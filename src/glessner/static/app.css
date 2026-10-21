@@ -1,0 +1,1022 @@
+/* tests/test_design_tokens.py checks the contrast of the token pairs in this file.
+   Colors appear only in the two token blocks. The mark tokens (--unreviewed and the others) are for ticks, bars, and
+   swatches; words, letters, and borders take the -text tokens, and fills take --fill-*. */
+:root {
+  color-scheme: light dark;
+  --bg: #f3f3f0; --panel: #ffffff; --panel-2: #f6f6f2; --fg: #1b1b1f; --muted: #5c5c66; --line: #d6d6d1; --line-strong: #82827f;
+  --accent: #1f55c4; --focus: #1f55c4;
+  --unreviewed: #5b7aa6; --authorized: #2f8a4c; --suspicious: #bd8000; --malicious: #c0262d;
+  --unreviewed-text: #3b66a8; --authorized-text: #1e7a3e; --suspicious-text: #8a5c00; --malicious-text: #b42318;
+  --fill-authorized: #1e7a3e; --fill-suspicious: #f0c24f; --fill-malicious: #b42318; --on-fill: #ffffff; --on-amber: #1b1b1f;
+  --band-timeline: #dbe4f2; --band-timeline-edge: #5b7fbf; --band-details: #f5f1e9; --band-details-edge: #9e824b;
+  --mark-bg: #fbe7a1;
+  --row-alt: #fafaf8; --d1: #dbe6f3; --d5: #1f4f99; --link: #c2410c;
+  --hit: #c0262d; --select: #111111; --related: #e0a400;
+  /* Surfaces mixed from tokens, so a pair tests/test_design_tokens.py checks can name them */
+  --state-bg: color-mix(in srgb, var(--band-timeline) 60%, var(--panel));
+  --decision-bg: color-mix(in srgb, var(--suspicious-text) 10%, var(--panel));
+  --decision-bg-malicious: color-mix(in srgb, var(--malicious-text) 10%, var(--panel));
+  --decision-bg-authorized: color-mix(in srgb, var(--authorized-text) 10%, var(--panel));
+  --pressed-bg: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  /* Type: the 10 px flags and 11.5 px breakdowns stay literals */
+  --t-11: 11px; --t-12: 12px; --t-13: 13px; --t-14: 14px; --t-16: 16px;
+  --mono: ui-monospace, Consolas, monospace;
+  /* Spacing, a 4 px grid, which some rules use; the rest set pixel sizes directly */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s6: 24px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #151517; --panel: #202024; --panel-2: #26262b; --fg: #ebebee; --muted: #a3a3ad; --line: #3a3a41; --line-strong: #75757f;
+    --accent: #8ab4f8; --focus: #8ab4f8;
+    --unreviewed: #8aa6cf; --authorized: #5cc27c; --suspicious: #e8b23a; --malicious: #f05a5f;
+    --unreviewed-text: #8fb0e6; --authorized-text: #5ec47a; --suspicious-text: #e5b84a; --malicious-text: #f27a76;
+    --fill-authorized: #5ec47a; --fill-suspicious: #e5b84a; --fill-malicious: #f27a76; --on-fill: #111111; --on-amber: #111111;
+    --band-timeline: #1b2434; --band-timeline-edge: #4c6ea8; --band-details: #2e2a23; --band-details-edge: #8c7a4e;
+    --mark-bg: #6b5a1a;
+    --row-alt: #26262a; --d1: #24364f; --d5: #8fb6ec; --link: #f08a4b;
+    --hit: #f05a5f; --select: #ffffff; --related: #ffd257;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: var(--t-13)/1.4 system-ui, sans-serif;
+       display: flex; flex-direction: column; height: 100vh; }
+/* The Hosts panel is hidden most of the time, so a flex column keeps the Timeline and Details panel sizes stable. The
+   stage holds them, and the Case overview over them, so the timeline keeps its size behind it. */
+#stage { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; position: relative; }
+#work { flex: 1 1 auto; display: flex; gap: 8px; min-height: 0; margin: 8px 16px 0; }   /* Filter panel and Timeline panel */
+/* The divider carries a grip, not a bare line: 10 px high, the grip 44 by 6 px in --line-strong with a slot
+   through it, turning --accent on hover, on focus, and while it is dragged */
+#divider { flex: 0 0 10px; margin: 0 16px; cursor: row-resize; position: relative; }
+#divider::before { content: ''; position: absolute; left: 0; right: 0; top: 4px; height: 2px; background: var(--line);
+                   border-radius: 1px; }
+#divider .grip { position: absolute; left: 50%; top: 2px; width: 44px; height: 6px; margin-left: -22px; border-radius: 3px;
+                 background: var(--line-strong); }
+#divider .grip::after { content: ''; position: absolute; left: 12px; right: 12px; top: 2px; height: 2px; border-radius: 1px;
+                        background: var(--panel); }
+#divider:hover .grip, #divider:focus-visible .grip, body.resizing #divider .grip { background: var(--accent); }
+body.resizing { cursor: row-resize; user-select: none; }
+header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 6px 16px; border-bottom: 1px solid var(--line);
+         background: var(--panel); }
+#status { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: auto; }
+/* Another case is open on the server, so this page sends nothing more: a band above the Case
+   panel until the page reloads */
+.case-changed { flex: none; padding: 6px 16px; background: var(--panel); color: var(--malicious-text); font-weight: 600;
+                border-bottom: 2px solid var(--malicious-text); }
+.case-changed button { margin-left: 8px; font-weight: 400; }
+/* The case page's status shrinks before the Case panel takes a second row, which the lanes would pay for; setStatus
+   puts the whole text in its hover. */
+body:not(.start-page) #status { flex: 1 1 160px; min-width: 0; text-align: right; white-space: nowrap; overflow: hidden;
+                                text-overflow: ellipsis; }
+/* Controls follow the scheme: a field is --panel on --fg, a border is --line-strong (3:1 against what it sits on), and
+   a placeholder is --muted, since a note box's placeholder is its only label */
+button, select, textarea, input:not([type=checkbox]):not([type=radio]) {
+  font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line-strong); border-radius: 4px;
+  padding: 2px 8px; }
+textarea { font: var(--t-12) var(--mono); padding: 4px; width: 100%; }
+button:hover { border-color: var(--fg); cursor: pointer; }
+::placeholder { color: var(--muted); opacity: 1; }
+/* One focus ring for every control. Menu items, split-chip buttons, and the dividers draw it inside, where a neighbor
+   or the edge would clip it. */
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; scroll-margin: 4px; }   /* a scroller leaves room for the ring */
+#divider:focus-visible, #labelDivider:focus-visible, #quickMenu button:focus-visible, #caseMenu button:focus-visible,
+.tagchip.split button:focus-visible { outline-offset: -2px; }
+/* Blue means clickable and leads somewhere or shows something: a link-like button lists, opens, or unfolds. A border
+   means an action that changes the case. The one filled button is the action a row leads with. A row that opens its
+   event is a third kind: --fg, underlined on hover. Information is never blue. */
+a { color: var(--accent); }   /* the browser's blue and purple are unreadable on the dark panel */
+button.linklike { padding: 0; border: 0; background: transparent; color: var(--accent); text-align: left; font: inherit; }
+button.linklike:hover { text-decoration: underline; }
+/* A step the analyst went back from is still a link, lighter and dashed. The dashes are drawn as a background, 6 px long with
+   4 px gaps in the link's own color, since a dashed text-decoration scales its dashes with its thickness (about 3 px at 1 px)
+   and was hard to make out in the trail. */
+.linklike.dim { font-weight: 400; background-image: linear-gradient(to right, currentColor 0 6px, transparent 6px 10px);
+                background-size: 10px 1px; background-repeat: repeat-x; background-position: 0 100%; }
+.linklike.dim:hover { background-image: none; text-decoration: underline; }
+button.primary { background: var(--fg); border-color: var(--fg); color: var(--panel); font-weight: 600; }
+button.primary.mark-suspicious { background: var(--fill-suspicious); border-color: var(--suspicious-text); color: var(--on-amber); }
+button.primary.mark-malicious { background: var(--fill-malicious); border-color: var(--fill-malicious); color: var(--on-fill); }
+button.primary.mark-authorized { background: var(--fill-authorized); border-color: var(--fill-authorized); color: var(--on-fill); }
+/* A toggle that is on */
+button[aria-pressed="true"], #viewPanel .presets button.on { border-color: var(--accent); background: var(--pressed-bg);
+                                                              color: var(--fg); font-weight: 600; }
+/* Panels told apart: a 26 px band names each working panel. The Timeline's is cool and darker than its panel,
+   the Details' warm and lighter, and each panel has a 3 px top edge in its band's hue. */
+.band { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) 10px; padding: 3px 10px; min-height: 26px;
+        border-bottom: 1px solid var(--line); }
+.band.timeline { background: var(--band-timeline); }
+.band.details { background: var(--band-details); }
+.band .name { margin-right: var(--s1); color: var(--muted); font-size: var(--t-11); font-weight: 700; text-transform: uppercase;
+              letter-spacing: .08em; }
+.band .sep { width: 1px; height: 16px; background: var(--line-strong); }
+main { position: relative; flex: 1 1 auto; min-width: 0; display: grid; grid-template-rows: auto auto 1fr;
+       grid-template-columns: minmax(0, 1fr);   /* never wider than the panel, whatever the canvas was drawn at */
+       min-height: 0; background: var(--panel);
+       border: 1px solid var(--line); border-top: 3px solid var(--band-timeline-edge); }
+#lanesBox { position: relative; display: grid; grid-template-rows: auto 1fr; grid-template-columns: minmax(0, 1fr); min-height: 0; }
+#axisRow { display: grid; grid-template-columns: var(--label-w, 260px) minmax(0, 1fr); border-bottom: 1px solid var(--line); }
+#axisSpacer { display: flex; align-items: center; justify-content: space-between; height: 30px; padding: 0 8px;
+              color: var(--muted); border-right: 1px solid var(--line); }
+/* Open all or Fold all, in the corner right of UTC: small, so the corner keeps its 30 px */
+#axisSpacer button { padding: 0 6px; font-size: 12px; line-height: 18px; color: var(--fg); }
+#axisSpacer button[hidden] { display: none; }
+#axis { height: 30px; display: block; min-width: 0; }
+#scroller { display: flex; overflow-y: auto; overflow-x: hidden; min-height: 0; }
+#labels { width: var(--label-w, 260px); flex: none; border-right: 1px solid var(--line); }
+#labels .row { height: 20px; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+               padding-right: 6px; cursor: default; }
+#labels .row.group { background: var(--bg); cursor: pointer; font-weight: 600; }
+#labels .row .twisty { display: inline-block; width: 14px; color: var(--muted); }
+#labels .row .count { color: var(--muted); font-weight: 400; margin-left: 6px; font-variant-numeric: tabular-nums; }
+#lanes { flex: 1; display: block; min-width: 0; cursor: grab; }
+#lanes.dragging { cursor: grabbing; }
+/* The Details panel: a warm band that names the page and holds Back and the trail, over one
+   scroller. It opens at two-thirds of the stage (flex-basis 66.7% here for the first paint; dividers.js sets pixels). */
+#details { flex: 0 0 66.7%; display: flex; flex-direction: column; overflow: hidden; margin: 0 16px 12px; background: var(--panel);
+           border: 1px solid var(--line); border-top: 3px solid var(--band-details-edge); }
+#detailsBand { flex: none; }
+#detailsBand .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+#detailsBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 12px; }
+#details h2 { font-size: var(--t-14); margin: 0 0 6px; }
+#details h3 { font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+              margin: 12px 0 4px; }
+#details .hint, .muted { color: var(--muted); }
+#details .pad { margin: 0; padding: 8px 12px; }
+#details .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+#details button[disabled] { opacity: .45; cursor: not-allowed; }
+#details .mark-unreviewed { border-color: var(--unreviewed-text); }
+#details .mark-authorized { border-color: var(--authorized-text); }
+#details .mark-suspicious { border-color: var(--suspicious-text); }
+#details .mark-malicious { border-color: var(--malicious-text); }
+#details table { border-collapse: collapse; width: 100%; margin-top: 6px; }
+#details td { border-top: 1px solid var(--line); padding: 2px 8px 2px 0; vertical-align: top; font-family: var(--mono);
+              font-size: var(--t-12); word-break: break-all; }
+#details td:first-child { color: var(--muted); white-space: nowrap; width: 180px; word-break: normal; }
+#details .related ul { margin: 4px 0; padding-left: 18px; }
+#details .related li { cursor: pointer; font-family: var(--mono); font-size: var(--t-12); font-variant-numeric: tabular-nums; }
+#details .related li:hover { text-decoration: underline; }
+
+/* Review-state badge: the letter carries the meaning, the fill says marked or not, and color comes
+   third. U is a hollow ring; A, S, and M are filled, S in light amber with a dark letter. */
+.badge { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 16px; height: 16px;
+         border-radius: 3px; font: 700 var(--t-11)/1 system-ui, sans-serif; }
+.badge.u { color: var(--unreviewed-text); border: 1.5px solid var(--unreviewed-text); background: transparent; }
+.badge.a { color: var(--on-fill); background: var(--fill-authorized); border: 1px solid var(--fill-authorized); }
+.badge.s { color: var(--on-amber); background: var(--fill-suspicious); border: 1px solid var(--suspicious-text); }
+.badge.m { color: var(--on-fill); background: var(--fill-malicious); border: 1px solid var(--fill-malicious); }
+
+/* Event page. The header is a grid of two rows over the two columns below:
+   row 1 is the identity with the verdict and its one decision beside it, row 2 the summary with the other marks beside it.
+   A third row, .ev-head-more, is drawn only when something needs saying. The right cells share the left cells' rows
+   (subgrid), so a pending decision sits level with the time. Between 960 and 1,150 px they drop under the left ones. */
+.ev-head { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px 16px; align-items: center; padding: 5px 12px 5px 8px;
+           background: var(--panel); border-bottom: 1px solid var(--line); border-left: 4px solid var(--unreviewed-text); }
+.ev-head.authorized { border-left-color: var(--authorized-text); }
+.ev-head.suspicious { border-left-color: var(--suspicious-text); }
+.ev-head.malicious { border-left-color: var(--malicious-text); }
+.ev-ident { display: flex; flex-wrap: nowrap; gap: 0 10px; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
+.ev-ident .badge { align-self: center; margin-right: -4px; }   /* the gap to the time is 6 px, which keeps the kind its room */
+.ev-ident .time { flex: none; font: 600 var(--t-16)/1.3 var(--mono); font-variant-numeric: tabular-nums; }
+.ev-ident .host { flex: none; font-size: var(--t-16); font-weight: 600; }
+.ev-ident .chip { flex: none; }
+.ev-ident .kind { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }   /* a min-width cuts it at the row's edge, with no ellipsis */
+.ev-sum { display: flex; flex-wrap: nowrap; gap: 0 6px; align-items: center; min-width: 0; }
+.ev-sum .chip { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-sum button.more { flex: none; }
+.ev-summary { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.ev-verdict { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.ev-head-more { min-width: 0; }
+.ev-head-more > * { margin-top: 2px; margin-bottom: 2px; }
+.ev-head-more [hidden] { display: none; }
+.ev-head-more:not(:has(> :not([hidden]))) { display: none; }   /* nothing visible: no third row, and no gap above it */
+@media (min-width: 1151px) {
+  .ev-head { grid-template-columns: minmax(0, 1fr) auto; }
+  .ev-ident { grid-column: 1; grid-row: 1; }
+  .ev-sum { grid-column: 1; grid-row: 2; }
+  .ev-verdict { grid-column: 2; grid-row: 1 / 3; display: grid; grid-template-rows: subgrid; align-items: center; gap: inherit; }
+  .ev-verdict > .verdict-line, .ev-verdict > .verdict-row { justify-self: end; flex-wrap: nowrap; white-space: nowrap; }
+  .ev-head-more { grid-column: 1 / -1; grid-row: 3; }
+}
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0 0; }
+.chip { padding: 0 8px; border: 1px solid var(--line-strong); border-radius: 10px; font-size: var(--t-12); background: var(--panel); }
+.chip.level-critical, .chip.level-high { border-color: var(--malicious-text); }
+.chip.level-medium { border-color: var(--suspicious-text); }
+#details .ev-verdict h3 { margin: 0; }
+.verdict-line, .verdict-row { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin: 0; }
+.ev-head-more .verdict-row { margin: 2px 0; }
+.verdict-row.small { font-size: var(--t-12); }
+.status { display: inline-flex; align-items: center; padding: 0 8px; border: 1.5px solid var(--unreviewed-text);
+          border-radius: 10px; color: var(--unreviewed-text); font-weight: 600; white-space: nowrap; }
+.status.authorized { border-color: var(--authorized-text); color: var(--authorized-text); }
+.status.suspicious { border-color: var(--suspicious-text); color: var(--suspicious-text); }
+.status.malicious { border-color: var(--malicious-text); color: var(--malicious-text); }
+.decision { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 1px 4px 1px 8px; border-radius: 4px;
+            border: 1px solid var(--suspicious-text); background: var(--decision-bg); }
+.decision.malicious { border-color: var(--malicious-text); background: var(--decision-bg-malicious); }
+.decision.authorized { border-color: var(--authorized-text); background: var(--decision-bg-authorized); }
+.decision > span { margin-right: auto; }
+.decision .lead { margin: 0; color: var(--suspicious-text); font-weight: 600; }
+.decision.malicious .lead { color: var(--malicious-text); }
+.decision.authorized .lead { color: var(--authorized-text); }
+.ev-verdict .decision { flex-wrap: nowrap; }
+#details button.quiet { color: var(--muted); }
+.mark-note { flex: 1 1 150px; min-width: 120px; }
+.ev-verdict .mark-note { flex: 0 1 180px; width: 180px; min-width: 100px; }
+button.tw { padding: 0 2px; border: 0; background: transparent; color: var(--accent); font-size: var(--t-12); }
+button.tw:hover { text-decoration: underline; }
+/* The selected events and their marks, above the buttons that mark them all */
+.selection-list { max-height: 7.5em; overflow-y: auto; margin: 2px 0 4px; padding: 0; list-style: none;
+                  font: var(--t-12)/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+.selection-list li { display: flex; gap: 8px; align-items: center; }
+.selection-list .sel-text { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.mark-note-text { overflow-wrap: anywhere; }
+.ev-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 1.35fr); }
+.ev-facts { padding: 6px 12px 12px; min-width: 0; }
+.ev-work { padding: 6px 12px 12px; background: var(--panel-2); border-left: 1px solid var(--line); min-width: 0; }
+@media (max-width: 960px) {
+  .ev-body { grid-template-columns: minmax(0, 1fr); }
+  .ev-work { border-left: 0; border-top: 1px solid var(--line); }
+}
+.ev-message { margin: 6px 0 2px; overflow-wrap: anywhere; }
+.ev-facts dl { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 2px 12px; margin: 0; }
+.ev-facts dt { color: var(--muted); }
+.ev-facts dd { margin: 0; font: var(--t-12)/1.6 var(--mono); overflow-wrap: anywhere; cursor: copy; border-radius: 3px; }
+.ev-facts dd:hover { background: var(--panel-2); }
+/* Tier 3 of the page: Record and source, Raw fields, and History fold, closed until opened, and the browser remembers it */
+details.fold { margin-top: 12px; }
+details.fold summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: var(--t-11); font-weight: 600;
+                       text-transform: uppercase; letter-spacing: .05em; }   /* only the label toggles, not the whole row */
+details.fold dl, details.fold .ev-history { margin-top: 4px; }
+.raw-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* A list's heading, count line, and buttons stay at the top of their panel while the rows scroll. A panel too
+   short for its heading to leave rows (the class is set by event_page.js) lets it scroll away. */
+.sticky-head { position: sticky; top: -8px; z-index: 2; background: var(--panel); }   /* a scroller's padding insets what sticks: -8px puts it flush under the band */
+.ev-work .sticky-head { top: -6px; background: var(--panel-2); }
+#details.short .sticky-head { position: static; }
+.ev-work ul.notes, .ev-facts ul.notes { margin: 0; padding-left: 18px; }
+/* The pivot trail lives in the Details band, and provenance is one strip under the header */
+.trail { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.trail .step-sep { color: var(--muted); }
+.trail .here { font-weight: 600; }
+/* The button is sized to the band's 19 px content box, so the band stays 26 px when a trail shows and the page does not drop */
+.trail .trail-save { margin-left: auto; padding-block: 0; line-height: 16px; }
+.prov { display: flex; flex: none; flex-wrap: nowrap; gap: 0 16px; padding: 3px 12px; border-bottom: 1px solid var(--line);
+        background: var(--panel-2); color: var(--muted); font-size: var(--t-12); overflow: hidden; white-space: nowrap; }
+.prov-part { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.prov-part.file { flex: 1 1 auto; }
+.prov-part.sha, .prov-part.build { flex: none; }
+.prov b { color: var(--fg); font-weight: 600; }
+.prov .prov-check { display: inline-block; flex: none; }
+.prov .prov-check.matches { color: var(--authorized-text); font-weight: 600; }
+.prov .prov-check.changed, .prov .prov-check.absent, .prov .prov-check.unreadable, .prov .prov-check.uncounted,
+.prov .prov-check.error { color: var(--malicious-text); font-weight: 600; }
+.pivots h3 { margin-top: 2px; }
+.pv-h { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 2px 0; }
+.pv-h h3 { margin: 0; }
+.pv-h label { margin-left: auto; color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.pv { display: grid; grid-template-columns: 22px minmax(0, 1fr) minmax(0, auto); gap: 1px 8px; align-items: start; padding: 5px 0;
+      border-top: 1px solid var(--line); }
+.pv:first-of-type { border-top: 0; }
+.pv-rank { display: inline-block; width: 20px; height: 20px; line-height: 20px; text-align: center; border-radius: 10px;
+           background: var(--bg); color: var(--muted); font-size: var(--t-11); font-weight: 600; }
+.pv-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
+#details button.pv-go { font-weight: 600; text-align: left; }
+.pv-value { padding: 0 5px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel); overflow-wrap: anywhere;
+            font: var(--t-12) var(--mono); }
+.pv-basis { padding: 0 6px; border: 1px dashed var(--line); border-radius: 8px; color: var(--muted); font-size: var(--t-11); }
+.pv-seconds { width: 5em; }
+.pv-reason, .pv-caveat, .pv-empty { margin-top: 1px; }
+.pv-reason { color: var(--muted); font-size: var(--t-12); }
+.pv-caveat:empty, .pv-empty:empty, .pv-flags:empty, .pv-sources:empty { display: none; }
+.pv-caveat { font-style: italic; }
+.pv-broad { color: var(--suspicious-text); }
+.pv-side { display: flex; justify-content: flex-end; align-items: baseline; gap: 4px; text-align: right; font-variant-numeric: tabular-nums;
+           white-space: nowrap; }
+.pv .pv-tw { padding: 0 2px; font-size: var(--t-12); line-height: 20px; }
+/* The fold: a folded row hides its reason, flags, and caveat, and keeps Broad and caveat as words beside its title.
+   The section's tick sets the default, and a row's own arrow overrides it with .folded or .unfolded. */
+.pv-short { display: none; }
+.pivots.reasons-folded .pv:not(.unfolded) :is(.pv-reason, .pv-flags, .pv-caveat),
+.pivots:not(.reasons-folded) .pv.folded :is(.pv-reason, .pv-flags, .pv-caveat) { display: none; }
+.pivots.reasons-folded .pv:not(.unfolded) .pv-short:not(:empty),
+.pivots:not(.reasons-folded) .pv.folded .pv-short:not(:empty) { display: inline-flex; gap: 6px; font-size: var(--t-12); }
+.pv-short .br { color: var(--suspicious-text); font-weight: 600; }
+.pv-short .cv { color: var(--muted); font-style: italic; }
+.pv-sources { grid-column: 2 / -1; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.pv-not, .pv-plain, .pv-foot { margin: 8px 0 0; }
+.pv-foot { font-size: var(--t-12); }
+/* Hosts edits case records as the Details pages do, so it opens with the Details' band; its body scrolls under the band */
+#hostsPanel { display: flex; flex-direction: column; margin: 8px 16px 0; background: var(--panel); border: 1px solid var(--line);
+              border-top: 3px solid var(--band-details-edge); max-height: 40vh; overflow: hidden; }
+#hostsPanel[hidden] { display: none; }
+#hostsBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 6px 10px; }
+#hostsTable { border-collapse: collapse; }
+#hostsTable td, #hostsTable th { padding: 4px 10px 4px 0; text-align: left; vertical-align: top; }
+#hostsTable tbody tr { border-top: 1px solid var(--line); }
+#hostsTable td.nowrap { white-space: nowrap; }
+/* Host roles and identity */
+#hostsTable tr.needs-review td:first-child { border-left: 3px solid var(--suspicious-text); padding-left: 6px; font-weight: 600; }
+#hostsTable tr.flash { background: color-mix(in srgb, var(--suspicious-text) 20%, transparent); }
+#hostsTable .role-status { max-width: 360px; margin-top: 2px; color: var(--muted); font-size: var(--t-12); }
+#hostsTable td.os { max-width: 240px; }
+#hostsTable .os-source { color: var(--muted); font-size: var(--t-12); }
+#hostsTable ul.review { margin: 0; padding-left: 16px; color: var(--suspicious-text); font-size: var(--t-12); }
+#hostsTable .ident { display: inline-flex; align-items: center; margin: 0 6px 3px 0; padding: 0 0 0 7px; border: 1px solid var(--line);
+                     border-radius: 10px; font: var(--t-12) var(--mono); }
+#hostsTable .ident.conflict { border-color: var(--suspicious-text); color: var(--suspicious-text); }
+#hostsTable .ident button.remove { padding: 0 6px; border: 0; background: transparent; color: var(--muted); line-height: 1.2; }
+#hostsTable .ident button.remove:hover { color: var(--malicious-text); }
+/* Splitting a host by recorded computer: the notice, its preview, and the split hosts' Undo split */
+#hostSplits { margin: 2px 0 8px; }
+#hostSplits .split-notice { margin: 4px 0; padding: 8px 10px; border: 1px solid var(--suspicious-text); border-radius: 4px;
+                            background: var(--decision-bg); }
+#hostSplits p { margin: 0 0 6px; }
+#hostSplits .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+#hostSplits .split-preview { margin-top: 8px; padding: 8px 10px; border: 1px solid var(--line); background: var(--panel); }
+#hostSplits h3 { margin: 0 0 4px; font-size: var(--t-13); }
+#hostSplits h4 { margin: 8px 0 2px; font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+                 color: var(--muted); }
+#hostSplits ul { margin: 2px 0; padding-left: 18px; max-width: 980px; }
+.split-table { border-collapse: collapse; }
+.split-table th, .split-table td { padding: 2px 14px 2px 0; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.split-table th { color: var(--muted); font-weight: 600; }
+.split-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+/* While a preview is open the panel takes more room, and the preview's buttons stay at its foot */
+#hostsPanel.splitting { max-height: 60vh; }
+#hostSplits .split-preview > .actions { position: sticky; bottom: -6px; margin-bottom: 0; padding: 6px 0;
+                                       background: var(--panel); }
+#hostSplits .split-done, #hostSplits .split-kept { margin: 4px 0; }
+#hostSplits .split-kept p { display: inline; margin-right: 8px; }
+#hostSplits .split-kept .actions { display: inline-flex; margin: 0; }
+#hostSplits .split-confirm { margin: 4px 0 0; padding: 6px 8px; border: 1px solid var(--suspicious-text); border-radius: 4px; }
+#labels .guess, .lg-flag.guess { margin-left: 6px; padding: 0 5px; border: 1px dashed var(--suspicious-text); border-radius: 8px;
+                                 color: var(--suspicious-text); font-size: 10px; font-weight: 400; }
+/* Counts on the case buttons: on the path, in the Case menu, and in the Timeline's toolbar */
+button > .count { margin-left: 6px; padding: 0 6px; border-radius: 9px; font-size: var(--t-11); font-weight: 600;
+                  font-variant-numeric: tabular-nums; }
+button > .count.flagged, button > .count.error { background: var(--fill-malicious); color: var(--on-fill); }
+button > .count.pending, button > .count.review { border: 1px solid var(--suspicious-text); color: var(--suspicious-text); }
+#tooltip { position: fixed; pointer-events: none; max-width: 520px; padding: 4px 8px; background: var(--panel);
+           border: 1px solid var(--line); box-shadow: 0 2px 8px rgba(0,0,0,.2); font-size: var(--t-12); white-space: pre-wrap;
+           font-variant-numeric: tabular-nums; z-index: 10; }
+#tooltip .l1 { font-weight: 600; }
+
+/* Quick-action menu: opens on a right-click on an event tick or a logon arrow. */
+#quickMenu { position: fixed; z-index: 20; min-width: 250px; max-width: 440px; padding: 4px 0; background: var(--panel);
+             border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.28); }
+#quickMenu .menu-head { padding: 4px 12px 6px; border-bottom: 1px solid var(--line); margin-bottom: 4px; font-size: var(--t-12);
+                        overflow-wrap: anywhere; }
+#quickMenu .menu-group { padding: 6px 12px 2px; font-size: var(--t-11); font-weight: 600; text-transform: uppercase;
+                         letter-spacing: .05em; color: var(--muted); }
+#quickMenu button[role="menuitem"] { display: block; width: 100%; padding: 3px 12px; border: 0; border-radius: 0;
+                                     background: transparent; text-align: left; }
+#quickMenu button[role="menuitem"]:hover:not([disabled]), #quickMenu button[role="menuitem"]:focus-visible {
+  background: var(--bg); }
+#quickMenu button[disabled] { color: var(--muted); cursor: default; }
+/* The menu's head: what it is for in muted caps, the event's badge with its kind, host, and time in bold, then the
+   message with the link that lists the events under the pointer. The link is a link, not a menu row. */
+#quickMenu .menu-head .for { font-size: var(--t-11); font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+                             color: var(--muted); }
+#quickMenu .menu-head .what { display: flex; flex-wrap: wrap; gap: 0 8px; align-items: center; }
+#quickMenu .menu-head button[role="menuitem"] { display: inline; width: auto; padding: 0; }
+#quickMenu .menu-head button[role="menuitem"]:hover:not([disabled]),
+#quickMenu .menu-head button[role="menuitem"]:focus-visible { background: transparent; }
+#quickMenu hr { margin: 4px 0; border: 0; border-top: 1px solid var(--line); }
+#quickMenu label { display: block; padding: 2px 12px; }
+#quickMenu .menu-foot { padding: 2px 12px 2px; text-align: right; }
+/* The tag picker's technique box: the pick list of attack.js, the menu's width, with its hint under it */
+/* "Technique" above the box, so the box and its list take the menu's width and a technique's name reads on one line */
+#quickMenu .menu-technique { display: grid; gap: 2px; padding: 2px 12px 4px; }
+#quickMenu .menu-technique .attack-input input[type="text"] { width: 100%; }
+/* Two lines kept for the hint, whose words change as the list comes and as the analyst types, so the menu placed at its
+   first size doesn't grow past the window's foot */
+#quickMenu .menu-technique .attack-hint { min-height: 2.8em; }
+/* An address row's View menu: its View choices check when in the View filter, and the search item lines up. */
+#quickMenu button[role="menuitemcheckbox"] { display: block; width: 100%; padding: 3px 12px; border: 0; border-radius: 0;
+                                             background: transparent; text-align: left; }
+#quickMenu button[role="menuitemcheckbox"]:hover, #quickMenu button[role="menuitemcheckbox"]:focus-visible {
+  background: var(--bg); }
+#quickMenu button[role="menuitemcheckbox"]::before { content: ''; display: inline-block; width: 1.4em; }
+#quickMenu button[role="menuitemcheckbox"][aria-checked="true"]::before { content: '\2713'; }
+#quickMenu button.menu-indent { padding-left: calc(12px + 1.4em); }
+#quickMenu code { font: var(--t-12) var(--mono); }
+
+/* To investigate as a worklist. Two sections, each with a meter on the start page's progress pattern (a --d5
+   bar on a --bg track) and its count in words. The marked events are the list row grid with a Done column first and the
+   counts last; a row followed up reads muted. Every color here is one of the pairs tests/test_design_tokens.py checks. */
+.inv-section { margin: 0 0 var(--s6); }
+.inv-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s3); padding: 2px 0 4px; }
+#details .inv-head h2 { margin: 0; }
+.meter { display: inline-flex; align-items: center; gap: var(--s2); font-variant-numeric: tabular-nums; color: var(--muted); }
+.meter .progress { display: inline-block; width: 160px; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+.meter .bar { height: 100%; background: var(--d5); }
+.rule-meter .meter .progress { width: 120px; }
+#details ul.rows.worklist { margin: 2px 0 0; padding: 0; list-style: none;
+  --cols: 34px 36px 26ch 52px minmax(0, 1fr) minmax(220px, 360px); }   /* the badge's column holds the word Mark */
+#details ul.rows.worklist .rel-head .rel-mark { grid-column: 2; }   /* Done has the first column, so Mark keeps to its own */
+#details ul.rows.worklist li { display: grid; grid-template-columns: var(--cols); gap: 0 8px; align-items: start; padding: 2px 0;
+                               border-bottom: 1px solid var(--line); cursor: pointer; }
+#details ul.rows.worklist li.rel-head { position: sticky; top: calc(var(--list-head-h, 0px) - 8px); z-index: 1; margin-bottom: 2px;
+                                        background: var(--panel); color: var(--muted); cursor: default; }
+#details.short ul.rows.worklist li.rel-head { position: static; }
+#details ul.rows.worklist li.rel-row:hover .rel-text { text-decoration: underline; }
+#details ul.rows.worklist .rel-time, #details ul.rows.worklist .rel-host { font: var(--t-12) var(--mono); font-variant-numeric: tabular-nums; }
+#details ul.rows.worklist .rel-event { font-size: var(--t-12); }
+#details ul.rows.worklist .inv-tick { margin: 2px 0 0 10px; width: 14px; height: 14px; }
+#details ul.rows.worklist li.done .rel-event .rel-text { color: var(--muted); }
+.inv-note, .inv-followed { margin-top: 1px; }
+.inv-counts { display: flex; flex-wrap: wrap; gap: 2px var(--s3); font-size: var(--t-12); font-variant-numeric: tabular-nums; }
+.inv-count { white-space: nowrap; }
+#details button.inv-n { font-weight: 600; }
+/* A pending source: what it is and why it fired, its progress, and its actions, in one row */
+.rule { display: grid; grid-template-columns: minmax(0, 1fr) 260px auto; gap: var(--s2) var(--s4); align-items: center; padding: var(--s2) 0;
+        border-top: 1px solid var(--line); }
+.inv-head + .rule { border-top: 0; }   /* the heading stands above the first row */
+.rule-why { font-size: var(--t-12); }
+.rule-meter { display: flex; flex-direction: column; gap: 2px; font-size: var(--t-12); }
+#details .rule .rule-acts { margin: 0; }
+.rule .confirm-block { grid-column: 1 / -1; }
+@media (max-width: 960px) { .rule { grid-template-columns: minmax(0, 1fr); } }
+.inv-foot { margin: var(--s2) 0 0; font-size: var(--t-12); }
+/* Ask first: the block before a group action, on the pattern of the split's undo confirm and the audit
+   trail's. The caution line is the decision box's tint; the sample is the work column's tint. */
+.confirm-block { margin: var(--s2) 0; padding: var(--s2) var(--s3); border: 1px solid var(--suspicious-text); border-radius: 4px;
+                 background: var(--panel); }
+.confirm-block .confirm-title { display: block; font-size: var(--t-14); margin-bottom: var(--s1); }
+.confirm-block .confirm-points { margin: var(--s1) 0; padding-left: 18px; }
+.confirm-block .confirm-warn { margin: var(--s2) 0; padding: 4px 8px; border: 1px solid var(--suspicious-text); border-radius: 4px;
+                               background: var(--decision-bg); }
+#details .confirm-block h3 { margin: var(--s2) 0 2px; }
+.confirm-block .confirm-sample { padding: 4px 8px; background: var(--panel-2); border-radius: 3px; font: var(--t-12) var(--mono);
+                                 font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+#details .confirm-block .actions { margin: var(--s2) 0 0; }
+/* Review one by one: the bar over the Event page while a queue is being reviewed */
+.review-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); padding: var(--s1) var(--s3);
+              background: var(--panel-2); border-bottom: 1px solid var(--line); }
+.review-bar .mark-note { flex: 0 1 180px; min-width: 100px; }
+.review-bar .keys { margin-left: auto; font-size: var(--t-12); }
+#details[data-page="event"] > #detailsBody > .review-bar { flex: none; }
+/* The Findings page: the findings on the left, the exports on the right, one column below 960 px. A card's
+   severity is the Hayabusa level chip's pattern (a worded chip, never a mark's letter or fill); its events are link-like
+   chips with the badge; the caveat is a caution tint, as the decision box and the clock note are. The caveat's sources
+   and links add two pairs tests/test_design_tokens.py checks: --muted and --accent on --decision-bg. */
+.findings-page { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: var(--s4); padding: 0 var(--s3) var(--s3); }
+@media (max-width: 960px) { .findings-page { grid-template-columns: minmax(0, 1fr); } }
+.findings-col, .exports-col { min-width: 0; }
+/* The right column: the report's outline, the Summary, the export cards, and the files written. No new
+   color: the scope chip is the Hayabusa level chip's shape in --line-strong, the preview the work column's tint.
+   Report and Exports each open with the Details band (`.band.details`, its name in --t-11 caps) and its 3 px edge, 24 px
+   apart, so the column reads as two sections. The name on the band is the Details band's own pair. */
+#details .exports-col h2.band { margin: 0 0 var(--s2); border-top: 3px solid var(--band-details-edge); }
+#details .exports-col h2.band ~ h2.band { margin-top: var(--s6); }
+.exports-col h2.band + .export-card { border-top: 0; }   /* the band's own rule stands above the first card */
+#details .exports-col .written-head { margin-top: var(--s4); }
+.report-outline { margin: 0 0 var(--s2); padding-left: 20px; }
+.report-outline li { margin: 2px 0; }
+.report-outline .ex-count { color: var(--muted); }
+.report-summary-box { margin: var(--s2) 0; }
+/* Prose, not a note or YAML: the page's font, where the global textarea rule is mono */
+.report-summary-box .report-summary { width: 100%; min-height: 4.5em; resize: vertical; font-family: inherit; font-size: var(--t-13);
+                                       line-height: 1.4; }
+#details .report-summary-box .actions { margin: var(--s1) 0 0; }
+.report-preview { margin: var(--s2) 0; padding: var(--s2) var(--s3); background: var(--panel-2); border: 1px solid var(--line);
+                  border-radius: 4px; font: var(--t-12)/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.export-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--s1) var(--s2); align-items: start;
+               padding: var(--s2) 0; border-top: 1px solid var(--line); }
+.export-card .export-what { font-size: var(--t-12); }
+.export-card .ex-count { font-variant-numeric: tabular-nums; }
+#details .export-card .export-buttons { margin: 0; justify-content: flex-end; }
+.export-card .chip.scope { font-variant-numeric: tabular-nums; }
+@media (max-width: 1150px) { .export-card { grid-template-columns: minmax(0, 1fr); } #details .export-card .export-buttons { justify-content: flex-start; } }
+/* The file name takes the spare width and is cut with an ellipsis, its path and words in the hover; the hash never wraps.
+   Rows is 76 px: "1,242,846" at this size is 62 px, and a narrower column ran a count into the hash beside it. */
+.files-table { table-layout: fixed; }
+.files-table th:first-child, .files-table td:first-child { width: 80px; }
+.files-table th:nth-child(3), .files-table td:nth-child(3) { width: 76px; }
+.files-table th:last-child, .files-table td:last-child { width: 118px; white-space: nowrap; }
+.files-table td:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.files-table td.mono { font-family: var(--mono); font-size: var(--t-12); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.files-table .file-hash { cursor: help; }
+#details .exports-col .written-note { margin: var(--s1) 0 0; font-size: var(--t-12); }
+.finding { margin: 0 0 var(--s3); padding: var(--s2) var(--s3); border: 1px solid var(--line); border-radius: 4px; }
+.finding.retired { color: var(--muted); }
+.finding-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s2); }
+.finding-head .chip { flex: none; }
+.finding-title { flex: 1 1 240px; min-width: 0; font-size: var(--t-14); overflow-wrap: anywhere; }
+.finding-head .acts { display: flex; gap: var(--s1); margin-left: auto; }
+.finding-narr { margin: var(--s1) 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.finding-line { font-size: var(--t-12); color: var(--muted); }
+.finding-events { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1); margin-top: var(--s1); }
+.finding-events[hidden] { display: none; }   /* the chips past the first eight, until "+N more" */
+.ev-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 0 8px 0 3px; border: 1px solid var(--line-strong);
+           border-radius: 10px; font: var(--t-12) var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ev-chip .linklike { font: inherit; overflow: hidden; text-overflow: ellipsis; }
+.ev-chip-edit { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; }
+.finding-form { display: grid; gap: var(--s2); margin: var(--s2) 0; }
+.finding-form input[type="text"], .finding-form textarea { width: 100%; min-width: 0; }
+.finding-form .actions input[type="text"] { flex: 1 1 240px; width: auto; }
+.finding-form textarea { min-height: 4em; resize: vertical; }
+#details .finding-form .actions, #details .finding-retire { margin: 0; }
+#details .finding-form p.warn { margin: 0; color: var(--suspicious-text); }
+/* A finding's ATT&CK field: the box, its pick list under it, the picked techniques as chips, and
+   one line of guidance. A technique's ID is in the mono face; an ID that isn't listed has a dashed chip in the flag's color. */
+#details .finding-form .attack-row { align-items: flex-start; }
+.attack-field { display: grid; gap: 4px; flex: 1 1 240px; min-width: 0; }
+.attack-input { position: relative; }
+.finding-form .actions .attack-input input[type="text"] { width: 100%; }
+.attack-pop { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; margin-top: 2px; background: var(--panel);
+              border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.28); font-size: var(--t-12); }
+.attack-pop.up { top: auto; bottom: 100%; margin: 0 0 2px; }   /* above the box when the window ends below it */
+.attack-list { max-height: 18em; overflow-y: auto; padding: 4px 0; }
+.attack-more { padding: 4px 12px; border-top: 1px solid var(--line); }
+.attack-opt { padding: 3px 12px; cursor: pointer; overflow-wrap: anywhere; }
+.attack-opt:hover { background: var(--bg); }
+/* The option Enter takes: the pressed toggle's tint with an accent bar, so the arrow keys' place reads at a glance */
+.attack-opt.active { background: var(--pressed-bg); box-shadow: inset 3px 0 0 var(--accent); }
+.attack-chips { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+.attack-chips:empty { display: none; }
+.attack-chip { display: inline-flex; align-items: center; max-width: 100%; padding: 0 0 0 8px; border: 1px solid var(--d5);
+               border-radius: 10px; font-size: var(--t-12); }
+.attack-chip.off-list { border-style: dashed; border-color: var(--suspicious-text); color: var(--suspicious-text); }
+.attack-chip button { padding: 0 5px; border: 0; background: transparent; color: inherit; }
+.attack-field .tid { font-family: var(--mono); }
+.attack-hint { font-size: var(--t-12); }
+.finding-new:empty { display: none; }
+.unassigned { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); margin: var(--s2) 0;
+              padding: var(--s2) var(--s3); border: 1px dashed var(--line-strong); border-radius: 4px; }
+.unassigned-list { margin: 0 0 var(--s3); }
+.retired-fold { margin-top: var(--s2); }
+/* A caveat: "What this does not prove", with its sources, beside the record on the Event page and on each finding */
+.caveat { margin: var(--s2) 0; padding: var(--s1) var(--s2); border: 1px solid var(--suspicious-text); border-radius: 4px;
+          background: var(--decision-bg); font-size: var(--t-12); }
+.caveat .caveat-title { display: block; }
+.caveat p { margin: 2px 0; }
+.caveat .caveat-src, .caveat .caveat-src span { color: var(--muted); }
+.caveat.collapsed .caveat-text, .caveat.collapsed .caveat-src > :not(.caveat-more) { display: none; }
+.caveat.collapsed .caveat-title { display: inline; margin-right: var(--s2); }
+.caveat.collapsed .caveat-src { display: inline; }
+.ev-facts .ev-caveat { margin: 2px 0 var(--s2); }
+.finding-add select { max-width: 320px; }
+
+/* Back history lives in the Details band; the Suggestions page keeps its groups below */
+.sg-group { margin: 8px 0; border-top: 1px solid var(--line); padding-top: 6px; }
+/* The find box on a list of events: at the right of the list's head; the rows that don't hold
+   every word are hidden, and the words are marked in the host and event cells with the search highlight's mark */
+.find { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); margin-left: auto; }
+.find input[type=search] { width: 230px; }
+.find .find-words, .find .find-ticks { color: var(--muted); font-variant-numeric: tabular-nums; }
+.find-foot { margin: 6px 0 0; }
+#details .related ul.rows li.find-out, #details ul.rows.worklist li.find-out, #details ul.sg-events li.find-out,
+#details ul.badged li.find-out { display: none; }
+.sg-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+.sg-head button.twisty { padding: 0 4px; border: 0; background: transparent; color: var(--accent); }
+ul.sg-events { margin: 4px 0 0; padding-left: 22px; }
+ul.sg-events li { display: flex; gap: 6px; align-items: center; padding: 1px 0; cursor: pointer;
+                  font: var(--t-12) var(--mono); font-variant-numeric: tabular-nums; }
+ul.sg-events li:hover .sg-text { text-decoration: underline; }
+ul.sg-events .sg-text { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+ul.sg-events li.sg-more { cursor: default; font-family: inherit; }
+
+/* Filter panel and filters. The side panels belong to the Timeline, so each opens with its
+   band, which stays at the top while the panel scrolls, and carries the Timeline's edge. */
+#filterPanel, #viewPanel { flex: 0 0 300px; overflow-y: auto; padding: 0 10px 8px; background: var(--panel); border: 1px solid var(--line);
+               border-top: 3px solid var(--band-timeline-edge); font-size: var(--t-12); }
+.band.panel-head { position: sticky; top: 0; z-index: 2; margin: 0 -10px 8px; padding: 3px 10px; }
+.band.panel-head > button { margin-left: auto; }
+.band.panel-head > button + button { margin-left: 0; }   /* a second action, such as the View panel's Close, sits beside the first */
+#filterPanel h3, #viewPanel h3 { margin: 10px 0 4px; font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+                  color: var(--muted); }
+/* Each section of the View panel folds from its heading. The heading is a button that reads as the heading, with an
+   arrow, and, when folded, how many of the section's values are on. */
+#viewPanel h3 button.fold { display: flex; align-items: baseline; gap: 6px; width: 100%; padding: 2px 0; border: 0; background: transparent;
+                            color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; }
+#viewPanel h3 button.fold:hover { color: var(--fg); }
+#viewPanel .fold-arrow { flex: none; width: 10px; }
+#viewPanel .fold-count { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
+.fchips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
+.fchip { display: inline-flex; align-items: center; gap: 2px; padding: 0 0 0 7px; border: 1px solid var(--suspicious-text);
+         border-radius: 9px; color: var(--suspicious-text); }
+.fchip button { padding: 0 6px; border: 0; background: transparent; color: inherit; line-height: 1.3; }
+.frow { display: grid; grid-template-columns: 14px 16px minmax(0, 1fr) auto; gap: 4px; align-items: center; padding: 1px 0; }
+.frow.info { color: var(--muted); }
+.frow .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.frow .n, .menu-check .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.frow button.tw { width: 14px; padding: 0; border: 0; background: transparent; color: var(--accent); }
+.frow input { margin: 0; }
+.frow.d1 { padding-left: 14px; } .frow.d2 { padding-left: 28px; } .frow.d3 { padding-left: 42px; }
+#fpFind { width: 100%; margin: 2px 0 4px; }
+#quickMenu .menu-check { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 6px; align-items: center;
+                         padding: 1px 12px; }
+#quickMenu .menu-check span:nth-child(2) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* Divider between the lane labels and the canvas. The grip is the divider's, turned upright,
+   and shows only on hover, on focus, and while dragging, since one always in view would sit over the lanes. */
+#labelDivider { position: absolute; top: 0; bottom: 0; left: calc(var(--label-w, 260px) - 3px); width: 7px; z-index: 2;
+                cursor: col-resize; }
+#labelDivider::after { content: ''; position: absolute; top: 0; bottom: 0; left: 3px; width: 1px; }
+#labelDivider:hover::after, #labelDivider:focus-visible::after, body.resizing-labels #labelDivider::after {
+  left: 2px; width: 3px; background: var(--muted); }
+#labelDivider .grip { display: none; position: absolute; left: 50%; top: 50%; width: 6px; height: 44px; margin: -22px 0 0 -3px;
+                      border-radius: 3px; background: var(--line-strong); }
+#labelDivider .grip::after { content: ''; position: absolute; top: 12px; bottom: 12px; left: 2px; width: 2px; border-radius: 1px;
+                             background: var(--panel); }
+#labelDivider:hover .grip, #labelDivider:focus-visible .grip, body.resizing-labels #labelDivider .grip {
+  display: block; background: var(--accent); }
+body.resizing-labels { cursor: col-resize; user-select: none; }
+.frow.off .name { color: var(--muted); }
+
+/* Zone axes under the UTC axis */
+.zone-label { display: flex; align-items: center; gap: 6px; height: 20px; padding: 0 2px 0 8px; overflow: hidden;
+              border-right: 1px solid var(--line); border-top: 1px dashed var(--line); font-size: var(--t-11); white-space: nowrap; }
+.zone-label .zname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.zone-label .zoffset { color: var(--muted); }
+.zone-label button { padding: 0 4px; border: 0; background: transparent; color: var(--muted); }
+.zone-axis { display: block; height: 20px; border-top: 1px dashed var(--line); }
+
+/* View flyout and the build-the-chain loop */
+.vrow { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 4px; align-items: center; padding: 1px 0; }
+.vrow .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.vrow .name .flag { color: var(--suspicious-text); }
+.vrow .n { color: var(--muted); font-variant-numeric: tabular-nums; }
+.vrow input { margin: 0; }
+.vrow.fade { margin-top: 10px; }
+.vrow.include { margin-bottom: 4px; }
+.vrow.include .name { white-space: normal; }   /* the hint wraps rather than being cut off */
+#viewPanel .presets { display: flex; gap: 4px; margin: 6px 0; }
+/* Event lists with the review-state column: each row is a grid of tick, badge, time,
+   offset, host, and event, and the IP pivot at either end adds a column saying which end
+   the address was on. The column heading is the first row; it sticks under the list's head, whose height pages.js's
+   stickUnder measures into --list-head-h. A search has no offset. The time is 26 characters wide, a microsecond date. */
+#details .related ul.rows { margin: 2px 0 0; padding: 0; list-style: none; --off: 76px; --cols: 16px 16px 26ch var(--off) 52px minmax(0, 1fr); }
+#details .related ul.rows.wide-off { --off: 92px; }   /* a gap of a day or more reads "-9 y 159 d" */
+#details .related ul.rows.no-off { --cols: 16px 16px 26ch 52px minmax(0, 1fr); }
+#details .related ul.rows.with-col { --cols: 16px 16px 26ch var(--off) 52px minmax(0, 1fr) 96px; }
+#details .related ul.rows.no-off.with-col { --cols: 16px 16px 26ch 52px minmax(0, 1fr) 96px; }
+#details .related ul.rows li { display: grid; grid-template-columns: var(--cols); gap: 0 8px; align-items: start; padding: 1px 0; }
+#details .related ul.rows li:hover { text-decoration: none; }
+#details .related ul.rows li.rel-row:hover .rel-text { text-decoration: underline; }
+.rel-row input { margin: 2px 0 0; width: 14px; height: 14px; }
+.rel-row .badge { margin-top: 1px; }
+.rel-time { white-space: nowrap; }
+.rel-host { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+.rel-event { min-width: 0; overflow-wrap: anywhere; }
+.rel-row .tag { margin-left: 8px; color: var(--muted); }
+ul.rows .off { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: right; color: var(--muted);
+               font-variant-numeric: tabular-nums; }
+ul.rows .off.far { color: var(--fg); }   /* a minute or more from the event */
+ul.rows .rel-col { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 600; }
+#details .related ul.rows li.rel-head { position: sticky; top: calc(var(--list-head-h, 0px) - 8px); z-index: 1; margin-bottom: 2px;
+                                        background: var(--panel); border-bottom: 1px solid var(--line); color: var(--muted);
+                                        cursor: default; }
+#details .ev-work ul.rows li.rel-head { top: calc(var(--list-head-h, 0px) - 6px); background: var(--panel-2); }
+#details.short ul.rows li.rel-head { position: static; }
+.rel-head .rel-mark { grid-column: 1 / 3; }
+.rel-head .rel-host, .rel-head .rel-col { font-weight: 400; }
+.rel-head > * { font-family: system-ui, sans-serif; }
+/* In the work column the event is one line, cut with an ellipsis and whole in its hover, so the list shows its rows: wrapped at
+   the column's width, one row took three or four lines. The search list is as wide as the panel and keeps wrapping. */
+#details .ev-work ul.rows .rel-event { display: flex; align-items: baseline; gap: 8px; }
+#details .ev-work ul.rows .rel-text { flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+#details .ev-work ul.rows .rel-row .tag { flex: none; margin-left: 0; }
+/* Lists that are not the grid put the badge before the row's text. The pile list and the audit trail's are the list itself
+   (ul.related.badged), not a list inside one. */
+#details ul.badged { padding-left: 0; list-style: none; }
+#details ul.badged li { display: flex; gap: 8px; align-items: baseline; }
+#details ul.badged li:hover { text-decoration: none; }
+#details ul.badged li:hover > span:not(.badge) { text-decoration: underline; }
+/* Search, in the Case panel beside the Case menu */
+#search { flex: 1 1 140px; min-width: 140px; max-width: 260px; }
+/* A field's add-to-View action changes the View, so it is a small bordered button; its add-to-search sibling opens a
+   search, so it is a link. Both show on hover or keyboard focus, so the field list stays readable. */
+dd button.addview, dd button.addsearch { margin-left: 8px; font-size: var(--t-11); opacity: 0; }
+dd button.addview { padding: 0 6px; }
+dd:hover button.addview, dd button.addview:focus, dd:hover button.addsearch, dd button.addsearch:focus { opacity: 1; }
+dd button.addview.active { opacity: 1; border-color: var(--suspicious-text); color: var(--suspicious-text); }   /* in the view filter: shown without hovering */
+
+/* Event page: the header band stays put and the two columns below scroll on their own, so a
+   value at the bottom of the fields can go into a note without losing either place. Narrow panels scroll as one. */
+/* A header taller than the panel, as an event with a pending suggestion and rows of Hayabusa's chips has at a short
+   height, would leave the body no height at all: the body keeps 160 px, and the panel's scroller scrolls
+   to it, the header scrolling away with it rather than sticking over it. */
+#details[data-page="event"] > #detailsBody { display: flex; flex-direction: column; padding: 0; }
+#details[data-page="event"] > #detailsBody > .ev-head, #details[data-page="event"] > #detailsBody > .prov { flex: none; }
+#details[data-page="event"] > #detailsBody > .ev-body { flex: 1 1 auto; min-height: 160px; grid-template-rows: minmax(0, 1fr); }
+#details[data-page="event"] .ev-facts, #details[data-page="event"] .ev-work { overflow-y: auto; min-height: 0; }
+/* At 960 px and below the body scrolls as one. The header sticks, so the verdict and the marks stay in reach, unless it is
+   taller than half the body (event_page.js sets head-tall), when it scrolls away. event_page.js sets --head-h to the
+   height that sticks, and the list's heading sticks under it, since the body has no padding to inset it. */
+@media (max-width: 960px) {
+  #details[data-page="event"] > #detailsBody { display: block; }
+  #details[data-page="event"] > #detailsBody > .ev-head { position: sticky; top: 0; z-index: 3; }
+  #details.head-tall[data-page="event"] > #detailsBody > .ev-head { position: static; }
+  #details[data-page="event"] > #detailsBody > .ev-body { grid-template-rows: none; }
+  #details[data-page="event"] .ev-facts, #details[data-page="event"] .ev-work { overflow: visible; }
+  #details[data-page="event"] .ev-work .sticky-head { top: var(--head-h, 0px); }
+  #details[data-page="event"] .ev-work ul.rows li.rel-head { top: calc(var(--head-h, 0px) + var(--list-head-h, 0px)); }
+}
+
+/* Tags: chips on the Event page, and the tag picker in the shared popup menu */
+.verdict-row.tags { gap: 4px 6px; }
+.tagchip { display: inline-flex; align-items: center; padding: 0 0 0 8px; border: 1px solid var(--d5); border-radius: 10px;
+           font-size: var(--t-12); }
+.tagchip.technique { font-family: var(--mono); }
+.tagchip.tag { border-color: var(--muted); }
+.tagchip.suggested { border-style: dashed; border-color: var(--muted); color: var(--muted); }
+/* An older technique tag off the ATT&CK list, flagged as a finding's chip is */
+.tagchip.off-list { border-style: dashed; border-color: var(--suspicious-text); color: var(--suspicious-text); }
+/* the flag in words, as on a finding's chip, while the ID stays mono; a flex item drops its leading space, so a margin */
+.tagchip .flag { margin-left: .3em; font-family: system-ui, sans-serif; }
+.tagchip button { padding: 0 5px; border: 0; background: transparent; color: inherit; }
+#quickMenu .tactic-grid { display: grid; grid-template-rows: repeat(8, auto); grid-auto-flow: column; column-gap: 6px; }   /* down, then across: kill-chain order */
+#quickMenu button.on { font-weight: 600; }
+.vrow.none .name { color: var(--muted); }
+
+/* Audit trail */
+.audit-row { display: grid; grid-template-columns: 44px 120px 70px minmax(0, 1fr) auto; gap: 4px 8px; align-items: baseline;
+             padding: 4px 0; border-bottom: 1px solid var(--line); }
+.audit-row.correction { background: color-mix(in srgb, var(--suspicious-text) 8%, transparent); }
+.audit-row .seq, .ev-history .seq { font-family: var(--mono); color: var(--muted); }
+.audit-row .audit-actions { display: flex; gap: 6px; align-items: baseline; }
+.audit-confirm { grid-column: 4 / -1; padding: 6px 8px; border: 1px solid var(--suspicious-text); border-radius: 4px; }
+/* The event an entry names: quoted, cut at a boundary by the server, the whole name in its hover; it wraps as
+   the words around it do, and keeps the words' strike-through when the entry is undone */
+#details .audit-row .ev-name { font: inherit; text-align: left; white-space: normal; overflow-wrap: anywhere; text-decoration: inherit; }
+#details .audit-row .ev-name:hover { text-decoration: underline; }
+.gone { text-decoration: line-through; color: var(--muted); }
+.correction-tag { margin-left: 6px; padding: 0 7px; border-radius: 9px; font-size: var(--t-11); border: 1px solid var(--suspicious-text);
+                    color: var(--suspicious-text); }
+#details button.undo { border-color: var(--suspicious-text); color: var(--suspicious-text); }
+.ev-history ul.history { margin: 2px 0 4px; padding-left: 0; list-style: none; font-size: var(--t-12); }
+#details .notes button.retract { margin-left: 8px; font-size: var(--t-11); }
+
+/* Import page: the files on the left, the selected file's mapping and preview on the right */
+.imp { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 12px; }
+.imp-files { border-right: 1px solid var(--line); padding-right: 10px; min-width: 0; }
+#details .imp-files h3 { margin-top: 0; }
+.imp-file { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 4px; padding: 4px; border-radius: 4px; }
+.imp-file.sel { background: var(--bg); }
+.imp-file button.linklike { overflow-wrap: anywhere; }
+.imp-file .imp-path { overflow-wrap: anywhere; }   /* a file loaded as tool output, listed and not picked */
+.imp-map { min-width: 0; }
+.imp-scroll { overflow-x: auto; margin: 6px 0; border: 1px solid var(--line); }
+#details table.imp-table { margin: 0; width: max-content; min-width: 100%; }
+#details .imp-table th, #details .imp-table td { max-width: 220px; padding: 2px 6px; border: 1px solid var(--line); text-align: left;
+  overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: var(--t-12) var(--mono); color: var(--fg);
+  width: auto; word-break: normal; }
+#details .imp-table th { background: var(--panel-2); font-family: inherit; }
+#details .imp-table th.name { color: var(--muted); font-weight: 400; }
+#details .imp-table th.mapped select { border-color: var(--accent); }
+.imp-settings { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 0 10px; align-items: center; }
+#details .imp-settings .actions { margin: 3px 0; }
+.imp-wide { flex: 1 1 360px; min-width: 200px; font-family: var(--mono); }
+.imp-problem { margin: 4px 0; padding: 4px 8px; border: 1px solid var(--suspicious-text); border-radius: 4px;
+               background: var(--decision-bg); }
+ul.imp-events { margin: 0; padding-left: 0; list-style: none; font-size: var(--t-12); }
+ul.imp-events li { display: flex; flex-wrap: wrap; gap: 0 10px; padding: 2px 0; border-bottom: 1px solid var(--line); }
+ul.imp-events .time { font-family: var(--mono); }
+ul.imp-events .host { font-weight: 600; }
+ul.imp-events .msg { flex: 1 1 300px; min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 960px) { .imp { grid-template-columns: minmax(0, 1fr); } .imp-files { border-right: 0; } }
+
+/* Search results say where the matches are. The highlight stays --fg, so a match in
+   muted text does not fall below 3:1 in dark mode. */
+mark { background: var(--mark-bg); color: var(--fg); border-radius: 2px; }
+#searchHelp { margin-left: -8px; padding: 2px 7px; font-weight: 600; }
+.match-strip-box { margin: 6px 0; max-width: 720px; }
+.match-strip { display: flex; align-items: flex-end; gap: 1px; height: 32px; border-bottom: 1px solid var(--line); }
+.match-strip .bar { flex: 1 1 0; min-width: 2px; background: var(--d5); cursor: zoom-in; }
+.match-strip .bar.empty { background: var(--line); cursor: default; }
+.match-strip .bar:hover { background: var(--related); }
+/* The strip and, to its right, the link to the rules found by name under the results; the link wraps under a narrow strip */
+.strip-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; }
+.strip-row .match-strip-box { flex: 1 1 320px; }
+.strip-row .by-name-link { flex: none; }
+.match-strip-ends { display: flex; justify-content: space-between; font-size: var(--t-11); }
+.related li .found { color: var(--muted); }
+.whole-word { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }   /* the Whole word tick in the search head */
+/* The search page's lines under the count: the reach line, the heading of a search with no match, and the box that names
+   the rules found by title (Also found by name) or the fields that hold the words (the zero-result hint).
+   The box's list keeps its heading row unstuck: it is short. */
+.reach { margin: 2px 0 6px; font-size: var(--t-12); color: var(--muted); }
+.list-head { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 6px 0 2px; }
+.list-head strong { font-weight: 600; }
+.hint-box { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line-strong); border-left: 3px solid var(--accent); border-radius: 4px;
+            background: var(--panel-2); }
+.hint-box p { margin: 0 0 4px; }
+#details .related .hint-box > ul { margin: 2px 0 0; padding-left: 0; list-style: none; }
+#details .related .hint-box li.demo { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; margin: 3px 0;
+                                      font: inherit; cursor: default; text-decoration: none; }
+.hint-box .by-rule + .by-rule { margin-top: 10px; }
+#details .related .hint-box ul.rows li.rel-head { position: static; background: var(--panel-2); }
+#details .help-table { width: auto; }
+#details .help-table td { border-top: 1px solid var(--line); padding: 3px 12px 3px 0; word-break: normal; width: auto; }
+#details .help-table td:first-child { color: var(--fg); font-family: var(--mono); }
+#details button.mono { font-family: var(--mono); }
+ul.help-examples { margin: 4px 0; padding-left: 18px; }
+
+/* Hayabusa's suggested tags: accept at the left end, dismiss at the right, each tinted */
+.tagchip.split { padding: 0; overflow: hidden; align-items: stretch; }
+.tagchip.split .label { padding: 1px 8px; }
+.tagchip.split button.end { width: 26px; padding: 0; border: 0; border-radius: 0; font-size: var(--t-14); font-weight: 600; }
+.tagchip.split button.accept { background: color-mix(in srgb, var(--authorized-text) 14%, var(--panel)); color: var(--authorized-text);
+                               border-right: 1px dashed var(--authorized-text); }
+.tagchip.split button.dismiss { background: color-mix(in srgb, var(--malicious-text) 14%, var(--panel)); color: var(--malicious-text);
+                                border-left: 1px dashed var(--malicious-text); }
+.tagchip.split button.accept:hover, .tagchip.split button.accept:focus-visible { background: var(--fill-authorized); color: var(--on-fill); }
+.tagchip.split button.dismiss:hover, .tagchip.split button.dismiss:focus-visible { background: var(--fill-malicious); color: var(--on-fill); }
+
+/* Tools page */
+#details table.tools-table { width: auto; min-width: 70%; }
+#details .tools-table th { text-align: left; font-weight: 600; color: var(--muted); padding: 2px 14px 2px 0; }
+#details .tools-table td { font-family: inherit; font-size: var(--t-13); padding: 4px 14px 4px 0; word-break: normal; width: auto; color: var(--fg); }
+#details .tools-table td:first-child { white-space: nowrap; }
+#details .tools-table .ok { color: var(--authorized-text); }
+#details .tools-table .warn { color: var(--suspicious-text); }
+.tools-job { margin: 6px 0; padding: 6px 10px; border: 1px solid var(--d5); border-radius: 4px; }
+.tools-job.failed { border-color: var(--malicious-text); }
+.tools-job ul, ul.tools-unread, ul.tools-others { margin: 4px 0; padding-left: 18px; }
+ul.tools-unidentified { font: var(--t-12) var(--mono); }
+
+/* Start page */
+body.start-page #status { margin-left: auto; }
+#start { flex: 1 1 auto; overflow-y: auto; margin: 8px 16px 12px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); }
+#start h2 { font-size: var(--t-14); margin: 0 0 8px; }
+#start h3 { font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 0 4px; }
+#start .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; }
+#start .mono, #start input.mono { font-family: var(--mono); font-size: var(--t-12); }
+#start input.wide { flex: 1 1 360px; min-width: 220px; }
+#start .ok { color: var(--authorized-text); }
+#start .warn { color: var(--suspicious-text); }
+#start button[disabled] { opacity: .45; cursor: not-allowed; }
+.start-grid { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 2fr); gap: 20px; }
+.start-recent { border-right: 1px solid var(--line); padding-right: 16px; min-width: 0; }
+.start-case { padding: 6px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.start-case.current { border-left: 3px solid var(--line-strong); padding-left: 8px; }
+.start-case .name { font-weight: 600; }
+.start-copy { margin: 4px 0 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; }
+.start-copy label { display: flex; gap: 6px; align-items: center; margin: 3px 0; }
+.start-field { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 0 10px; align-items: start; margin: 6px 0; }
+.start-field > span { padding-top: 4px; }
+.start-field [data-check] { overflow-wrap: anywhere; }
+.start-field [data-check="tools"] { white-space: pre-line; }   /* one detected executable per line */
+.start-browser { margin: 4px 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px; max-height: 260px; overflow-y: auto; }
+.start-browser ul { margin: 2px 0; padding-left: 16px; columns: 2; }
+.start-job { margin: 8px 0; padding: 6px 10px; border: 1px solid var(--d5); border-radius: 4px; }
+.start-job.failed { border-color: var(--malicious-text); }
+.start-job .start-left-out { margin: 4px 0 0; padding-left: 18px; overflow-wrap: anywhere; }
+.start-job { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.start-job > :not(.start-spinner):not(.start-job-line) { flex-basis: 100%; }
+.start-spinner { width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--d5); border-radius: 50%;
+                 animation: start-spin 0.9s linear infinite; }
+@keyframes start-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .start-spinner { animation: none; border-top-color: var(--d5); border-right-color: var(--d5); } }
+.start-job .progress { height: 6px; margin-top: 4px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+.start-job .bar { height: 100%; background: var(--d5); }
+.start-steps { margin: 12px 0 0; padding-left: 20px; }
+.start-build { margin: 16px 0 0; font-size: var(--t-11); }
+@media (max-width: 960px) { .start-grid { grid-template-columns: minmax(0, 1fr); } .start-recent { border-right: 0; } }
+
+/* Host clocks against the capture: the Case panel's switch, lane label flags, the Hosts
+   panel's check, and the Event page's note */
+#clockSwitch { display: inline-flex; align-items: center; }
+#clockSwitch[hidden] { display: none; }
+#clockSwitch .switch-label { margin-right: 6px; color: var(--muted); }
+#clockSwitch button:first-of-type { border-radius: 4px 0 0 4px; }
+#clockSwitch button + button { margin-left: -1px; border-radius: 0 4px 4px 0; }
+#clockSwitch button[aria-pressed="true"] { position: relative; }
+#clockPartly { margin-left: 8px; color: var(--suspicious-text); }
+#clockSwitch button[aria-disabled="true"], button.align-clock[aria-disabled="true"] { opacity: .6; cursor: progress; }
+#labels .clock-flag, .lg-flag.clock-flag { margin-left: 6px; padding: 0 5px; border: 1px solid var(--suspicious-text); border-radius: 8px;
+                                           color: var(--suspicious-text); font-size: 10px; font-weight: 400; }
+#labels .clock-flag.aligned, .lg-flag.clock-flag.aligned { border-color: var(--line); color: var(--muted); }
+#hostsTable .clock-check { max-width: 340px; margin-top: 4px; font-size: var(--t-12); white-space: normal; }
+#hostsTable .clock-check.flag { padding: 4px 8px; border: 1px solid var(--suspicious-text); border-radius: 4px;
+                                background: var(--decision-bg); }
+#hostsTable .clock-check.disagree { padding-left: 6px; border-left: 3px solid var(--suspicious-text); }
+#hostsTable .clock-head { font-weight: 600; }
+#hostsTable .clock-check button { margin-top: 4px; }
+.ev-clock { margin: 4px 0 2px; padding: 3px 8px; border-left: 3px solid var(--suspicious-text); border-radius: 2px;
+            background: var(--decision-bg); font-size: var(--t-12); overflow-wrap: anywhere; }
+.ev-clock.agrees { border-left-color: var(--muted); background: var(--panel); }
+.ev-clock-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 3px; }
+#details .ev-clock button { padding: 0 8px; font-size: var(--t-12); }
+
+/* The Case panel grouped by job: the case and its state, the path, and the Case menu */
+/* A long case name and state line ellipsize (the whole text is in their hovers) so the Case panel keeps one row from 1280 px
+   up; the stage had paid 27 to 33 px of lanes for a second row */
+#caseId { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; max-width: 220px; }
+#caseId strong { font-size: var(--t-14); }
+#caseId strong, #caseState { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#caseState { color: var(--muted); font-size: 11.5px; }
+#caseState .warn { color: var(--malicious-text); font-weight: 600; }
+#path { display: inline-flex; gap: 2px; padding: 3px; border-radius: 6px; background: var(--bg); }
+#path button { padding: 3px 12px; border: 0; border-radius: 4px; background: transparent; }
+#path button:hover { box-shadow: 0 0 0 1px var(--line); }
+#path button[aria-current="page"] { background: var(--panel); box-shadow: 0 0 0 1px var(--muted); font-weight: 600; }
+header .grow { flex: 1 1 auto; }
+#caseMenuBox { position: relative; }
+#caseMenu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 20; min-width: 200px; padding: 4px 0;
+            background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 18px rgba(0,0,0,.28); }
+#caseMenu[hidden] { display: none; }
+#caseMenu button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 4px 12px;
+                   border: 0; border-radius: 0; background: transparent; text-align: left; }
+#caseMenu button:hover, #caseMenu button:focus-visible { background: var(--bg); }
+
+/* The Timeline's own toolbar, which is the Timeline's band, and its state line. In the first row's
+   corner sits the Legend button, however the toolbar wraps beside an open legend. */
+#tlToolbar { position: relative; padding: 3px 84px 3px 8px; }
+#legendButton { position: absolute; top: 3px; right: 8px; }
+#tlToolbar label { color: var(--muted); }
+#stateLine { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 14px; padding: 2px 8px; font-size: var(--t-12);
+             font-variant-numeric: tabular-nums; border-bottom: 1px solid var(--line); background: var(--state-bg); }
+#stateLine b { font-weight: 600; font-variant-numeric: tabular-nums; }
+#stHidden, #stClock { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+#stHidden:empty, #stClock:empty { display: none; }
+#stWindow { margin-left: auto; white-space: nowrap; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 0 3px 0 8px; border: 1px solid var(--line-strong);
+        border-radius: 10px; background: var(--panel); }
+.pill.flag { border-color: var(--suspicious-text); }
+.pill button { padding: 0 7px; font-size: 11.5px; border-radius: 8px; }
+
+/* The legend: every mark the timeline draws, in the tokens draw.js reads, so it follows dark mode */
+#legendPanel { flex: 0 0 310px; overflow-y: auto; padding: 0 12px 8px; background: var(--panel); border: 1px solid var(--line);
+               border-top: 3px solid var(--band-timeline-edge); font-size: var(--t-12); }
+#legendPanel .band.panel-head { margin: 0 -12px 8px; padding: 3px 12px; }
+#legendPanel h3 { margin: 10px 0 4px; font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+                  color: var(--muted); }
+.lg-item { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 8px; align-items: center; margin: 4px 0; }
+.lg-item svg { width: 34px; height: 20px; overflow: visible; }
+.lg-item.flagrow { grid-template-columns: max-content minmax(0, 1fr); }
+.lg-item .lg-flag { margin-left: 0; justify-self: start; }
+.lg-unreviewed { fill: var(--unreviewed); } .lg-authorized { fill: var(--authorized); }
+.lg-suspicious { fill: var(--suspicious); } .lg-malicious { fill: var(--malicious); }
+.lg-hollow { fill: none; stroke: var(--suspicious); stroke-width: 1; }
+.lg-hit { fill: none; stroke: var(--hit); stroke-width: 1.5; }
+.lg-select { fill: none; stroke: var(--select); stroke-width: 2; }
+.lg-related { fill: var(--related); }
+.lg-faded { fill: var(--muted); }
+.lg-d1 { fill: var(--d1); } .lg-d3 { fill: color-mix(in srgb, var(--d1), var(--d5)); } .lg-d5 { fill: var(--d5); }
+.lg-hitline { fill: var(--hit); }
+.lg-link { fill: none; stroke: var(--link); stroke-width: 1.5; } .lg-link-head { fill: var(--link); }
+.lg-link.outside { stroke-dasharray: 4 3; } .lg-link.grouped { stroke-width: 4; }
+.lg-link-count { fill: var(--link); font: var(--t-11) system-ui, sans-serif; }
+.lg-window { fill: none; stroke: var(--related); stroke-width: 1; stroke-dasharray: 3 3; }
+.lg-window-gap { fill: var(--related); font: 10px system-ui, sans-serif; }
+.lg-pair { fill: none; stroke: var(--suspicious); stroke-width: 1.5; stroke-dasharray: 6 4; }
+
+/* The Case overview, over the timeline and the Details panel, which stay laid out behind it */
+#overview { position: absolute; inset: 0; z-index: 5; overflow-y: auto; padding: 8px 16px 12px; background: var(--bg); }
+#overview[hidden] { display: none; }
+.ov-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 12px; }
+.ov-grid > section { min-width: 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.ov-grid > .span2 { grid-column: 1 / -1; }
+.ov-grid h2 { font-size: var(--t-12); margin: 0 0 8px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.ov-grid h3 { font-size: var(--t-11); margin: 12px 0 6px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.ov-lead { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 8px 0;
+           border-top: 1px solid var(--line); }
+.ov-lead:first-child { border-top: 0; }
+.ov-lead .bar { align-self: stretch; border-radius: 2px; background: var(--unreviewed); }
+.ov-lead .bar.critical, .ov-lead .bar.high { background: var(--malicious); }
+.ov-lead .bar.medium, .ov-lead .bar.suggestion { background: var(--suspicious); }
+.ov-lead .t { font-weight: 600; overflow-wrap: anywhere; }
+.ov-lead .why { color: var(--muted); overflow-wrap: anywhere; }
+.ov-lead .counts { font-size: var(--t-12); }
+.ov-lead.worked .t { font-weight: 400; color: var(--muted); }
+.ov-lead.worked .bar { opacity: .35; }
+.ov-badge { display: inline-block; margin-left: 6px; padding: 0 7px; border: 1px solid var(--authorized-text); border-radius: 9px;
+            color: var(--authorized-text); font-size: var(--t-11); font-weight: 600; }
+.ov-chip { display: inline-block; margin: 2px 4px 0 0; padding: 0 7px; border: 1px solid var(--line); border-radius: 9px;
+           background: var(--panel-2); color: var(--muted); font-size: var(--t-11); }
+.ov-note { margin: 6px 0 0; color: var(--muted); font-size: 11.5px; }
+.ov-markbar { display: flex; height: 12px; margin: 6px 0 4px; border-radius: 3px; overflow: hidden; background: var(--bg); }
+.ov-markbar .malicious { background: var(--malicious); } .ov-markbar .suspicious { background: var(--suspicious); }
+.ov-markbar .authorized { background: var(--authorized); }
+.ov-legend { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.ov-dot { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border-radius: 2px; vertical-align: -1px; }
+.ov-dot.malicious { background: var(--malicious); } .ov-dot.suspicious { background: var(--suspicious); }
+.ov-dot.authorized { background: var(--authorized); }
+.ov-stats { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin-top: 10px; }
+.ov-stats > :nth-child(odd) { color: var(--muted); }
+.ov-table { width: 100%; border-collapse: collapse; }
+.ov-table th { padding: 3px 6px; text-align: left; font-size: 11.5px; font-weight: 600; color: var(--muted);
+               border-bottom: 1px solid var(--line); }
+.ov-table td { padding: 4px 6px; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.ov-table td:first-child { white-space: nowrap; }
+.ov-table .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ov-table .flag { color: var(--suspicious-text); font-weight: 600; }
+.ov-table ul { margin: 0; padding-left: 14px; }
+.ov-gaps { margin: 0; padding-left: 18px; }
+.ov-gaps li { margin: 3px 0; }
+.ov-gaps .warn { color: var(--suspicious-text); font-weight: 600; }
+.ov-integrity { display: flex; flex-wrap: wrap; gap: 6px 22px; color: var(--muted); }
+.ov-integrity b { color: var(--fg); font-weight: 600; }
+/* Integrity's Journal row and the trail's chain line: the state in red only on a break */
+.ov-journal { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.ov-journal .warn, .audit-journal .warn, .read-only.warn { color: var(--malicious-text); font-weight: 600; }
+.journal-continue { flex-basis: 100%; }
+.journal-continue textarea { width: 100%; max-width: 640px; }
+code.journal-head { font-size: var(--t-12); }
+#overview button.num { font-variant-numeric: tabular-nums; }
+@media (max-width: 960px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
+/* The Tools page's runs that failed or loaded nothing, which the overview's Gaps link to */
+#details ul.tools-gaps { margin: 4px 0; padding-left: 18px; }
+#details ul.tools-gaps li.flash, #details ul.tools-unidentified.flash { background: color-mix(in srgb, var(--suspicious-text) 20%, transparent); }

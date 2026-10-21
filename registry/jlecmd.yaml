@@ -1,0 +1,18 @@
+id: jlecmd
+name: JLECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/JLECmd.zip
+detect:
+  executables: [JLECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [jumplist]
+input: host_dir
+run:
+  # -d finds every *.automaticDestinations-ms and *.customDestinations-ms file under the host folder.
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "-q"]
+  timeout_minutes: 30
+options: []
+outputs: ["*Destinations.csv"]
+parser: jlecmd_csv
+notes: "Jump lists: the files and places each application opened, per user"

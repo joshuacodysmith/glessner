@@ -1,0 +1,17 @@
+id: event_xml
+name: Windows event XML
+publisher: glessner
+license: MIT
+# Part of the app: src/glessner/event_xml.py, run with the app's own Python in isolated mode, so nothing is
+# downloaded and the run is recorded like any tool's. It converts the XML to EvtxECmd's CSV layout, which the EvtxECmd
+# parser reads, so the events have the same fields as event logs.
+builtin: true
+handles: [event_xml]
+input: host_dir
+run:
+  args: ["-I", "-m", "glessner.event_xml", "{input_list}", "{output_dir}"]
+  timeout_minutes: 60
+options: []
+outputs: [event_xml.csv]
+parser: event_xml_csv
+notes: "Windows event XML from wevtutil, Event Viewer, a SIEM, or EvidenceForge (https://github.com/Cisco-Talos/EvidenceForge), read with the same fields as event logs"

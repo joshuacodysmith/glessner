@@ -1,0 +1,57 @@
+[project]
+name = "glessner"
+version = "0.2.0"
+description = "Windows triage for SOC analysts: runs Eric Zimmerman's tools, Hayabusa, and Suricata on a collection and puts every record on one timeline to pivot, mark, and export. Local, no AI, no network calls. Pre-alpha."
+readme = "README.md"
+authors = [
+    { name = "Joshua Cody Smith", email = "17328550+joshuacodysmith@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.6",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+glessner = "glessner.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.23,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "playwright>=1.63.0",
+    "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
+    "ruff==0.16.9",
+]
+
+[tool.pytest.ini_options]
+# Tests run on pytest-xdist workers, one per two logical CPUs (tests/conftest.py, which also keeps each module's browser
+# tests, and its lab tests, on one worker). -n 0 runs them one at a time, as print output and debugging need; --pdb does so by itself.
+addopts = "-n auto --dist loadgroup"
+required_plugins = "pytest-xdist>=3.8.0"   # a venv without xdist fails naming the plugin, not on an unknown -n
+markers = [
+    "lab: needs local copies of the public datasets and tools; skipped when they are absent",
+    "browser: drives the installed Edge through Playwright; skipped when either is missing",
+    "lint: runs ruff or ESLint over the code; skipped when that linter isn't installed",
+]
+
+# scripts/lint.py runs ruff with this configuration, and ESLint with eslint.config.mjs.
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+# Security rules (S) aren't selected.
+select = ["F", "E", "W", "B", "BLE", "UP", "I", "SIM", "C4", "PERF", "RUF"]
+ignore = [
+    "B905",     # zip() without strict=: each call in the code truncates on purpose
+    "E731",     # a lambda bound to a name is the code's idiom for one-line local helpers
+    "RUF005",   # `a + [b]` reads as well as `[*a, b]`
+    "SIM905",   # a word list written as one string and split, such as ZEEK_LOGS, stays readable on few lines
+]
+allowed-confusables = ["×"]   # the page's remove buttons show it, and a browser test checks for it
+
+[tool.ruff.lint.flake8-comprehensions]
+allow-dict-calls-with-keyword-arguments = true   # dict(artifact=..., ...) collects keyword arguments for Event

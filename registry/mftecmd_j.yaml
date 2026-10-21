@@ -1,0 +1,23 @@
+id: mftecmd_j
+name: MFTECmd ($J)
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/MFTECmd.zip
+detect:
+  executables: [MFTECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+# The USN journal: every file creation, rename, write, and deletion the journal still
+# holds, one event per change record. With its volume's $MFT, the one in the nearest folder above the $J, given by -m,
+# each change gets its folder. Without one the run has no -m and a note saying so, and the folder is empty. MFTECmd
+# only reads both files.
+handles: [usnjrnl]
+input: each_file
+related:
+  - {artifact: mft, args: ["-m", "{related}"]}
+run:
+  args: ["-f", "{input_file}", "--csv", "{output_dir}", "--csvf", "mftecmd_j.csv"]
+  timeout_minutes: 60
+options: []
+outputs: [mftecmd_j.csv]
+parser: mftecmd_j_csv
+notes: "The USN journal ($J): file creations, renames, writes, and deletions, with their folders from $MFT"

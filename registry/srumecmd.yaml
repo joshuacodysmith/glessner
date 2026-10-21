@@ -1,0 +1,22 @@
+id: srumecmd
+name: SrumECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/SrumECmd.zip
+detect:
+  executables: [SrumECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [srum]
+input: host_dir
+# SrumECmd opens SRUDB.dat with the Windows database engine, which rewrites it and leaves engine logs beside it. So it
+# reads copies in the run folder, with the SOFTWARE hive it uses to name accounts.
+work_on_copies: true
+copy_also: ["registry:SOFTWARE"]
+run:
+  # -d finds SRUDB.dat and the SOFTWARE hive under the host folder: here, the working copies.
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}"]
+  timeout_minutes: 30
+options: []
+outputs: ["*_SrumECmd_NetworkUsages_Output.csv"]
+parser: srumecmd_csv
+notes: "SRUM: network use and activity per application, saved about hourly"

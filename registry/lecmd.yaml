@@ -1,0 +1,17 @@
+id: lecmd
+name: LECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/LECmd.zip
+detect:
+  executables: [LECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [lnk]
+input: host_dir
+run:
+  args: ["-d", "{host_dir}", "-q", "--csv", "{output_dir}", "--csvf", "lecmd.csv"]
+  timeout_minutes: 30
+options: []
+outputs: [lecmd.csv]
+parser: lecmd_csv
+notes: The Source* times describe the collected copy of the LNK file, not the original, so the parser ignores them.

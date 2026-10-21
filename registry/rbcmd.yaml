@@ -1,0 +1,23 @@
+id: rbcmd
+name: RBCmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/net9/RBCmd.zip
+detect:
+  executables: [RBCmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [recycle_bin]
+# The .NET 9 build, on a .NET 9 runtime, ideally one unpacked in the tools folder. Its -d searches a folder for Recycle
+# Bin files without administrator rights. The .NET 4 build's -d needs the Backup privilege, so without administrator
+# rights it finds nothing (RBCmd source, GetRecycleBinFiles); empty_result names that if it's the one installed.
+# Intake identifies only $I files (identify.RECYCLE_VERSIONS), so a host that has only an INFO2 file is never planned.
+dotnet: 9
+input: host_dir
+run:
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--csvf", "rbcmd.csv", "-q"]
+  timeout_minutes: 10
+options: []
+outputs: [rbcmd.csv]
+empty_result: "RBCmd found none of the host's Recycle Bin files. Its .NET 4 build needs administrator rights to search folders; install the .NET 9 build and a .NET 9 runtime."
+parser: rbcmd_csv
+notes: "Recycle Bin: deleted files' original paths and deletion times"

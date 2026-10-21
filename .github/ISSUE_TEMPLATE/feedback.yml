@@ -1,0 +1,137 @@
+name: Feedback
+description: Tell us how Glessner worked for you, or where it didn't.
+title: "Feedback: "
+labels: ["feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Short answers are fine. Skip any question that doesn't apply.
+
+        **This issue is public. Don't attach or paste evidence, case files, or real incident data.** Remove client names, host names, account names, addresses, and screenshots of case data. Describe what you saw in general terms, or use a synthetic example.
+
+        Follow-up questions come as comments on this issue. Don't post an email address or phone number here.
+
+        Report a security problem privately instead, through the repository's **Security and quality** tab and **Report a vulnerability**. Don't open an issue for it.
+
+        Check known_limitations.md in the repository before you report something the app is known not to do.
+  - type: input
+    id: experience
+    attributes:
+      label: Experience
+      description: How many years have you worked incidents or forensics?
+    validations:
+      required: false
+  - type: input
+    id: current_tools
+    attributes:
+      label: Your current tools
+      description: Which tools do you use most for Windows triage today?
+    validations:
+      required: false
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: Run `uv run glessner --version` and paste the result.
+      placeholder: "0.2.0+abc1234"
+    validations:
+      required: false
+  - type: textarea
+    id: what_you_used_it_for
+    attributes:
+      label: What you used it for
+      description: A practice case, a training exercise, or your own case. If it was your own case, say what kind of incident in general terms, such as ransomware on 6 hosts.
+    validations:
+      required: false
+  - type: input
+    id: timing
+    attributes:
+      label: Timing
+      description: If you timed yourself, how many minutes from opening the timeline did it take to find the initial access and the first lateral movement? Write "not found" for any you didn't find.
+    validations:
+      required: false
+  - type: textarea
+    id: what_led_you
+    attributes:
+      label: What led you to what you found
+      description: For example, a Hayabusa suggestion, a logon arrow, a search, or a pivot.
+    validations:
+      required: false
+  - type: textarea
+    id: stuck
+    attributes:
+      label: Where you got stuck
+      description: Where did you get stuck, and for how long?
+    validations:
+      required: false
+  - type: textarea
+    id: missing
+    attributes:
+      label: What you looked for and didn't find
+      description: What did you look for that Glessner didn't show or couldn't do?
+    validations:
+      required: false
+  - type: textarea
+    id: missing_sources
+    attributes:
+      label: Artifacts or log sources it didn't read
+      description: Which artifacts or log sources did you need that Glessner didn't read?
+    validations:
+      required: false
+  - type: textarea
+    id: ratings
+    attributes:
+      label: Ratings
+      description: Rate each task from 1 (hard) to 5 (easy). Add a word on why if you like.
+      value: |
+        Installing it and setting up a case:
+        Reading the timeline:
+        Following one account or address across hosts:
+        Marking and tagging events:
+        Search:
+        Exports and the report:
+    validations:
+      required: false
+  - type: textarea
+    id: broke
+    attributes:
+      label: What broke
+      description: Say what you did, what you expected, and what happened. For a problem you can reproduce, use the bug report form instead.
+    validations:
+      required: false
+  - type: textarea
+    id: new_information
+    attributes:
+      label: Anything new it showed you
+      description: Did Glessner show you anything you hadn't already found?
+    validations:
+      required: false
+  - type: textarea
+    id: disagreed
+    attributes:
+      label: Anything that disagreed
+      description: Did anything in Glessner disagree with your earlier findings or with the source tools?
+    validations:
+      required: false
+  - type: textarea
+    id: next_incident
+    attributes:
+      label: Your next Windows incident
+      description: Would you use Glessner on it? Why or why not?
+    validations:
+      required: false
+  - type: textarea
+    id: one_change
+    attributes:
+      label: The one change that would help most
+      description: What one change would make the most difference?
+    validations:
+      required: false
+  - type: checkboxes
+    id: no_evidence
+    attributes:
+      label: Evidence and real data
+      options:
+        - label: I have not attached or pasted evidence, case files, or real incident data.
+          required: true

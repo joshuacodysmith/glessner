@@ -1,0 +1,27 @@
+id: sqlecmd
+name: SQLECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/net9/SQLECmd.zip
+detect:
+  executables: [SQLECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+# Browser history, downloads, searches, and typed URLs (Chrome, Edge, Brave, Firefox), and Windows notifications, by
+# the maps in the tool's Maps folder. The .NET 9 build; .NET 9 from the tools folder.
+# SQLite may write beside a database it opens, so it runs on copies, with each database's log files. --hunt false: a
+# map applies to the database file it names, rather than to every SQLite file.
+dotnet: 9
+handles: [sqlite]
+input: host_dir
+work_on_copies: true
+copy_also: [sqlite_log]
+run_in_run_folder: true
+run:
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--hunt", "false"]
+  timeout_minutes: 30
+options: []
+outputs: ["*.csv"]
+empty_result: "SQLECmd's maps matched none of the host's SQLite databases."
+empty_ok: true
+parser: sqlecmd_csv
+notes: "Browser history, downloads, searches, and typed URLs, and Windows notifications"

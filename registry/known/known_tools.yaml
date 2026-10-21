@@ -1,0 +1,78 @@
+# Tools the app knows of but doesn't run. The Tools page names any it finds in the tools
+# folder, with its status. Each entry's url is the tool's public page. A tool moves to a registry file when it gets a
+# parser.
+- name: bstrings
+  executables: [bstrings.exe]
+  reads: Strings from any file, with built-in patterns
+  status: Not a timeline tool. It suits search or an indicator sweep.
+  url: https://ericzimmerman.github.io/
+- name: AppCompatCacheParser
+  executables: [AppCompatCacheParser.exe]
+  reads: Shimcache in the SYSTEM hive
+  status: Not run by the app. RECmd's batch file already reads shimcache.
+  url: https://ericzimmerman.github.io/
+- name: RecentFileCacheParser
+  executables: [RecentFileCacheParser.exe]
+  reads: RecentFileCache.bcf, on Windows 7
+  status: Not run by the app yet
+  url: https://ericzimmerman.github.io/
+- name: Chainsaw
+  executables: ["chainsaw*.exe"]
+  reads: Event logs, with its own hunting rules and a check for deleted records
+  status: Not run by the app yet. Planned as a source of anti-forensics leads.
+  url: https://github.com/WithSecureLabs/chainsaw/releases
+- name: YARA-X
+  executables: [yr.exe]
+  reads: File contents, with YARA rules
+  status: Not run by the app yet. It writes results only to the console, which the runner can't load yet.
+  url: https://github.com/VirusTotal/yara-x/releases
+- name: Zircolite
+  executables: ["zircolite*.exe"]
+  reads: Event logs and CSV or JSON exports, with Sigma rules
+  status: Not run by the app yet
+  url: https://github.com/wagga40/Zircolite
+- name: Hindsight
+  executables: ["hindsight*.exe"]
+  reads: Chrome, Edge, and Firefox browser history
+  status: Not run by the app yet
+  url: https://github.com/RyanDFIR/hindsight
+- name: SRUM-DUMP
+  executables: ["srum_dump*.exe"]
+  reads: SRUDB.dat with the SOFTWARE hive
+  status: Not run by the app. SrumECmd reads the same database.
+  url: https://github.com/MarkBaggett/srum-dump
+- name: KAPE
+  executables: [kape.exe, gkape.exe]
+  reads: Live systems and images, to collect triage evidence
+  status: Collects evidence. Its output is the evidence layout the app reads.
+  url: https://www.kroll.com/kape
+- name: Timeline Explorer
+  executables: [TimelineExplorer.exe]
+  reads: CSV timelines, including the app's exports
+  status: A viewer, used beside the app
+  url: https://ericzimmerman.github.io/
+- name: Registry Explorer
+  executables: [RegistryExplorer.exe]
+  reads: Registry hives
+  status: A viewer, used beside the app
+  url: https://ericzimmerman.github.io/
+- name: MFTExplorer
+  executables: [MFTExplorer.exe]
+  reads: $MFT
+  status: A viewer, used beside the app
+  url: https://ericzimmerman.github.io/
+- name: ShellBags Explorer
+  executables: [ShellBagsExplorer.exe]
+  reads: ShellBags
+  status: A viewer, used beside the app. SBECmd, its command-line version, is in the registry.
+  url: https://ericzimmerman.github.io/
+- name: JumpList Explorer
+  executables: [JumpListExplorer.exe]
+  reads: Jump lists
+  status: A viewer, used beside the app. JLECmd, its command-line version, is in the registry.
+  url: https://ericzimmerman.github.io/
+- name: EZViewer
+  executables: [EZViewer.exe]
+  reads: Documents and other files, without the programs that made them
+  status: A viewer, used beside the app
+  url: https://ericzimmerman.github.io/

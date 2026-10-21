@@ -1,0 +1,5442 @@
+{
+ "about": {
+  "title": "Pivot guidance for the Event page",
+  "written": "From public pages, the app's code, and measurements on cases built from public datasets, each listed in sources. A kind's measured field gives counts taken on a case built from the Stolen Szechuan Sauce dataset when the table was written, some of them before the pivot or the parser fix they count was built, so the same case rebuilt with this version can count differently.",
+  "explained_in": "This about block, which describes the table's fields. Each row cites its sources by key in sources.",
+  "status": "The app reads this file for the Event page's next pivots and the counts in To investigate. The reasons, ranks, and default windows are fixed here, each row with its sources, and the app writes none of them.",
+  "choosing_a_kind": "Kinds are tried in order, overlays aside; the first whose match fits the event wins. 'default' matches every event and comes last. An overlay kind (hayabusa_hit) adds its rows after the event's own kind's when its match fits, skipping any pivot the kind already ranks.",
+  "match": "Each key is an events-table column, compared without letter case. A string must equal the column; a list means any of its values; {\"contains\": s} and {\"starts_with\": s} test part of the column. {\"any_of\": [...]} fits when one of its objects fits. has_hayabusa_hit means the event has Hayabusa hits joined (the Event page's ev.hits). Channel and provider names are as Windows writes them. Some come from documentation, not from a case. The same language serves a row's when, a not_offered entry's when, and a caveat's when.",
+  "pivots": "status: built or later. A kind ranks only built pivots; a later pivot appears only in a kind's later list, which the app ignores. A ranked pivot not in pivots.BUILT drops out, with the sentences that send the analyst to it, and the rows below it move up. note names a search that reaches the same events by hand, where there is one.",
+  "pivot_entry": "rank orders the rows. label overrides the pivot's catalog label. args: seconds for window ('case' means the case's time_window_seconds); end for addr (source_ip, dest_ip, remote: the end that isn't one of the seed host's addresses, internal: the end that is a collected host's, external: an end that is not a collected host's address, the first in source, destination order, each: a row per address); value for a file_name row with a fixed name; term for search, with {column} or {data.Field} filled from the event; term_hint where the field name needs checking. when limits a row to events matching it. count false means the row shows no count (a search with a free-text word). breakdown: 'always' for the window row, 'over_limit' for the rest (shown when the count passes 500). broad lists the broad_rules that can flag this row; over_limit applies to every counted row; the window row takes window_text. broad_text replaces the rule's text for this row.",
+  "caveat": "null, or {text, when, check}. text says where the matching misses what the reason promises. when limits it to events that meet the condition. check short_path: once the row is counted, the page shows what the host's MFT says the 8.3 path stands for in the caveat's place, and keeps the caveat where the MFT cannot say.",
+  "rows_not_in_the_table": "A pivot whose key the event lacks moves to the not-offered line with its usual reason (core.js PIVOTS), or with the kind's not_offered reason when its when fits. not_offered_always applies to every kind. A pivot the page offers that a kind doesn't rank goes on one line after the ranked rows, as a plain link with no count, so the page drops none of the pivots it offers.",
+  "counts": "Each counted row's count is an exact case-wide count(*) with the click's own conditions, run after the Event page draws.",
+  "empty_reasons": "The sentences a pivot shows when it finds only the event itself. A sentence with when shows only when its condition fits."
+ },
+ "pivots": {
+  "session": {
+   "label": "Same logon session",
+   "status": "built",
+   "note": "",
+   "matches": "Same host and logon ID, without letter case, with no time bound. A logon ID is unique only until the host restarts, so after a restart the list can join another session's events"
+  },
+  "account": {
+   "label": "Same account",
+   "status": "built",
+   "note": "",
+   "matches": "The account key, without letter case: name@realm and user/REALM split, and each spelling of the domain that the case's SIDs show is one domain, with the same name where no domain is recorded"
+  },
+  "source_ip": {
+   "label": "Same source IP",
+   "status": "built",
+   "note": "",
+   "matches": "Same source address, as stored"
+  },
+  "connection": {
+   "label": "Same source IP and port",
+   "status": "built",
+   "note": "",
+   "matches": "Same source address and port, within the case's time window around the event. Its list offers the case-wide match, where a reused port joins other connections"
+  },
+  "file": {
+   "label": "Same file",
+   "status": "built",
+   "note": "",
+   "matches": "Same normalized path (file_key)"
+  },
+  "addr": {
+   "label": "Same IP at either end",
+   "status": "built",
+   "note": "",
+   "matches": "The address as source or destination, as stored"
+  },
+  "window": {
+   "label": "Same host within \u00b1N s",
+   "status": "built",
+   "note": "",
+   "matches": "Same host lane within N seconds (1 to 3,600)"
+  },
+  "search": {
+   "label": "Search",
+   "status": "built",
+   "note": "",
+   "matches": "A search term the row fills in from the event, which the analyst can also type"
+  },
+  "file_name": {
+   "label": "Same file name",
+   "status": "built",
+   "note": "",
+   "matches": "The last part of the path (or of the process's, when the event has no path), in any folder, without letter case. A bare name such as SRUM's counts, and so does a capture's URL path"
+  },
+  "service_name": {
+   "label": "Same service name",
+   "status": "built",
+   "note": "",
+   "matches": "The service's key name or display name, on any host"
+  },
+  "workstation": {
+   "label": "Same workstation",
+   "status": "built",
+   "note": "search: workstation:",
+   "matches": "Same source_workstation, without letter case"
+  },
+  "flow": {
+   "label": "Same flow",
+   "status": "built",
+   "note": "",
+   "matches": "Suricata flow_id, or Zeek uid for imported Zeek logs"
+  },
+  "task_name": {
+   "label": "Same task name",
+   "status": "built",
+   "note": "",
+   "matches": "The task's path and name: TaskName in 4698, 4699, 4702 and Task Scheduler events, Autoruns' Entry for Tasks, RECmd TaskCache's Path"
+  },
+  "rule": {
+   "label": "Same rule or signature",
+   "status": "built",
+   "note": "search: code: for a Suricata signature",
+   "matches": "A Suricata or imported IDS alert's signature (event_code), or a Hayabusa hit's rule title"
+  },
+  "parent_process": {
+   "label": "Parent process",
+   "status": "later",
+   "note": "search: parent:",
+   "matches": "The parent's own creation event: Sysmon ParentProcessGuid, or 4688's creator PID on the same host before this event"
+  },
+  "process": {
+   "label": "Same process",
+   "status": "later",
+   "note": "",
+   "matches": "Sysmon ProcessGuid"
+  },
+  "hash": {
+   "label": "Same hash",
+   "status": "built",
+   "note": "",
+   "matches": "Any of the event's file hashes, lower case, any algorithm: MD5, SHA-1, and SHA-256 from Amcache, Autoruns, Sysmon, Suricata fileinfo, and Zeek files"
+  },
+  "registry_key": {
+   "label": "Same registry key",
+   "status": "later",
+   "note": "search: registry_key:",
+   "matches": "Same registry_path"
+  },
+  "folder": {
+   "label": "Same folder",
+   "status": "later",
+   "note": "",
+   "matches": "Files whose key has the same parent folder"
+  },
+  "mft_entry": {
+   "label": "Same MFT entry",
+   "status": "later",
+   "note": "",
+   "matches": "MFT entry and sequence number"
+  },
+  "dns_name": {
+   "label": "Same DNS name",
+   "status": "later",
+   "note": "",
+   "matches": "The query name"
+  },
+  "dns_answer": {
+   "label": "DNS answer address",
+   "status": "later",
+   "note": "",
+   "matches": "Events at either end of an address the name resolved to"
+  },
+  "dhcp_lease": {
+   "label": "DHCP lease",
+   "status": "later",
+   "note": "",
+   "matches": "The lease that held this address at this time"
+  },
+  "rdp_session": {
+   "label": "Same RDP session",
+   "status": "later",
+   "note": "",
+   "matches": "The Remote Desktop session ID on the same host"
+  },
+  "volume": {
+   "label": "Same volume",
+   "status": "later",
+   "note": "",
+   "matches": "The volume serial number a shortcut records"
+  },
+  "host_at_address": {
+   "label": "Host at this address within \u00b1N s",
+   "status": "later",
+   "note": "",
+   "matches": "The lane of the collected host that owns the address, within N seconds"
+  },
+  "files_loaded": {
+   "label": "Files loaded",
+   "status": "later",
+   "note": "",
+   "matches": "Files a Prefetch entry lists as loaded"
+  },
+  "cache_neighbors": {
+   "label": "Neighboring cache entries",
+   "status": "later",
+   "note": "",
+   "matches": "AppCompatCache entries next to this one"
+  },
+  "site": {
+   "label": "Same site",
+   "status": "later",
+   "note": "",
+   "matches": "The host name of a visited URL, in DNS and capture records"
+  }
+ },
+ "broad_rules": {
+  "over_limit": {
+   "test": "count > 500 (RELATED_LIMIT), on every counted row; the window row takes window_text, which points to its breakdown by source",
+   "text": "Broad: {count} events. The list shows the 500 nearest in time.",
+   "window_text": "Broad: {count} events. The list shows the 500 nearest in time; open one source from the breakdown to reach the rest.",
+   "sources": [
+    "code-queries"
+   ]
+  },
+  "system_session": {
+   "test": "logon ID is 0x3e7, 0x3e4, 0x3e5, or 0x3e6, without letter case",
+   "text": "Broad: this is a system session (SYSTEM, NETWORK SERVICE, LOCAL SERVICE, or ANONYMOUS LOGON). Everything that account does on this host shares it.",
+   "sources": [
+    "MS-lsa",
+    "code-evtxecmd",
+    "SZ"
+   ],
+   "basis": "Microsoft names 0x3e7 as LocalSystem's logon ID (LsaGetLogonSessionData). The parser's SYSTEM_SESSIONS comment names 0x3e4 and 0x3e5 as NetworkService's and LocalService's. On Szechuan the Subject of every 0x3e6 event is ANONYMOUS LOGON (101), of 81 of 99 0x3e5 events LOCAL SERVICE, and of 0x3e4 events NETWORK SERVICE or a computer account. No Microsoft page read lists 0x3e4 to 0x3e6 (inference from the samples)."
+  },
+  "service_account": {
+   "test": "account name is SYSTEM, LOCAL SERVICE, NETWORK SERVICE, ANONYMOUS LOGON, or matches DWM-<n> or UMFD-<n> (inference: Windows' own window manager and font driver sessions)",
+   "text": "Broad: a Windows service account. It acts on every host.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "machine_account": {
+   "test": "account name ends in $",
+   "text": "Broad: a computer's own account.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "loopback": {
+   "test": "address in 127.0.0.0/8, ::1, 0.0.0.0, or ::",
+   "text": "Broad: a loopback address, matched on this host only.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "link_local": {
+   "test": "address in 169.254.0.0/16 or fe80::/10",
+   "text": "Broad: a link-local address, matched on this host only.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "own_address": {
+   "test": "address is one of any collected host's addresses (hosts.ips), whichever event the row starts from, a capture record included",
+   "text": "Broad: {host}'s own address. Most of that host's traffic carries it.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "system_binary": {
+   "test": "file name is one of svchost.exe, cmd.exe, powershell.exe, rundll32.exe, conhost.exe, services.exe, winlogon.exe, lsass.exe, explorer.exe, wmiprvse.exe, dllhost.exe, taskhostw.exe",
+   "text": "Broad: a shared Windows program. Every use of it matches.",
+   "sources": [
+    "SZ"
+   ]
+  },
+  "logon_process": {
+   "test": "Same file on a 4624 or 4625, whose key is the process that handled the logon (ProcessName)",
+   "text": "This is the program that handled the logon, not something the user ran.",
+   "sources": [
+    "SZ",
+    "code-evtxecmd"
+   ]
+  },
+  "weak_time": {
+   "test": "set per kind",
+   "text": "Weak: many entries share this time, so nearby events may be unrelated."
+  }
+ },
+ "not_offered_always": [
+  {
+   "pivot": "session",
+   "when": {
+    "logon_id": "0x0"
+   },
+   "reason": "Logon ID 0x0 is no logon session. A case built by an earlier version of Glessner holds it on 4625s and 4688s until the case is rebuilt."
+  }
+ ],
+ "empty_reasons": {
+  "session": [
+   {
+    "text": "No other event shares this logon session."
+   },
+   {
+    "text": "Process creation and share access are recorded only where their auditing was on."
+   }
+  ],
+  "account": [
+   {
+    "text": "No other event names this account in this spelling."
+   }
+  ],
+  "source_ip": [
+   {
+    "text": "No other event has this source address."
+   }
+  ],
+  "addr": [
+   {
+    "text": "No other event has this address at either end."
+   }
+  ],
+  "connection": [
+   {
+    "text": "No other event has this address and port. RDP logons record no port, and NAT changes it."
+   }
+  ],
+  "file": [
+   {
+    "text": "No other source names this path. The file may have been deleted before collection, or its MFT, Prefetch, or Amcache wasn't collected."
+   },
+   {
+    "text": "An 8.3 path such as ADMINI~1 matches the long one only when this host's MFT holds exactly one name it can stand for. Try Same file name for a file whose own name isn't short.",
+    "when": {
+     "file_path": {
+      "contains": "~"
+     }
+    }
+   }
+  ],
+  "file_name": [
+   {
+    "text": "No other file of this name in the case."
+   }
+  ],
+  "window": [
+   {
+    "text": "Nothing else on this host in the window. The host's logs may not reach this time: check its earliest event and any log clear (1102, 104)."
+   }
+  ],
+  "service_name": [
+   {
+    "text": "No other event names this service, by its key name or its display name."
+   }
+  ],
+  "workstation": [
+   {
+    "text": "No other event names this client computer. The client supplies the name."
+   }
+  ],
+  "flow": [
+   {
+    "text": "No other capture record of this connection."
+   }
+  ],
+  "task_name": [
+   {
+    "text": "No other event names this task. Task Scheduler's own log may not have been collected."
+   }
+  ],
+  "rule": [
+   {
+    "text": "The rule or signature fired only on this event."
+   }
+  ],
+  "hash": [
+   {
+    "text": "No other event has this hash."
+   },
+   {
+    "text": "Amcache's SHA-1 covers only a file's first 30 MB, so a larger file's entry never matches another source's hash.",
+    "when": {
+     "artifact": "amcache"
+    }
+   }
+  ]
+ },
+ "kinds": [
+  {
+   "kind": "logon_network",
+   "group": "Logons and credentials",
+   "title": "4624 type 3, network logon",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": "3"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What this logon did here: share access, the admin rights it got (4672), the processes it started, and its logoff.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624",
+      "J-PsExec"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where it came from: that machine's other logons and ticket requests, and the capture's records of its traffic.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624",
+      "code-queries",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The capture's records of this connection (SMB, DCE/RPC, or LDAP, and its flow), and other logons made over it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 600
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What followed on this host: a service install (7045), a task, or a process started remotely. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-0530",
+      "J-PsExec"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account logged on, which shows spread.",
+     "broad": [
+      "machine_account",
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-logon",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "workstation",
+     "rank": 6,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other logons that name the same client computer. The client supplies the name, so treat it as a lead.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4624",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 7,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "The drawn logon link leads to the source host's 4648. With Network Level Authentication, a type 3 can be the first step of an RDP logon (Poling).",
+   "measured": "4624 type 3, DESKTOP to DC01 from port 49752: session 3; account 6,030; source IP 5,869 (Suricata 5,583); either end 6,791. IP and port 4: the other 4624 of the connection 0.3 s later, and a Suricata flow and TLS record 1,079 s later, from another connection on a reused port. Across all 4624 type 3 seeds with a port, the capture's SMB (237 of 364), flow (120 of 202), DCE/RPC (107 of 180), and LDAP (104 of 123) records on the same address and port fall within 5 s once the 3,599.5 s clock offset is applied. Its TLS, DNS, krb5, and HTTP records on them (68) never do."
+  },
+  {
+   "kind": "logon_rdp",
+   "group": "Logons and credentials",
+   "title": "4624 type 10, Remote Desktop logon",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": "10"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What the RDP user did in this session: the processes started, files and shares opened, and the logoff.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624",
+      "J-mstsc"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The client: its 1149 and RdpCoreTS 131 records, its other logons, and the capture's flows.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "J-mstsc",
+      "Poling",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What happened in the minutes after the logon. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-0327"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other hosts this account reached by RDP, and failed tries before this one.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-logon",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 5,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "connection",
+     "reason": "A type 10 logon records no source port."
+    }
+   ],
+   "later": [
+    {
+     "pivot": "rdp_session",
+     "reason": "This session's connect, disconnect, reconnect, and logoff events, by session ID.",
+     "sources": [
+      "MS-4778",
+      "Poling"
+     ]
+    }
+   ],
+   "also": "Type 10 alone misses the type 3 that Network Level Authentication writes first and the type 7 of a reconnect (Poling). On the client host, look for mstsc.exe and a 4648 to TERMSRV (JPCERT). Reconnects (4778) carry the client's address.",
+   "measured": "4624 type 10 from 194.61.24.102 on DC01: session 4 (4624, 4672, 4634, 4647); account 6,030; source IP 59,286 (Suricata flow 29,313 and TLS 29,207; RdpCoreTS 131 346; 4624 4; 4648 4); either end 59,601; Same file 180 (winlogon.exe). Window \u00b1300 s: 64,178, of them Schannel 36888 and 36874 29,205 each. The 500 nearest reach 8.7 s (median over 5 type 10 seeds)."
+  },
+  {
+   "kind": "logon_interactive",
+   "group": "Logons and credentials",
+   "title": "4624 type 2, interactive logon",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": "2"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What the user did in this logon.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Programs that started at logon (Run keys, the Startup folder) and the user's first actions.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-T1547"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account logged on, and whether it belongs at this console.",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 4,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "addr",
+     "reason": "An interactive logon records the local machine as its address.",
+     "when": {
+      "source_ip": [
+       "127.0.0.1",
+       "::1"
+      ]
+     }
+    },
+    {
+     "pivot": "connection",
+     "reason": "An interactive logon records port 0."
+    }
+   ],
+   "later": [],
+   "measured": "4624 type 2 for DWM-1: session 2; account 91; window \u00b160 s 14,578 (USN 12,315)."
+  },
+  {
+   "kind": "logon_unlock",
+   "group": "Logons and credentials",
+   "title": "4624 type 7, unlock or reconnect",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": "7"
+   },
+   "pivots": [
+    {
+     "pivot": "account",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon this unlock belongs to (an earlier type 2 or 10), and the user's other activity.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624",
+      "Poling"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "From a remote address this is an RDP reconnect: the client and its first logon.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Poling"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the user did after coming back.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Only the unlock's own logon events: its 4672 and logoff. The user's processes keep the session of the original logon (inference).",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Poling",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 5,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "measured": "4624 type 7 from 127.0.0.1: session 3 (4624, 4672, 4634; each of the 10 type 7 sessions checked holds 2 or 3 such events); account 6,030; source IP 62 (loopback logons); window \u00b160 s 652."
+  },
+  {
+   "kind": "logon_cached",
+   "group": "Logons and credentials",
+   "title": "4624 type 11, cached logon",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": "11"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What the user did in this logon.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The account's other logons. The domain controller has no record of this one: it wasn't contacted.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What followed, such as connections once the machine was back on the network (inference).",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 4,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "addr",
+     "reason": "A cached logon's address is the local machine.",
+     "when": {
+      "source_ip": [
+       "127.0.0.1",
+       "::1"
+      ]
+     }
+    }
+   ],
+   "later": [],
+   "measured": "4624 type 11 on DESKTOP: session 2; account 3,822; source IP 62; Same file 164 (svchost.exe); window \u00b160 s 7,965."
+  },
+  {
+   "kind": "logon_batch_service",
+   "group": "Logons and credentials",
+   "title": "4624 type 4 or 5, batch or service logon",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security",
+    "logon_type": [
+     "4",
+     "5"
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "window",
+     "rank": 1,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The task or service that started with this logon (inference).",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account runs tasks or services.",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What this task or service did. A service logon's session is often SYSTEM's, which the Broad flag says.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 4,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "measured": "Same logon session from a type 5 logon in SYSTEM's 0x3E7 session on DC01 returned 1,110 events (4907 641, 4624 type 5 154, 4672 154)."
+  },
+  {
+   "kind": "logon_other",
+   "group": "Logons and credentials",
+   "title": "4624, other logon types (8, 9, 12, 13)",
+   "match": {
+    "event_code": "4624",
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What this logon did.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where it came from.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account logged on.",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What followed on this host.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4624"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 5,
+     "label": "Same file (the logon process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that handled this logon, such as winlogon.exe or services.exe. It shows that program's other events, not what the user did.",
+     "broad": [
+      "logon_process"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": []
+  },
+  {
+   "kind": "logon_failed",
+   "group": "Logons and credentials",
+   "title": "4625, failed logon",
+   "match": {
+    "event_code": "4625",
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is one address trying many accounts or passwords? Look for a 4624 from it after the failures.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4625",
+      "A-T1110"
+     ]
+    },
+    {
+     "pivot": "workstation",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Failures and successes from the same client name. Use it when the address is empty.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4625",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is one account failing from many places, or on many hosts?",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "A-T1110",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Did a successful logon follow the failures? In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-T1110",
+      "V-sec"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 5,
+     "label": "Same failure reason",
+     "args": {
+      "term": "code:4625 SubStatus:{data.SubStatus}"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Same failure reason: 0xC0000064 means the user name doesn't exist, 0xC000006A a wrong password.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4625",
+      "code-search"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A 4625's logon ID belongs to the process that reported it (0x0, or SYSTEM's 0x3e7), not to a logon session."
+    }
+   ],
+   "later": [],
+   "also": "No 4625 doesn't mean no guessing: lockout changes what is logged, and network failures may appear only on the target (Valhuntir).",
+   "measured": "4625 type 3 with no address, workstation kali: account 0 (no domain); window \u00b160 s 1,990; Same workstation 99, which is 95 failures and 4 successes."
+  },
+  {
+   "kind": "ntlm_validation",
+   "group": "Logons and credentials",
+   "title": "4776, NTLM credential validation",
+   "match": {
+    "event_code": "4776",
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "account",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account authenticated. On a domain controller this is every NTLM validation of a domain account.",
+     "broad": [
+      "machine_account",
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4776",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "workstation",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Validations and logons from the same client computer.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4776",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The logon this validation served, and failures around it (Error Code not 0x0).",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4776"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "4776 is written only on the computer that holds the account: the domain controller for a domain account, the host itself for a local one. It names the client but not the server the user reached (Microsoft, 4776).",
+   "measured": "12 events; account set on all 12, domain on none, workstation on none."
+  },
+  {
+   "kind": "explicit_credentials",
+   "group": "Logons and credentials",
+   "title": "4648, logon with explicit credentials",
+   "match": {
+    "event_code": "4648",
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "What the person who supplied the credentials was doing in that logon.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4648",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the process)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Which program used the credentials: runas, schtasks, mstsc, net, or a tool.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4648",
+      "J-mstsc",
+      "J-schtasks"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else these credentials were used.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4648",
+      "V-sec"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The commands around it on this host.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "J-schtasks"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "The drawn logon link leads to the target server the event names; the 4624 there shows whether the logon worked. Scheduled tasks, RunAs, and mapped drives write 4648 too.",
+   "measured": "4648 with SubjectLogonId 0x3E7: session 1,110 (4907 641, 4624 type 5 154, 4672 154); account 35; source IP 62 (127.0.0.1); Same file 180; window \u00b160 s 7,561."
+  },
+  {
+   "kind": "special_privileges",
+   "group": "Logons and credentials",
+   "title": "4672, special privileges assigned",
+   "match": {
+    "event_code": "4672",
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Which logon got admin rights. Pair it with its 4624 and see what that session did.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4672"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is this account expected to hold admin rights on this host?",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4672",
+      "V-sec"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the privileged session did straight away.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4672"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "Every SYSTEM logon writes a 4672, so it doesn't show escalation by itself.",
+   "measured": "4672 for Administrator: session 3; account 6,030; window \u00b160 s 1,502."
+  },
+  {
+   "kind": "kerberos",
+   "group": "Logons and credentials",
+   "title": "4768, 4769, 4771, Kerberos ticket requests",
+   "match": {
+    "event_code": [
+     "4768",
+     "4769",
+     "4771"
+    ],
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The client machine: its other ticket requests and logons.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4769"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The capture's krb5 and flow records of this request.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "This account's other activity.",
+     "broad": [
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4769",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Logons and ticket requests around it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "A ticket request and the network logon it leads to are separate connections, so they don't share a source port (inference from the protocols: Kerberos goes to the KDC on port 88). On Szechuan none of 89 Kerberos events with a port shares it with a 4624 within 5 s; the 19 that share it at all are at least 1,014 s apart.",
+   "measured": "4769 for Administrator@C137.LOCAL: account 28 (4769s only); source IP 5,869; IP and port 3: the 4769, then a flow and a TLS record 1,079 s later on a reused port; either end 6,791; window \u00b160 s 197. Across Kerberos seeds, the capture's krb5 (28 of 42) and flow (28 of 73) records sharing the address and port fall within 5 s once the clock offset is applied; DCE/RPC, TLS, LDAP, HTTP, and DNS records (59) never do."
+  },
+  {
+   "kind": "rdp_session",
+   "group": "Logons and credentials",
+   "title": "RDP session events: 4778, 4779, LocalSessionManager 21 to 25, RemoteConnectionManager 1149 and 261, RdpCoreTS 131",
+   "match": {
+    "any_of": [
+     {
+      "event_code": [
+       "4778",
+       "4779"
+      ],
+      "log_channel": "Security"
+     },
+     {
+      "log_channel": "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+      "event_code": [
+       "21",
+       "22",
+       "23",
+       "24",
+       "25"
+      ]
+     },
+     {
+      "log_channel": "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+      "event_code": [
+       "1149",
+       "261"
+      ]
+     },
+     {
+      "log_channel": "Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational",
+      "event_code": "131"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "window",
+     "rank": 1,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The RDP logon (4624 type 10 or 7) this belongs to, and what the user did. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Poling",
+      "A-0327"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The client machine: its other connections and logons.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4778",
+      "J-mstsc"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other RDP sessions and logons.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4778"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "rdp_session",
+     "reason": "Connect, disconnect, reconnect, and logoff of this session, by session ID.",
+     "sources": [
+      "Poling"
+     ]
+    }
+   ],
+   "also": "The sources disagree on 1149: JPCERT reads it as authentication succeeded, Poling as a network connection made before credentials are entered.",
+   "measured": "RemoteConnectionManager 261: no pivot field filled; window \u00b160 s 61,778 during the brute force (Schannel 36888 and 36874, 29,205 each)."
+  },
+  {
+   "kind": "group_change",
+   "group": "Logons and credentials",
+   "title": "4728, 4729, 4732, 4733, 4756, 4757, group membership changed",
+   "match": {
+    "event_code": [
+     "4728",
+     "4729",
+     "4732",
+     "4733",
+     "4756",
+     "4757"
+    ],
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that made the change. Follow it to its 4624 and source.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4732"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "label": "Same account (who made the change)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Who made the change, and their other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4732",
+      "SZ",
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What that account did before and after the change.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4732"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 4,
+     "label": "Same member",
+     "args": {
+      "term": "{data.MemberSid}"
+     },
+     "count": false,
+     "breakdown": "over_limit",
+     "reason": "The member's other changes and logons, by its SID. A local group's member name is usually \"-\".",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4732"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "measured": "4732, Hayabusa's top hit: session 101 (0x3E6, ANONYMOUS LOGON); account 98 (the group); window \u00b160 s 3,640."
+  },
+  {
+   "kind": "account_management",
+   "group": "Logons and credentials",
+   "title": "4720, 4722 to 4726, 4738, 4740, 4767, 4781, user account changed",
+   "match": {
+    "event_code": [
+     "4720",
+     "4722",
+     "4723",
+     "4724",
+     "4725",
+     "4726",
+     "4738",
+     "4740",
+     "4767",
+     "4781"
+    ],
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon of the account that made the change (the Subject), and what else it did.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4720",
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "label": "Same account (the account changed)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The created or changed account's later logons and activity.",
+     "broad": [
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4720",
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the person making the change did around it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-4720"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "The app takes the account changed (Target) as the account and the Subject's logon ID as the session, so the two rows lead to different people.",
+   "measured": "4720 19 and 4738 52 events, each with an account, a domain, and a logon ID."
+  },
+  {
+   "kind": "process_creation",
+   "group": "Processes, scripts, services, and tasks",
+   "title": "4688 and Sysmon 1, process created",
+   "match": {
+    "any_of": [
+     {
+      "event_code": "4688",
+      "log_channel": "Security"
+     },
+     {
+      "event_code": "1",
+      "event_provider": "Microsoft-Windows-Sysmon"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Which logon ran it. Follow it to the 4624 and that logon's source.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4688",
+      "UWS-4688"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "When the program landed (MFT, USN), and whether it ran before (Prefetch, Amcache).",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-exec",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The commands and files around it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-exec"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where else this account ran programs.",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4688"
+     ]
+    },
+    {
+     "pivot": "hash",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same program under another name or on another host (Sysmon).",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "ECS-related"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 6,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same program name in other folders or on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "parent_process",
+     "reason": "What started it. cmd.exe under services.exe, WmiPrvSE.exe, wsmprovhost.exe, or w3wp.exe points to remote or web execution. Would rank first.",
+     "sources": [
+      "MS-4688",
+      "Sysmon",
+      "UWS-4688",
+      "evtx-parent-process"
+     ]
+    },
+    {
+     "pivot": "process",
+     "reason": "Everything this one process did: its connections, files, and registry writes (Sysmon).",
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "also": "A 4688 from before Windows 10 has no parent name, and the command line is empty unless a policy turns it on (Microsoft). Windows reuses process IDs. The parent's name is on the Event page, and search parent: finds its other children.",
+   "measured": "4688 services.exe on DESKTOP at boot: all 78 4688s carry SubjectLogonId 0x3E7, so they join DESKTOP's SYSTEM session, 1,205 events (1,127 plus the 78), flagged broad. A case built by an earlier version holds 0x0 on them, which offers no session. Same file 388 (4624 type 5 357); Same file name 395; window \u00b160 s 7,792. Szechuan has no Sysmon."
+  },
+  {
+   "kind": "powershell_script",
+   "group": "Processes, scripts, services, and tasks",
+   "title": "PowerShell 4104, script block logged",
+   "match": {
+    "event_code": "4104",
+    "log_channel": [
+     "Microsoft-Windows-PowerShell/Operational",
+     "PowerShellCore/Operational"
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "search",
+     "rank": 1,
+     "label": "Same script block",
+     "args": {
+      "term": "code:4104 ScriptBlockId:{data.ScriptBlockId}"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The other parts of the same script block. The data numbers each part (MessageNumber of MessageTotal), so a long script spans several events (inference from the fields).",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-search"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The process that ran the script (powershell.exe in 4688 or Sysmon 1) and what it did next.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "PS-logging"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The account the event's System element names, and its other activity.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-evtxecmd",
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "4104 records script blocks only where script block logging is turned on (Microsoft, about_Logging_Windows).",
+   "measured": "3 events, each with an account named from its SID; their data holds ScriptBlockId, MessageNumber, and MessageTotal."
+  },
+  {
+   "kind": "service_install",
+   "group": "Processes, scripts, services, and tasks",
+   "title": "7045 and 4697, service installed",
+   "match": {
+    "any_of": [
+     {
+      "event_code": "7045",
+      "log_channel": "System"
+     },
+     {
+      "event_code": "4697",
+      "log_channel": "Security"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the service binary)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Did the binary land (MFT, USN, a write to ADMIN$), and did it run (Prefetch, process creation)?",
+     "broad": [
+      "system_binary"
+     ],
+     "broad_text": "Broad when the path is svchost.exe -k: every shared service matches.",
+     "caveat": {
+      "text": "An 8.3 path such as ADMINI~1 matches the long one only when this host's MFT holds exactly one name it can stand for.",
+      "check": "short_path",
+      "when": {
+       "file_path": {
+        "contains": "~"
+       }
+      }
+     },
+     "sources": [
+      "J-PsExec",
+      "A-0552",
+      "V-svc",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 600
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The logon that installed it (4624 type 3 with a 4672) and the share access just before. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-0530",
+      "J-PsExec",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "service_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same service on other hosts shows spread. State changes on this host show it started, when they were logged.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "V-svc"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 4,
+     "label": "Same account (from the System element)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The account the event's System element names. In the EVTX-ATTACK-SAMPLES events checked, that was the remote installer; beyond them it is inference. A service SYSTEM installed has none.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "evtx-7045-account",
+      "code-evtxecmd",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 5,
+     "when": {
+      "event_code": "4697"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Who installed it, and from which logon.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4697"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 6,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The binary's name on other hosts or in other folders, as with PsExec's PSEXESVC.exe.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "J-PsExec",
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A 7045 records no logon ID.",
+     "when": {
+      "event_code": "7045"
+     }
+    },
+    {
+     "pivot": "addr",
+     "reason": "A service install records no address."
+    }
+   ],
+   "later": [],
+   "also": "A later change to the service's path or account goes unlogged (Microsoft, 4697). PsExec can rename its service with -r (Valhuntir). The sources differ on which record to use: ATT&CK's DET0552 lists 4697, JPCERT and Valhuntir use 7045. The 7045 caveat in caveats.json says the account shown is the one the System element names, which was the installer in the EVTX-ATTACK-SAMPLES events checked.",
+   "measured": "7045 coreupdater on DC01: Same file 30 (MFT 11, USN 10, SRUM 3, 7045 2, Autoruns 2, Amcache 1, Prefetch 1; 19 of them on DESKTOP); Same file name 49, or 53 with bare names; account 6,030. Same service name 6 with RECmd's Services rows (the 7045, Autoruns, and RECmd on each host), 4 without. Window \u00b1600 s: 65,001, of them Schannel 36888 and 36874 29,205 each; the nearest event log records are the installing 4624 type 3 and 4672, at 0.0 s. Across 40 7045 seeds the 500 nearest reach a median 0.92 s, and 4 of 40 lists hold a 4624 before the install. 7045 for the vmmemctl driver: Same file 13; service name by the written name 2, missing Autoruns' VMMemCtl; window \u00b160 s 3,546."
+  },
+  {
+   "kind": "service_state",
+   "group": "Processes, scripts, services, and tasks",
+   "title": "7000, 7009, 7023, 7030, 7031, 7034, 7036, 7040, service state changes",
+   "match": {
+    "event_code": [
+     "7000",
+     "7009",
+     "7023",
+     "7030",
+     "7031",
+     "7034",
+     "7036",
+     "7040"
+    ],
+    "log_channel": "System"
+   },
+   "pivots": [
+    {
+     "pivot": "service_name",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The service's install (7045) and its other state changes, on this host and others.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What happened as it started or stopped.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "These events write the display name in param1 (7009 in param2); 7040 also gives the key name in param4, which Same service name uses to join the two names.",
+   "measured": "The getsystem names outmgo, mszhao, pmhrio, and nehgye each have a 7045 and a 7009."
+  },
+  {
+   "kind": "scheduled_task",
+   "group": "Processes, scripts, services, and tasks",
+   "title": "4698, 4699, 4702, and Task Scheduler Operational events, scheduled task",
+   "match": {
+    "any_of": [
+     {
+      "event_code": [
+       "4698",
+       "4699",
+       "4702"
+      ],
+      "log_channel": "Security"
+     },
+     {
+      "log_channel": "Microsoft-Windows-TaskScheduler/Operational"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "task_name",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The task's whole life: created, updated, run (100, 200, 201), and deleted (4699).",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-task",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the task's program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is the task's program new on disk, and did it run?",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4698",
+      "J-schtasks"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 3,
+     "when": {
+      "log_channel": "Security"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Who created it. A network logon (type 3) behind it means it was made remotely.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4698",
+      "J-schtasks"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The logon before it. On the source host, look for schtasks.exe and a 4648.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "J-schtasks"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The creator's other activity.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-4698",
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "The app reads no program from Task Scheduler's own events; only the Security task events, 4698 to 4702, give it the task's command.",
+     "when": {
+      "log_channel": "Microsoft-Windows-TaskScheduler/Operational"
+     }
+    },
+    {
+     "pivot": "account",
+     "reason": "The app reads no account from Task Scheduler's own events (UserContext stays in the data).",
+     "when": {
+      "log_channel": "Microsoft-Windows-TaskScheduler/Operational"
+     }
+    }
+   ],
+   "later": [],
+   "also": "Microsoft flags tasks created in the library root and tasks set to log on with a stored password. Attackers can hide a task by removing its SD value (ATT&CK T1053.005).",
+   "measured": "Task Scheduler Operational holds 140 (295 events), 200 and 100 (265 each), 129 (215), 201 and 102 (214 each), and other codes, each with a TaskName. No pivot field is filled. Window \u00b160 s: 207 for a 106, 1,882 for a 140. Same task name 9, the task's whole life."
+  },
+  {
+   "kind": "log_cleared",
+   "group": "Logs",
+   "title": "Security 1102 and System 104, log cleared",
+   "match": {
+    "any_of": [
+     {
+      "event_code": "1102",
+      "log_channel": "Security"
+     },
+     {
+      "event_code": "104",
+      "log_channel": "System",
+      "event_provider": "Microsoft-Windows-Eventlog"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Which logon cleared the log. Follow that logon to its source.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-1102",
+      "V-tamper"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Who cleared it, and their other activity.",
+     "broad": [
+      "service_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-1102"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 600
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the clear may hide and what came next. Sysmon, the USN journal, other logs, and other hosts still cover the gap.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-tamper"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 4,
+     "label": "Same file name: wevtutil.exe",
+     "args": {
+      "value": "wevtutil.exe"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The tool that clears logs from the command line: its Prefetch, Amcache, and process creation. PowerShell can clear them too.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "J-wevtutil"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 5,
+     "label": "The same event on other hosts",
+     "args": {
+      "term": "code:{event_code} channel:{log_channel}"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Clears on several hosts at once point to a scripted cleanup.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-tamper",
+      "code-search"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "Codes 1102 and 104 occur in 10 other channels on Szechuan that aren't log clears, so this kind matches the channel and provider too. Where 104 is written is uncertain (low confidence).",
+   "measured": "No Security 1102 and no System 104. Code 1102 occurs in 3 other channels (16 events) and 104 in 7 (41)."
+  },
+  {
+   "kind": "share_access",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "5140 and 5145, network share accessed",
+   "match": {
+    "event_code": [
+     "5140",
+     "5145"
+    ],
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The network logon (4624 type 3) that made the access, and its source.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "MS-5140",
+      "J-PsExec"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 600
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "After a write to ADMIN$ or C$, look here for a service, a task, or a process. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-0530",
+      "J-PsExec"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 3,
+     "when": {
+      "event_code": "5145"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Did the file written over the share run here? The app joins the share's local folder to the relative name, so the key is the file's local path.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-5145",
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 4,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The source host and what it ran.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-share"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other shares and hosts the account touched.",
+     "broad": [
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-share"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 6,
+     "label": "Pipes on IPC$",
+     "args": {
+      "term": "code:5145 ShareName:*IPC$"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Named pipes on IPC$, such as PSEXESVC's, show remote execution.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "J-PsExec",
+      "MS-5145",
+      "code-search"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "A 5140 names only the share, once per session.",
+     "when": {
+      "event_code": "5140"
+     }
+    }
+   ],
+   "later": [],
+   "also": "Share auditing is off by default, and access that NTFS denied writes no event (Microsoft, 5145). Szechuan has no 5140 or 5145."
+  },
+  {
+   "kind": "sysmon_network",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Sysmon 3, network connection",
+   "match": {
+    "event_code": "3",
+    "event_provider": "Microsoft-Windows-Sysmon"
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "remote"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Who else talked to the remote address: other hosts, and the capture's flows and alerts.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "code-queries",
+      "code-pivots",
+      "evtx-sysmon3-direction"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program's file: when it landed and whether it ran before.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-sysmon"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The capture's records of this connection, by its source address and port.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The process start or file write that led to it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-sysmon"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that ran the program.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "process",
+     "reason": "Which program connected, and how it started.",
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "dns_name",
+     "reason": "The name looked up just before the connection (Sysmon 22, capture DNS).",
+     "sources": [
+      "V-conn"
+     ]
+    }
+   ],
+   "also": "Older Sysmon writes the local end as the source, so the address row uses the end that isn't this host's. Sysmon 3 is off by default and configs filter it, so it isn't complete. A failed RDP attempt looks the same as a successful one (Microsoft Q&A)."
+  },
+  {
+   "kind": "sysmon_file_create",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Sysmon 11, file created",
+   "match": {
+    "event_code": "11",
+    "event_provider": "Microsoft-Windows-Sysmon"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Did it run (Prefetch, Amcache, process creation), and is it on other hosts?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "V-exec"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Other files the program wrote, and a download or share write just before.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same file name in other folders or on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that ran the program that wrote it.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "process",
+     "reason": "Which program wrote it, and how that program started.",
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "folder",
+     "reason": "Other files dropped in the same folder.",
+     "sources": [
+      "FOR508"
+     ]
+    }
+   ],
+   "also": "Sysmon 11 also fires when a file is overwritten, so it doesn't prove the file is new (Sysmon)."
+  },
+  {
+   "kind": "sysmon_image_load",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Sysmon 7, image loaded",
+   "match": {
+    "event_code": "7",
+    "event_provider": "Microsoft-Windows-Sysmon"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the DLL)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where the loaded DLL came from (MFT, USN), and what else loaded it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same DLL name in other folders or on other hosts.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the loading process did around the load.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that ran the loading process.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "process",
+     "reason": "The process that loaded it, and everything else it did.",
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "also": "Sysmon logs image loads only when configured to, since logging every load is heavy (Sysmon). Same file centers on the DLL; the loading program is the process."
+  },
+  {
+   "kind": "sysmon_remote_thread",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Sysmon 8, remote thread created",
+   "match": {
+    "event_code": "8",
+    "event_provider": "Microsoft-Windows-Sysmon"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the source program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that created the thread: when it landed and whether it ran before.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 2,
+     "label": "Same target program",
+     "args": {
+      "term": "code:8 TargetImage:{data.TargetImage}"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other threads created in the same target program.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "code-search"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the source and target processes did around it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that ran the source program.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "process",
+     "reason": "The source process's other actions.",
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "also": "Malware uses remote threads to inject code into other processes (Sysmon)."
+  },
+  {
+   "kind": "sysmon_process_access",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Sysmon 10, process accessed",
+   "match": {
+    "event_code": "10",
+    "event_provider": "Microsoft-Windows-Sysmon"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the source program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that opened the other process: when it landed and whether it ran before.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 2,
+     "label": "Same target program",
+     "args": {
+      "term": "code:10 TargetImage:{data.TargetImage}"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other programs that opened the same target, such as lsass.exe.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "code-search"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the source process did around the access.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that ran the source program.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "process",
+     "reason": "The source process's other actions.",
+     "sources": [
+      "Sysmon"
+     ]
+    }
+   ],
+   "also": "Sysmon names reading lsass.exe's memory to steal credentials as what this event detects; configs filter expected access, since diagnostic tools open processes often (Sysmon)."
+  },
+  {
+   "kind": "defender_detection",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "Defender 1116 and 1117, malware detected or acted on",
+   "match": {
+    "event_code": [
+     "1116",
+     "1117"
+    ],
+    "log_channel": "Microsoft-Windows-Windows Defender/Operational"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where the detected file came from, and whether it ran before the detection.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-defender"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What happened just before: the download, the process, the logon.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-defender"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user the detection names, and their other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-defender"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same file name on other hosts.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-defender"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": []
+  },
+  {
+   "kind": "object_access",
+   "group": "Shares, Sysmon, Defender, and object access",
+   "title": "4656, 4660, 4663, object access",
+   "match": {
+    "event_code": [
+     "4656",
+     "4660",
+     "4663"
+    ],
+    "log_channel": "Security"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the object)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other access to the same file.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "session",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The logon that accessed it.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What that logon did around the access.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-evtxecmd"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": []
+  },
+  {
+   "kind": "prefetch",
+   "group": "File and execution artifacts",
+   "title": "Prefetch run time",
+   "match": {
+    "artifact": "prefetch"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Where the program came from, when it landed (MFT, USN), its hash (Amcache), and its process creation if logged.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-pf",
+      "V-pf",
+      "libscca",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 30
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Prefetch is written about 10 seconds after launch. Events in that span show what launched it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-pf"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same program run from another folder writes another .pf file; this also finds other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "W-pf",
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "Prefetch's file list names no single path for this program. Try Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    },
+    {
+     "pivot": "account",
+     "reason": "Prefetch records no user."
+    },
+    {
+     "pivot": "session",
+     "reason": "Prefetch records no logon."
+    },
+    {
+     "pivot": "addr",
+     "reason": "Prefetch records no address."
+    }
+   ],
+   "later": [
+    {
+     "pivot": "files_loaded",
+     "reason": "The DLLs and files it touched in its first seconds can name a staging folder.",
+     "sources": [
+      "W-pf"
+     ]
+    }
+   ],
+   "also": "No .pf file doesn't mean the program never ran: Prefetch is off by default on Windows Server (Valhuntir) and may be off on SSDs (Forensics Wiki).",
+   "measured": "COREUPDATER.EXE: Same file 30; Same file name 49; window \u00b130 s: the 500 nearest reach a median 4.4 s over 40 Prefetch seeds, and 40 of 40 windows exceed 500 (median 2,902)."
+  },
+  {
+   "kind": "amcache",
+   "group": "File and execution artifacts",
+   "title": "Amcache entry",
+   "match": {
+    "artifact": "amcache"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Did it run (Prefetch, process creation), and when did it land (MFT, USN)?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-ct",
+      "V-amc",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "hash",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same SHA-1 under another name or on another host. Amcache writes SHA-1 in lower case and Autoruns in upper case, and the match ignores case.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-amc",
+      "ECS-related",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The file on other hosts or in other folders.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Events around the time the entry was written.",
+     "broad": [
+      "weak_time"
+     ],
+     "broad_text": "Weak: the time is when Windows' inventory task wrote the entry, and many entries share it.",
+     "caveat": null,
+     "sources": [
+      "V-amc"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "The SHA-1 covers only the first 30 MB of the file (Cyber Triage).",
+   "measured": "coreupdater.exe: Same file 30; Same file name 49; window \u00b160 s 1,637."
+  },
+  {
+   "kind": "appcompatcache",
+   "group": "File and execution artifacts",
+   "title": "AppCompatCache (Shimcache) entry, from RECmd",
+   "match": {
+    "artifact": "registry",
+    "registry_path": {
+     "contains": "AppCompatCache"
+    }
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The file's MFT record (does its modified time match?), and Prefetch and Amcache for execution.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-mandiant",
+      "V-shim",
+      "SZ",
+      "code-recmd"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The file on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-shim"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names no program path: an app ID, a counter, an empty value, or a key with no value.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "This row names a path the app can't write out in full, such as one in a user's profile folder. Try Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "This row names no file.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "window",
+     "reason": "The row's time is the AppCompatCache key's last write, shared by every entry."
+    }
+   ],
+   "later": [
+    {
+     "pivot": "cache_neighbors",
+     "reason": "Entries next to it in the cache were added at about the same time.",
+     "sources": [
+      "W-mandiant"
+     ]
+    }
+   ],
+   "also": "The app times these rows by the key's LastWrite, not by the file's modified time that the entry holds.",
+   "measured": "546 rows: DESKTOP's 266 share one time, DC01's 280 another. No file key; window \u00b160 s 870. Their paths match an MFT key 256 of 278 times on DC01 and 142 of 181 on DESKTOP, once SYSVOL\\ is read as the volume root."
+  },
+  {
+   "kind": "mft_usn",
+   "group": "File and execution artifacts",
+   "title": "MFT and USN journal records",
+   "match": {
+    "artifact": [
+     "mft",
+     "usnjrnl"
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same path in other sources: did it run, was it copied over a share, was it opened?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "FOR508",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What else was created, renamed, or deleted around it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "FOR508",
+      "V-usn"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Copies under other paths or on other hosts, such as a download in Downloads.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "account",
+     "reason": "MFT and USN records name no user."
+    }
+   ],
+   "later": [
+    {
+     "pivot": "folder",
+     "reason": "Other files dropped in the same folder.",
+     "sources": [
+      "FOR508"
+     ]
+    },
+    {
+     "pivot": "mft_entry",
+     "reason": "Follows the file through renames and deletion by its MFT entry number.",
+     "sources": [
+      "MS-USN"
+     ]
+    }
+   ],
+   "also": "Programs can set $SI times: $SI earlier than $FN is a lead, not proof (ATT&CK T1070.006). The USN journal drops its oldest records when full. A file with hard links appears under each of its paths, and Same file matches one path only.",
+   "measured": "MFT coreupdater.exe, $SI born: Same file 30; Same file name 49; window \u00b160 s 275. USN Downloads\\coreupdater.exe: Same file 17 (USN only); Same file name 49."
+  },
+  {
+   "kind": "recycle_bin",
+   "group": "File and execution artifacts",
+   "title": "Recycle Bin entry",
+   "match": {
+    "artifact": "recycle_bin"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The deleted file's other records: when it landed, whether it ran, and shortcuts to it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the user did around the deletion.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same file name elsewhere.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "account",
+     "reason": "The user's SID is in the extra fields only."
+    }
+   ],
+   "later": [],
+   "measured": "$I entry: Same file 12; window \u00b160 s 140."
+  },
+  {
+   "kind": "run_key",
+   "group": "Registry and autoruns",
+   "title": "Run key value (RECmd, Sysmon 12 to 14)",
+   "match": {
+    "any_of": [
+     {
+      "artifact": "registry",
+      "registry_path": {
+       "contains": "\\CurrentVersion\\Run"
+      }
+     },
+     {
+      "event_provider": "Microsoft-Windows-Sysmon",
+      "event_code": [
+       "12",
+       "13",
+       "14"
+      ],
+      "registry_path": {
+       "contains": "\\CurrentVersion\\Run"
+      }
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the program it starts)",
+     "when": {
+      "artifact": "registry"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is the program it starts present and new, and did it run after a logon?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "A-T1547",
+      "V-run",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the program that set it)",
+     "when": {
+      "event_provider": "Microsoft-Windows-Sysmon"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program that wrote the value: when it landed and how it started.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Sysmon",
+      "code-evtxecmd"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "The dropped file and the process that wrote the value (Sysmon 13).",
+     "broad": [
+      "weak_time"
+     ],
+     "broad_text": "Weak for RECmd rows: every value in the key shares the key's last write time.",
+     "caveat": null,
+     "sources": [
+      "V-run"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "For a user's Run key, whose logon runs it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-run"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "V-autorun"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names no program path: an app ID, a counter, an empty value, or a key with no value.",
+     "when": {
+      "file_key": "",
+      "artifact": "registry",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "This row names a path the app can't write out in full, such as one in a user's profile folder. Try Same file name.",
+     "when": {
+      "file_key": "",
+      "artifact": "registry"
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "This row names no file.",
+     "when": {
+      "file_key": "",
+      "file_path": "",
+      "artifact": "registry"
+     }
+    },
+    {
+     "pivot": "account",
+     "reason": "RECmd rows fill no account.",
+     "when": {
+      "artifact": "registry"
+     }
+    }
+   ],
+   "later": [
+    {
+     "pivot": "registry_key",
+     "reason": "The key's other values, and the Sysmon 12 and 13 events that set them.",
+     "sources": [
+      "A-T1547"
+     ]
+    }
+   ],
+   "measured": "A RECmd Run value: no pivot field filled; window \u00b160 s 3,980. Seven RECmd rows name coreupdater.exe."
+  },
+  {
+   "kind": "recmd_services",
+   "group": "Registry and autoruns",
+   "title": "Services entry, from RECmd's Services plugin",
+   "match": {
+    "artifact": "registry",
+    "message": {
+     "starts_with": "Services:"
+    }
+   },
+   "pivots": [
+    {
+     "pivot": "service_name",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The service's install (7045), state changes, and Autoruns entry, on each host. The row names the service by its key name.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-recmd"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "label": "Same file (the service binary)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is the service binary present and new, and did it run?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-recmd"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The binary's name on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names no program path: an app ID, a counter, an empty value, or a key with no value.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "This row names a path the app can't write out in full, such as one in a user's profile folder. Try Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "This row names no file.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "window",
+     "reason": "The row's time is the Services key's last write, shared by every service on the host. Each service's own key time is in the row's data, as Name last write."
+    }
+   ],
+   "later": [],
+   "measured": "1,603 rows with 3 distinct times. The data holds the key name (Name: coreupdater), the service key's own last write, and the image path (Image path: C:\\Windows\\System32\\coreupdater.exe); coreupdater has a row on each host."
+  },
+  {
+   "kind": "recmd_taskcache",
+   "group": "Registry and autoruns",
+   "title": "Scheduled task, from RECmd's TaskCache plugin",
+   "match": {
+    "artifact": "registry",
+    "message": {
+     "starts_with": "Scheduled Tasks (TaskCache):"
+    }
+   },
+   "pivots": [
+    {
+     "pivot": "task_name",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The task's creation, updates, and runs in the event logs, and its Autoruns entry.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-recmd"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "window",
+     "reason": "The row's time is the TaskCache\\Tasks key's last write, shared by every task. The task's created time is in the row's data."
+    }
+   ],
+   "later": [],
+   "measured": "277 rows with 2 distinct times. The data holds Created on, Last start, Last stop, and the task's Path, such as \\Microsoft\\Windows\\Time Synchronization\\..."
+  },
+  {
+   "kind": "userassist",
+   "group": "Registry and autoruns",
+   "title": "UserAssist entry, from RECmd",
+   "match": {
+    "artifact": "registry",
+    "message": {
+     "starts_with": "UserAssist:"
+    }
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program's other records: Prefetch, process creation, when it landed.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-recmd"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program by name, on this host and others.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names no program path: an app ID, a counter, an empty value, or a key with no value.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "This row names a path the app can't write out in full, such as one in a user's profile folder. Try Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "This row names no file.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "window",
+     "reason": "The row's time is the Count key's last write, shared by its entries. The program's last run time is in the row's data."
+    }
+   ],
+   "later": [],
+   "measured": "117 rows with 10 distinct times. coreupdater.exe has a row on each host, as {System}\\coreupdater.exe with its last run time and run count."
+  },
+  {
+   "kind": "bam",
+   "group": "Registry and autoruns",
+   "title": "Background Activity Moderator (BAM) entry, from RECmd",
+   "match": {
+    "artifact": "registry",
+    "message": {
+     "starts_with": "Background Activity Moderator (BAM):"
+    }
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program's other records: Prefetch, process creation, when it landed.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ",
+      "code-recmd"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program by name, on this host and others.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names no program path: an app ID, a counter, an empty value, or a key with no value.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "This row names a path the app can't write out in full, such as one in a user's profile folder. Try Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "This row names no file.",
+     "when": {
+      "file_key": "",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "window",
+     "reason": "The row's time is the user's BAM key's last write. The program's execution time is in the row's data."
+    },
+    {
+     "pivot": "account",
+     "reason": "The user's SID is in the key path only."
+    }
+   ],
+   "later": [],
+   "measured": "62 rows with 9 distinct times; the value names a \\Device\\HarddiskVolume3\\ path."
+  },
+  {
+   "kind": "autoruns_service",
+   "group": "Registry and autoruns",
+   "title": "Autoruns service or driver entry",
+   "match": {
+    "artifact": "autoruns",
+    "log_channel": [
+     "Services",
+     "Drivers"
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is the binary present and new, and did it run?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Autoruns",
+      "V-autorun",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "service_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The service's install (7045) and state changes, on each host.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Autoruns",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "hash",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same binary elsewhere, by hash: Autoruns gives MD5, SHA-1, and SHA-256.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Autoruns",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The binary's name on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "window",
+     "reason": "This time is when the program was compiled (PE link time), not an event on this host.",
+     "when": {
+      "ts_desc": "Image built (PE link time)"
+     }
+    }
+   ],
+   "later": [],
+   "also": "Autoruns gives the key name in Entry and the display name at the start of Description.",
+   "measured": "Autoruns service coreupdater: Same file 30; Same service name 6; window not offered, since its time is a PE link time."
+  },
+  {
+   "kind": "autoruns_other",
+   "group": "Registry and autoruns",
+   "title": "Autoruns entry, other locations",
+   "match": {
+    "artifact": "autoruns"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Is the program present and new, and did it run?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Autoruns",
+      "V-autorun"
+     ]
+    },
+    {
+     "pivot": "task_name",
+     "rank": 2,
+     "when": {
+      "log_channel": "Tasks"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The task's creation and runs in the event logs.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-task",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "hash",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same program elsewhere, by hash.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Autoruns"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program on other hosts.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 5,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Events around when the program's file was last written.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-autoruns"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "window",
+     "reason": "This time is when the program was compiled (PE link time), not an event on this host.",
+     "when": {
+      "ts_desc": "Image built (PE link time)"
+     }
+    }
+   ],
+   "later": [],
+   "measured": "Autoruns writes the task location as Tasks (218 rows), with the task path in Entry, such as \\Microsoft\\Windows\\.NET Framework\\...; 214 are timed by PE link time and 4 by the file's last write. Run entry coreupdate: Same file 16 (powershell.exe); window not offered (PE link time)."
+  },
+  {
+   "kind": "lnk_jumplist",
+   "group": "User activity",
+   "title": "Shortcut (LNK) and jump list entry",
+   "match": {
+    "artifact": [
+     "lnk",
+     "jumplist"
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the target)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Does the target exist, when was it created, and did it run?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-lnk",
+      "W-jl",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the user did around opening it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-lnk"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "when": {
+      "artifact": "jumplist"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-jl",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 4,
+     "label": "The target's machine",
+     "args": {
+      "term": "{data.MachineID}"
+     },
+     "count": false,
+     "breakdown": "over_limit",
+     "reason": "The machine the target was on, by its NetBIOS name.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-lnk"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "account",
+     "reason": "A shortcut records no user in the app.",
+     "when": {
+      "artifact": "lnk"
+     }
+    }
+   ],
+   "later": [
+    {
+     "pivot": "volume",
+     "reason": "A USB drive or share the target was on, by volume serial number.",
+     "sources": [
+      "W-lnk"
+     ]
+    }
+   ],
+   "also": "File and Open dialogs, applications, and programs also create these entries, so one doesn't show that the user opened the file on purpose (Valhuntir).",
+   "measured": "LNK secret_beth.txt: Same file 12 (USN 7, LNK 4, Recycle Bin 1); window \u00b160 s 1,341. Jump list \\FileShare: Same file 18; account 0 (no domain)."
+  },
+  {
+   "kind": "shellbags",
+   "group": "User activity",
+   "title": "ShellBag entry",
+   "match": {
+    "artifact": "shellbags"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the folder)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The folder's MFT record, and shortcut and jump list entries for files in it.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-sb",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Events around the key's write.",
+     "broad": [
+      "weak_time"
+     ],
+     "broad_text": "Weak: sibling folders share the key time, and it changes when the folder view changes.",
+     "caveat": null,
+     "sources": [
+      "V-sb"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "Only drive and UNC paths get a key; this folder is a shell or known-folder path (69 of 120 get one on Szechuan).",
+     "when": {
+      "file_key": ""
+     }
+    }
+   ],
+   "later": [],
+   "measured": "\\FileShare\\New folder: Same file 5; account 0 (no domain); window \u00b160 s 369."
+  },
+  {
+   "kind": "srum",
+   "group": "User activity",
+   "title": "SRUM record",
+   "match": {
+    "artifact": "srum"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program's Prefetch and process creation, and whether it landed recently.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-srum",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 3600
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "SRUM rows are hourly totals. Look for flows, Sysmon 3, and firewall records in that hour to see where the bytes went. In a busy window, open that source from the breakdown.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-srum"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's activity in that hour.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program by name, which also finds rows with no path.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "SRUM wrote a bare name or an app ID here, which has no path to match. Use Same file name.",
+     "when": {
+      "file_key": ""
+     }
+    }
+   ],
+   "later": [],
+   "measured": "Network use by coreupdater.exe: Same file 30; account 0; window \u00b160 s 479; 4 of 7 coreupdater rows have a bare name. An app timeline row with a bare name: Same file name with bare names 53."
+  },
+  {
+   "kind": "windows_timeline",
+   "group": "User activity",
+   "title": "Windows Timeline activity",
+   "match": {
+    "artifact": "timeline"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the program)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program's other records: Prefetch, process creation, when it landed.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "MS-knownfolder",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The program by name, which also finds rows with no path.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What else the user did then.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "This row names an app ID or a folder the app doesn't map, not a full path.",
+     "when": {
+      "file_key": ""
+     }
+    }
+   ],
+   "later": [],
+   "measured": "cmd.exe: no file key; account 0; Same file name 44, or 73 with bare names; window \u00b160 s 4,972. 12 of 185 rows get a key."
+  },
+  {
+   "kind": "browser",
+   "group": "User activity",
+   "title": "Browser history",
+   "match": {
+    "artifact": "browser"
+   },
+   "pivots": [
+    {
+     "pivot": "file",
+     "rank": 1,
+     "label": "Same file (the download)",
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Did the download land (MFT, Zone.Identifier), and did it run?",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "W-chrome",
+      "V-browser"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the user did after the visit or download.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-browser"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "Only download rows have a path.",
+     "when": {
+      "file_key": ""
+     }
+    }
+   ],
+   "later": [
+    {
+     "pivot": "site",
+     "reason": "DNS lookups and connections to the site.",
+     "sources": [
+      "V-browser"
+     ]
+    }
+   ],
+   "also": "Redirects, prefetching, and scripts also write history, so a visit doesn't show the user saw the page (Valhuntir). Szechuan has no browser history."
+  },
+  {
+   "kind": "notification",
+   "group": "User activity",
+   "title": "Windows notification",
+   "match": {
+    "artifact": "notification"
+   },
+   "pivots": [
+    {
+     "pivot": "window",
+     "rank": 1,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the user was doing when the notification arrived.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The user's other activity.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "measured": "42 rows, timed when the notification arrived; each names the profile with no domain and no file."
+  },
+  {
+   "kind": "hayabusa_hit",
+   "group": "Alerts",
+   "title": "Any event with a Hayabusa hit (added to its own kind)",
+   "match": {
+    "has_hayabusa_hit": true
+   },
+   "overlay": true,
+   "pivots": [
+    {
+     "pivot": "rule",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same rule on other hosts and at other times: spread, or a noisy rule.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "H-cmd",
+      "V-hay"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [],
+   "also": "Hayabusa's docs say medium-level rules most often need tuning; a technique tag is the rule's label, not a finding.",
+   "measured": "2,291 hits under 74 rules; the commonest, Task Updated, has 295."
+  },
+  {
+   "kind": "ids_alert",
+   "group": "Alerts",
+   "title": "IDS alert (Suricata, or an imported Snort or Suricata fast alert)",
+   "match": {
+    "any_of": [
+     {
+      "artifact": "suricata",
+      "log_channel": "alert"
+     },
+     {
+      "artifact": "ids_alert"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "flow",
+     "rank": 1,
+     "when": {
+      "artifact": "suricata"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The connection's other records: its flow, DNS, HTTP, TLS, and files.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 2,
+     "args": {
+      "end": "internal"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Which collected host was involved, and the capture's other records of it.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "code-queries",
+      "code-pivots"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 3,
+     "args": {
+      "end": "external"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The other end of the connection, outside the case: its records on every host and in the capture. An alert's source isn't always the attacker: in Suricata's own example src_ip is the server.",
+     "broad": [
+      "loopback",
+      "link_local"
+     ],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "code-queries",
+      "code-pivots"
+     ]
+    },
+    {
+     "pivot": "rule",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same signature elsewhere: spread, or noise.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Suri-rules",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 5,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Other capture records in the same minutes.",
+     "broad": [],
+     "caveat": {
+      "text": "The network lane only, never the host's own events."
+     },
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 6,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Records on the same source address and port.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "host_at_address",
+     "reason": "What the internal host itself was doing at the time.",
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "also": "An alert's source isn't always the attacker: in Suricata's own example src_ip is the server. An alert doesn't show that the attack worked. An imported fast alert keeps its rule in the code column and has no flow ID.",
+   "measured": "461 Suricata alerts; event_code holds the signature ID (2001330 200, 2012709 198). Metasploit alert, 203.78.103.109:443 to DC01: source IP 10 (alerts only); IP and port 10 (alerts sharing port 443); either end 20, or 64,637 on DC01's address; window \u00b160 s 11 (capture lane only); Same flow 4. RDP admin login alert: source IP 59,286; either end at the outside address, 194.61.24.102, 59,601 (the 315 more are capture records with it as destination); IP and port 10, including the host's RdpCoreTS 131; Same flow 8."
+  },
+  {
+   "kind": "suricata_http_file",
+   "group": "Network records",
+   "title": "Suricata HTTP and file records, Zeek http and files",
+   "match": {
+    "any_of": [
+     {
+      "artifact": "suricata",
+      "log_channel": [
+       "http",
+       "fileinfo"
+      ]
+     },
+     {
+      "artifact": "zeek",
+      "log_channel": [
+       "http",
+       "files"
+      ]
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "flow",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The connection's other records: the alert, the flow, the TLS or HTTP record.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "hash",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same file in other transfers, and on hosts that recorded its hash (Amcache, Autoruns, Sysmon). Suricata hashes files only when its file hashing is on.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "ECS-related"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The downloaded file on the hosts: its USN and MFT records, Prefetch, and process creation.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 4,
+     "args": {
+      "end": "internal"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The client host and its other traffic.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "host_at_address",
+     "reason": "What the client host was doing as the file arrived.",
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "measured": "fileinfo /coreupdater.exe: Same file 2 (the URL's key); Same file name 49; IP and port 9; source IP 59,286."
+  },
+  {
+   "kind": "dns",
+   "group": "Network records",
+   "title": "DNS record (capture, Sysmon 22, Zeek dns)",
+   "match": {
+    "any_of": [
+     {
+      "artifact": "suricata",
+      "log_channel": "dns"
+     },
+     {
+      "event_code": "22",
+      "event_provider": "Microsoft-Windows-Sysmon"
+     },
+     {
+      "artifact": "zeek",
+      "log_channel": "dns"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "source_ip"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The client host's events at that time.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE"
+     ]
+    },
+    {
+     "pivot": "flow",
+     "rank": 2,
+     "when": {
+      "artifact": [
+       "suricata",
+       "zeek"
+      ]
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The connection record of this lookup.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 3,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the client did around the lookup.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "V-conn"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "addr",
+     "reason": "Sysmon 22 records no address in the app.",
+     "when": {
+      "event_code": "22"
+     }
+    }
+   ],
+   "later": [
+    {
+     "pivot": "dns_answer",
+     "reason": "Did anything connect to the address the name resolved to? The answer is in the extra fields only.",
+     "sources": [
+      "Zeek-dns",
+      "V-conn"
+     ]
+    },
+    {
+     "pivot": "dns_name",
+     "reason": "Which other hosts looked up this name. Repeated lookups can mean beaconing.",
+     "sources": [
+      "Zeek-dns",
+      "V-conn"
+     ]
+    }
+   ],
+   "also": "Encrypted DNS isn't seen, and Windows DNS servers' analytic logging is off by default (Microsoft).",
+   "measured": "Suricata DNS: source IP 5,869; IP and port 2; either end 6,791, or 64,637 on DC01's address; window \u00b160 s 157; Same flow 3."
+  },
+  {
+   "kind": "dhcp",
+   "group": "Network records",
+   "title": "DHCP record (capture, Dhcp-Client, Zeek dhcp)",
+   "match": {
+    "any_of": [
+     {
+      "artifact": "suricata",
+      "log_channel": "dhcp"
+     },
+     {
+      "log_channel": "Microsoft-Windows-Dhcp-Client/Admin"
+     },
+     {
+      "artifact": "zeek",
+      "log_channel": "dhcp"
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "each"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Events from that address while the lease held.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "broad_text": "Broad over long spans: the address moves to other devices.",
+     "caveat": null,
+     "sources": [
+      "Zeek-dhcp"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 2,
+     "args": {
+      "seconds": 300
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "What the device did once it had the address.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Zeek-dhcp"
+     ]
+    },
+    {
+     "pivot": "search",
+     "rank": 3,
+     "label": "Same MAC address or host name",
+     "args": {
+      "term_hint": "the client's MAC address or host name"
+     },
+     "count": false,
+     "breakdown": "over_limit",
+     "reason": "The same device under other addresses.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Zeek-dhcp"
+     ]
+    }
+   ],
+   "not_offered": [
+    {
+     "pivot": "addr",
+     "reason": "Windows Dhcp-Client events fill no address in the app.",
+     "when": {
+      "log_channel": "Microsoft-Windows-Dhcp-Client/Admin"
+     }
+    }
+   ],
+   "later": [
+    {
+     "pivot": "dhcp_lease",
+     "reason": "Which device held this address at this time: its MAC address and host name, then its host lane. Would rank first.",
+     "sources": [
+      "Zeek-dhcp",
+      "MS-DHCP"
+     ]
+    }
+   ],
+   "also": "The client supplies its host name, so treat it as a lead.",
+   "measured": "Dhcp-Client 50041 (9 events): no pivot field filled; window \u00b160 s 3,882. Szechuan's capture has no DHCP records."
+  },
+  {
+   "kind": "network_flow",
+   "group": "Network records",
+   "title": "Network flow and other capture or firewall records (Suricata, Zeek, 5156, 5157, Windows Firewall, FortiGate, SonicWall, Cisco ASA)",
+   "match": {
+    "any_of": [
+     {
+      "artifact": [
+       "suricata",
+       "zeek"
+      ]
+     },
+     {
+      "event_code": [
+       "5156",
+       "5157"
+      ],
+      "log_channel": "Security"
+     },
+     {
+      "artifact": [
+       "windows_firewall",
+       "fortinet",
+       "sonicwall",
+       "cisco_asa"
+      ]
+     }
+    ]
+   },
+   "pivots": [
+    {
+     "pivot": "addr",
+     "rank": 1,
+     "args": {
+      "end": "remote"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other traffic with the remote address, and the internal host's events.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "Zeek-conn",
+      "Suri-EVE",
+      "code-imports"
+     ]
+    },
+    {
+     "pivot": "flow",
+     "rank": 2,
+     "when": {
+      "artifact": [
+       "suricata",
+       "zeek"
+      ]
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Alerts and protocol records of the same connection.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "Suri-EVE",
+      "CID",
+      "SZ"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 3,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The host's own record of this connection (Sysmon 3, 5156), and the firewall's.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries",
+      "code-imports"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 4,
+     "args": {
+      "seconds": 60
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Other records in the same lane at the time.",
+     "broad": [],
+     "caveat": {
+      "text": "One lane only: the network lane for capture records, the host's for 5156 and Windows Firewall records."
+     },
+     "sources": [
+      "Zeek-conn"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": [
+    {
+     "pivot": "host_at_address",
+     "reason": "What the internal host was doing at the time.",
+     "sources": [
+      "SZ"
+     ]
+    }
+   ],
+   "also": "A flow doesn't show what it carried or which process made it. Zeek's S0 means no reply, REJ rejected, and OTH that the capture began mid-connection. SonicWall's preset maps no source port.",
+   "measured": "Flow to 203.78.103.109: source IP 2,487; IP and port 2; either end 64,637 on DC01's address or 20 on the remote one; window \u00b160 s 11; Same flow 4."
+  },
+  {
+   "kind": "default",
+   "group": "Fallback",
+   "title": "Any other event",
+   "match": {},
+   "pivots": [
+    {
+     "pivot": "session",
+     "rank": 1,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other events of the same logon on this host.",
+     "broad": [
+      "system_session"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "file",
+     "rank": 2,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "The same file in other sources.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "addr",
+     "rank": 3,
+     "args": {
+      "end": "each"
+     },
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Other events with this address at either end.",
+     "broad": [
+      "loopback",
+      "link_local",
+      "own_address"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "connection",
+     "rank": 4,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Records with the same source address and port.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "account",
+     "rank": 5,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "This account's other events, across hosts.",
+     "broad": [
+      "service_account",
+      "machine_account"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "window",
+     "rank": 6,
+     "args": {
+      "seconds": "case"
+     },
+     "count": true,
+     "breakdown": "always",
+     "reason": "Everything on this host around this time.",
+     "broad": [],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    },
+    {
+     "pivot": "file_name",
+     "rank": 7,
+     "count": true,
+     "breakdown": "over_limit",
+     "reason": "Files of the same name anywhere in the case.",
+     "broad": [
+      "system_binary"
+     ],
+     "caveat": null,
+     "sources": [
+      "code-queries"
+     ]
+    }
+   ],
+   "not_offered": [],
+   "later": []
+  }
+ ],
+ "sources": {
+  "MS-4624": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4624",
+   "title": "Microsoft, event 4624"
+  },
+  "MS-4625": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4625",
+   "title": "Microsoft, event 4625"
+  },
+  "MS-4648": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4648",
+   "title": "Microsoft, event 4648"
+  },
+  "MS-4672": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4672",
+   "title": "Microsoft, event 4672"
+  },
+  "MS-4688": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4688",
+   "title": "Microsoft, event 4688"
+  },
+  "MS-4697": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4697",
+   "title": "Microsoft, event 4697"
+  },
+  "MS-4698": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4698",
+   "title": "Microsoft, event 4698"
+  },
+  "MS-4720": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4720",
+   "title": "Microsoft, event 4720"
+  },
+  "MS-4776": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4776",
+   "title": "Microsoft, event 4776"
+  },
+  "MS-1102": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-1102",
+   "title": "Microsoft, event 1102"
+  },
+  "MS-5140": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5140",
+   "title": "Microsoft, event 5140"
+  },
+  "MS-5145": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5145",
+   "title": "Microsoft, event 5145"
+  },
+  "MS-4778": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4778",
+   "title": "Microsoft, event 4778"
+  },
+  "MS-4769": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769",
+   "title": "Microsoft, event 4769"
+  },
+  "MS-4732": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4732",
+   "title": "Microsoft, event 4732"
+  },
+  "MS-lsa": {
+   "ref": "https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-lsagetlogonsessiondata",
+   "title": "Microsoft, LsaGetLogonSessionData (LocalSystem is 0x3e7)"
+  },
+  "PS-logging": {
+   "ref": "https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_logging_windows",
+   "title": "Microsoft, about_Logging_Windows (4104)"
+  },
+  "Sysmon": {
+   "ref": "https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon",
+   "title": "Microsoft Sysinternals, Sysmon"
+  },
+  "Autoruns": {
+   "ref": "https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns",
+   "title": "Microsoft Sysinternals, Autoruns"
+  },
+  "MS-USN": {
+   "ref": "https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ns-winioctl-usn_record_v2",
+   "title": "Microsoft, USN_RECORD_V2"
+  },
+  "MS-DNS": {
+   "ref": "https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics",
+   "title": "Microsoft, DNS logging and diagnostics"
+  },
+  "MS-DHCP": {
+   "ref": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-R2-and-2008/dd183591(v=ws.10)",
+   "title": "Microsoft, DHCP server audit log"
+  },
+  "MSQA": {
+   "ref": "https://learn.microsoft.com/en-us/answers/questions/527585/sysmon-event-id-3-rdp-logon-issue-initiated-field",
+   "title": "Microsoft Q&A, Sysmon 3 Initiated field"
+  },
+  "MS-naming": {
+   "ref": "https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file",
+   "title": "Microsoft, naming files (8.3 aliases)"
+  },
+  "MS-knownfolder": {
+   "ref": "https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid",
+   "title": "Microsoft, KNOWNFOLDERID"
+  },
+  "MS-defender": {
+   "ref": "https://learn.microsoft.com/en-us/defender-endpoint/troubleshoot-microsoft-defender-antivirus",
+   "title": "Microsoft, Defender Antivirus event IDs"
+  },
+  "J-PsExec": {
+   "ref": "https://jpcertcc.github.io/ToolAnalysisResultSheet/details/PsExec.htm",
+   "title": "JPCERT/CC, PsExec sheet"
+  },
+  "J-mstsc": {
+   "ref": "https://jpcertcc.github.io/ToolAnalysisResultSheet/details/mstsc.htm",
+   "title": "JPCERT/CC, mstsc sheet"
+  },
+  "J-schtasks": {
+   "ref": "https://jpcertcc.github.io/ToolAnalysisResultSheet/details/schtasks.htm",
+   "title": "JPCERT/CC, schtasks sheet"
+  },
+  "J-wevtutil": {
+   "ref": "https://jpcertcc.github.io/ToolAnalysisResultSheet/details/wevtutil.htm",
+   "title": "JPCERT/CC, wevtutil sheet"
+  },
+  "A-0552": {
+   "ref": "https://attack.mitre.org/detectionstrategies/DET0552/",
+   "title": "MITRE ATT&CK v20, DET0552"
+  },
+  "A-0530": {
+   "ref": "https://attack.mitre.org/detectionstrategies/DET0530/",
+   "title": "MITRE ATT&CK v20, DET0530"
+  },
+  "A-0327": {
+   "ref": "https://attack.mitre.org/detectionstrategies/DET0327/",
+   "title": "MITRE ATT&CK v20, DET0327"
+  },
+  "A-T1543": {
+   "ref": "https://attack.mitre.org/techniques/T1543/003/",
+   "title": "MITRE ATT&CK, T1543.003"
+  },
+  "A-T1053": {
+   "ref": "https://attack.mitre.org/techniques/T1053/005/",
+   "title": "MITRE ATT&CK, T1053.005"
+  },
+  "A-T1547": {
+   "ref": "https://attack.mitre.org/techniques/T1547/001/",
+   "title": "MITRE ATT&CK, T1547.001"
+  },
+  "A-T1110": {
+   "ref": "https://attack.mitre.org/techniques/T1110/",
+   "title": "MITRE ATT&CK, T1110"
+  },
+  "A-T1070.006": {
+   "ref": "https://attack.mitre.org/techniques/T1070/006/",
+   "title": "MITRE ATT&CK, T1070.006"
+  },
+  "FOR508": {
+   "ref": "https://www.sans.org/cyber-security-courses/advanced-incident-response-threat-hunting-training/",
+   "title": "SANS FOR508 syllabus (public page only)"
+  },
+  "H-out": {
+   "ref": "https://yamato-security.github.io/hayabusa/output/",
+   "title": "Hayabusa, output"
+  },
+  "H-cmd": {
+   "ref": "https://yamato-security.github.io/hayabusa/commands/dfir-timeline/",
+   "title": "Hayabusa, DFIR timeline commands"
+  },
+  "Suri-EVE": {
+   "ref": "https://docs.suricata.io/en/latest/output/eve/eve-json-format.html",
+   "title": "Suricata, EVE JSON format"
+  },
+  "Suri-rules": {
+   "ref": "https://docs.suricata.io/en/latest/rules/intro.html",
+   "title": "Suricata, rules introduction"
+  },
+  "Zeek-conn": {
+   "ref": "https://docs.zeek.org/en/master/logs/conn.html",
+   "title": "Zeek, conn.log"
+  },
+  "Zeek-state": {
+   "ref": "https://docs.zeek.org/en/master/scripts/base/protocols/conn/main.zeek.html",
+   "title": "Zeek, conn states"
+  },
+  "Zeek-dns": {
+   "ref": "https://docs.zeek.org/en/master/logs/dns.html",
+   "title": "Zeek, dns.log"
+  },
+  "Zeek-dhcp": {
+   "ref": "https://docs.zeek.org/en/master/logs/dhcp.html",
+   "title": "Zeek, dhcp.log"
+  },
+  "CID": {
+   "ref": "https://github.com/corelight/community-id-spec",
+   "title": "Community ID specification"
+  },
+  "W-mandiant": {
+   "ref": "https://cloud.google.com/blog/topics/threat-intelligence/caching-out-the-val/",
+   "title": "Mandiant, Shimcache (Parisi, 2015)"
+  },
+  "W-ct": {
+   "ref": "https://www.cybertriage.com/blog/shimcache-and-amcache-forensic-analysis-2026/",
+   "title": "Cyber Triage, Shimcache and Amcache (Ray, 2026)"
+  },
+  "W-pf": {
+   "ref": "https://forensics.wiki/prefetch/",
+   "title": "Forensics Wiki, Prefetch"
+  },
+  "W-lnk": {
+   "ref": "https://forensics.wiki/lnk/",
+   "title": "Forensics Wiki, LNK"
+  },
+  "W-jl": {
+   "ref": "https://forensics.wiki/jump_lists/",
+   "title": "Forensics Wiki, jump lists"
+  },
+  "W-chrome": {
+   "ref": "https://forensics.wiki/google_chrome/",
+   "title": "Forensics Wiki, Google Chrome"
+  },
+  "Poling": {
+   "ref": "https://ponderthebits.com/2018/02/windows-rdp-related-event-logs-identification-tracking-and-investigation/",
+   "title": "Poling, RDP event logs (2018)"
+  },
+  "UWS-4688": {
+   "ref": "https://www.ultimatewindowssecurity.com/securitylog/encyclopedia/event.aspx?eventid=4688",
+   "title": "Ultimate Windows Security, 4688"
+  },
+  "libscca": {
+   "ref": "https://github.com/libyal/libscca/blob/main/documentation/Windows%20Prefetch%20File%20(PF)%20format.asciidoc",
+   "title": "libscca, Prefetch format"
+  },
+  "ECS-related": {
+   "ref": "https://www.elastic.co/docs/reference/ecs/ecs-related",
+   "title": "Elastic ECS, related fields"
+  },
+  "DDB-idx": {
+   "ref": "https://duckdb.org/docs/current/sql/indexes.html",
+   "title": "DuckDB, indexes"
+  },
+  "DDB-perf": {
+   "ref": "https://duckdb.org/docs/current/guides/performance/indexing.html",
+   "title": "DuckDB, indexing performance"
+  },
+  "V-sec": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_security.yaml",
+   "title": "Valhuntir, Security log"
+  },
+  "V-svc": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_services.yaml",
+   "title": "Valhuntir, services"
+  },
+  "V-sysmon": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_sysmon.yaml",
+   "title": "Valhuntir, Sysmon"
+  },
+  "V-share": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_network_share.yaml",
+   "title": "Valhuntir, network shares"
+  },
+  "V-task": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_task_scheduler.yaml",
+   "title": "Valhuntir, Task Scheduler"
+  },
+  "V-pf": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/prefetch.yaml",
+   "title": "Valhuntir, Prefetch"
+  },
+  "V-amc": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/amcache.yaml",
+   "title": "Valhuntir, Amcache"
+  },
+  "V-shim": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/shimcache.yaml",
+   "title": "Valhuntir, Shimcache"
+  },
+  "V-srum": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/srum.yaml",
+   "title": "Valhuntir, SRUM"
+  },
+  "V-sb": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/shellbags.yaml",
+   "title": "Valhuntir, ShellBags"
+  },
+  "V-run": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/registry_run_keys.yaml",
+   "title": "Valhuntir, Run keys"
+  },
+  "V-hay": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/hayabusa_alerts.yaml",
+   "title": "Valhuntir, Hayabusa alerts"
+  },
+  "V-lnk": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/lnk_files.yaml",
+   "title": "Valhuntir, LNK files"
+  },
+  "V-jl": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/jump_lists.yaml",
+   "title": "Valhuntir, jump lists"
+  },
+  "V-browser": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/browser_history.yaml",
+   "title": "Valhuntir, browser history"
+  },
+  "V-usn": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/usn_journal.yaml",
+   "title": "Valhuntir, USN journal"
+  },
+  "V-mft": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/mft.yaml",
+   "title": "Valhuntir, MFT"
+  },
+  "V-logon": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/discipline/playbooks/unusual_logon.yaml",
+   "title": "Valhuntir, unusual logon playbook"
+  },
+  "V-exec": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/discipline/playbooks/suspicious_execution.yaml",
+   "title": "Valhuntir, suspicious execution playbook"
+  },
+  "V-autorun": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/discipline/playbooks/suspicious_autorun.yaml",
+   "title": "Valhuntir, suspicious autorun playbook"
+  },
+  "V-conn": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/discipline/playbooks/suspicious_connection.yaml",
+   "title": "Valhuntir, suspicious connection playbook"
+  },
+  "V-tamper": {
+   "ref": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/discipline/playbooks/log_tampering.yaml",
+   "title": "Valhuntir, log tampering playbook"
+  },
+  "evtx-7045-account": {
+   "ref": "https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES/tree/master/Lateral%20Movement",
+   "title": "EVTX-ATTACK-SAMPLES, Lateral Movement folder, LM_Remote_Service02_7045.evtx: the account in the System element of its 7045 events"
+  },
+  "evtx-sysmon3-direction": {
+   "ref": "https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES/tree/master/Lateral%20Movement",
+   "title": "EVTX-ATTACK-SAMPLES, Lateral Movement folder: Sysmon 3 events with Initiated false record the local address as the source"
+  },
+  "evtx-parent-process": {
+   "ref": "https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES/tree/master/Lateral%20Movement",
+   "title": "EVTX-ATTACK-SAMPLES, Lateral Movement folder: shells started by w3wp.exe, sqlservr.exe, WmiPrvSE.exe, wsmprovhost.exe, or services.exe"
+  },
+  "code-queries": {
+   "ref": "src/glessner/queries.py",
+   "title": "queries.py (RELATED and related())"
+  },
+  "code-pivots": {
+   "ref": "src/glessner/pivots.py",
+   "title": "pivots.py (_addresses, which end of the event a row takes)"
+  },
+  "code-evtxecmd": {
+   "ref": "src/glessner/parsers/evtxecmd.py",
+   "title": "parsers/evtxecmd.py"
+  },
+  "code-suricata": {
+   "ref": "src/glessner/parsers/suricata.py",
+   "title": "parsers/suricata.py"
+  },
+  "code-recmd": {
+   "ref": "src/glessner/parsers/recmd.py",
+   "title": "parsers/recmd.py"
+  },
+  "code-autoruns": {
+   "ref": "src/glessner/parsers/autoruns.py",
+   "title": "parsers/autoruns.py"
+  },
+  "code-imports": {
+   "ref": "src/glessner/imports.py",
+   "title": "imports.py (PRESETS)"
+  },
+  "code-search": {
+   "ref": "src/glessner/search.py",
+   "title": "search.py (syntax and BASE_WHERE)"
+  },
+  "code-js-core": {
+   "ref": "src/glessner/static/js/core.js",
+   "title": "static/js/core.js (PIVOTS, pivotMissing)"
+  },
+  "code-js-event": {
+   "ref": "src/glessner/static/js/event_page.js",
+   "title": "static/js/event_page.js (Find related, fields)"
+  },
+  "code-js-pages": {
+   "ref": "src/glessner/static/js/pages.js",
+   "title": "static/js/pages.js (pivot lists, To investigate)"
+  },
+  "code-js-menu": {
+   "ref": "src/glessner/static/js/quick_menu.js",
+   "title": "static/js/quick_menu.js (quick actions)"
+  },
+  "code-js-clock": {
+   "ref": "src/glessner/static/js/clock.js",
+   "title": "static/js/clock.js (clock note, pair link)"
+  },
+  "SZ": {
+   "ref": "https://dfirmadness.com/the-stolen-szechuan-sauce/",
+   "title": "The Stolen Szechuan Sauce case (DFIR Madness), 2026-10-16: counts, account spellings, and logon IDs in a Glessner case built from its DC01 and DESKTOP images and packet capture"
+  }
+ }
+}

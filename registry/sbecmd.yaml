@@ -1,0 +1,21 @@
+id: sbecmd
+name: SBECmd
+publisher: Eric Zimmerman
+# No public repository or license file was found; Eric Zimmerman distributes it free.
+license: Free; license terms not published
+download_url: https://download.ericzimmermanstools.com/SBECmd.zip
+detect:
+  executables: [SBECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: ["registry:NTUSER", "registry:USRCLASS"]   # the user hives only
+input: host_dir
+run:
+  # SBECmd finds every NTUSER.DAT and UsrClass.dat under the host folder and writes one CSV per hive. --nl lets it
+  # process dirty hives whose transaction logs were not collected, as RECmd does. Never -l: that reads this machine.
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--nl"]
+  timeout_minutes: 30
+options: []
+# The messages file is written on every run; a host whose hives hold no ShellBags still gets header-only CSVs.
+outputs: ["!SBECmd_Messages.txt"]
+parser: sbecmd_csv
+notes: "ShellBags: the folders, drives, and network shares each user browsed in Explorer"

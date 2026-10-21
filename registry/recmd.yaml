@@ -1,0 +1,19 @@
+id: recmd
+name: RECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/RECmd.zip
+detect:
+  executables: [RECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [registry, registry_log]
+input: host_dir
+run:
+  # --nl lets RECmd process dirty hives whose transaction logs were not collected.
+  args: ["-d", "{host_dir}", "--bn", '{tool_dir}\BatchExamples\DFIRBatch.reb', "--nl",
+         "--csv", "{output_dir}", "--csvf", "recmd.csv"]
+  timeout_minutes: 60
+options: []
+outputs: [recmd.csv]
+parser: recmd_csv
+notes: ""

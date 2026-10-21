@@ -1,0 +1,33 @@
+id: suricata
+name: Suricata
+publisher: Open Information Security Foundation
+license: GPL-2.0
+download_url: https://suricata.io/download/
+detect:
+  executables: [suricata.exe]
+  version: {args: ["-V"], regex: 'version (\d+\.\d+\.\d+)'}
+# Packet captures, one run per file: EVE JSON with flows, protocol records (DNS, HTTP, TLS, SMB, Kerberos,
+# and more), files seen, and rule alerts. The Windows build needs Npcap's wpcap.dll even to read files. Its shipped
+# suricata.yaml points at C:\Program Files\Suricata, so the paths it needs are set on the command line, and setup.md
+# unpacks the installer instead of installing it. -k none: offline captures often carry checksums the capturing card
+# offloaded. --runmode single: in the default multi-threaded mode, reading a file, Suricata 8.0.7 logged every flow and most TLS
+# records with the capture's first packet time; one thread logs each at its own time, and
+# was no slower on the 198 MB Szechuan capture.
+npcap: true
+handles: [pcap]
+input: each_file
+run:
+  args: ["-c", '{tool_dir}\suricata.yaml', "-r", "{input_file}", "-l", "{output_dir}", "-k", "none", "--runmode", "single",
+         "--set", 'reference-config-file={tool_dir}\reference.config',
+         "--set", 'default-log-dir={output_dir}']
+  timeout_minutes: 240
+# A rule set made by scripts/suricata_rules.py from ET Open: one file, beside the executable, with ET's classification
+# list and the set's version. Without it Suricata still writes every protocol record, but raises no rule alerts.
+rules:
+  file: 'rules\suricata.rules'
+  version_file: 'rules\et-open-version.txt'
+  args: ["-S", "{rules_file}", "--set", 'classification-file={tool_dir}\rules\classification.config']
+options: []
+outputs: [eve.json]
+parser: suricata_eve
+notes: "Packet captures: flows, DNS, HTTP, TLS, SMB, Kerberos, and files seen, with ET Open alerts when the rule set is in place"

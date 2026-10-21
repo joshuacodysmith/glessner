@@ -1,0 +1,97 @@
+{
+  "about": "Caveats: what a kind of record does not prove, one text per artifact or event type, each with its sources. A record matches the first row whose match fits it: its artifact, and where given its event code, its channel, or a word in its registry path. The same record always shows the same text, and the app writes none of it. A source has a title and either a url, for a public page, or a path, which names a file of this app.",
+  "caveats": [
+    {
+      "id": "prefetch",
+      "name": "Prefetch",
+      "match": {"artifact": ["prefetch"]},
+      "text": "A Prefetch file shows the program ran, with up to its last eight run times (Windows 8 and later). It does not show who ran it, or that the run succeeded. A missing .pf file does not mean the program never ran: Prefetch is off by default on Windows Server and may be off on SSDs.",
+      "sources": [
+        {"title": "Valhuntir, Prefetch", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/prefetch.yaml"},
+        {"title": "Forensics Wiki, Prefetch", "url": "https://forensics.wiki/prefetch/"}
+      ]
+    },
+    {
+      "id": "amcache",
+      "name": "Amcache file entry",
+      "match": {"artifact": ["amcache"]},
+      "text": "An Amcache file entry shows the file was present and inventoried, with its SHA-1. On Windows 10 and later it does not by itself show that the program ran, or who ran it. The time is when Windows' inventory task wrote the entry, not when the file first appeared or ran. The SHA-1 covers only the first 30 MB of the file. Look for Prefetch, a process creation event, or SRUM to show execution.",
+      "sources": [
+        {"title": "Cyber Triage, Shimcache and Amcache (Ray, 2026)", "url": "https://www.cybertriage.com/blog/shimcache-and-amcache-forensic-analysis-2026/"},
+        {"title": "Valhuntir, Amcache", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/amcache.yaml"},
+        {"title": "Valhuntir, SRUM", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/srum.yaml"},
+        {"title": "SANS FOR508 syllabus (public page), the disagreement", "url": "https://www.sans.org/cyber-security-courses/advanced-incident-response-threat-hunting-training/"},
+        {"title": "parsers/amcache.py, the time label", "path": "src/glessner/parsers/amcache.py"}
+      ]
+    },
+    {
+      "id": "appcompatcache",
+      "name": "AppCompatCache (Shimcache)",
+      "match": {"artifact": ["registry"], "registry_path_has": "appcompatcache"},
+      "text": "An AppCompatCache entry shows Windows saw the file. On Vista and later it does not by itself show that the program ran. The row's time is the cache key's last write, shared by every entry on the host, so it is not when this file was seen or run. The file's modified time is in the entry's data. Windows writes the cache to the registry only at a clean shutdown.",
+      "sources": [
+        {"title": "Mandiant, Shimcache (Parisi, 2015)", "url": "https://cloud.google.com/blog/topics/threat-intelligence/caching-out-the-val/"},
+        {"title": "Cyber Triage, Shimcache and Amcache (Ray, 2026)", "url": "https://www.cybertriage.com/blog/shimcache-and-amcache-forensic-analysis-2026/"},
+        {"title": "Valhuntir, Shimcache", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/shimcache.yaml"},
+        {"title": "parsers/recmd.py, the row time", "path": "src/glessner/parsers/recmd.py"},
+        {"title": "The Stolen Szechuan Sauce case (DFIR Madness): in a Glessner case built from DC01 and DESKTOP, each host's AppCompatCache rows share one time", "url": "https://dfirmadness.com/the-stolen-szechuan-sauce/"}
+      ]
+    },
+    {
+      "id": "lnk",
+      "name": "Shortcut (LNK) and jump list",
+      "match": {"artifact": ["lnk", "jumplist"]},
+      "text": "A shortcut or jump list entry shows the shell recorded a reference to the file under that profile. Applications, File and Open dialogs, drag and drop, and programs also create entries, so it does not prove the user opened the file on purpose, or that the program ran. It does not show that the file still exists, or what it contained.",
+      "sources": [
+        {"title": "Valhuntir, LNK files", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/lnk_files.yaml"},
+        {"title": "Valhuntir, jump lists", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/jump_lists.yaml"},
+        {"title": "Forensics Wiki, LNK", "url": "https://forensics.wiki/lnk/"},
+        {"title": "Forensics Wiki, jump lists", "url": "https://forensics.wiki/jump_lists/"}
+      ]
+    },
+    {
+      "id": "logon",
+      "name": "Logon events 4624 and 4625",
+      "match": {"artifact": ["evtx"], "event_code": ["4624", "4625"]},
+      "text": "A logon event shows an account authenticated, or failed to, from a source. It does not show who used the account. On an NTLM logon, the workstation name is the one the client sent. The address and workstation fields depend on the authentication protocol.",
+      "sources": [
+        {"title": "Microsoft, event 4624", "url": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4624"},
+        {"title": "Microsoft, event 4625", "url": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4625"},
+        {"title": "Microsoft, MS-NLMP AUTHENTICATE_MESSAGE", "url": "https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-nlmp/033d32cc-88f9-4483-9bf2-b273055038ce"}
+      ]
+    },
+    {
+      "id": "autoruns",
+      "name": "Autoruns entry",
+      "match": {"artifact": ["autoruns"]},
+      "text": "An Autoruns entry shows a persistence location and its target. It does not show when the entry was set. For a program file the time is when the linker built the image, for a script it is the file's last write, and for a location row it is the key's or folder's last change.",
+      "sources": [
+        {"title": "Valhuntir, Run keys", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/registry_run_keys.yaml"},
+        {"title": "Microsoft Sysinternals, Autoruns", "url": "https://learn.microsoft.com/en-us/sysinternals/downloads/autoruns"},
+        {"title": "parsers/autoruns.py, header comment on the Time column", "path": "src/glessner/parsers/autoruns.py"}
+      ]
+    },
+    {
+      "id": "suricata_alert",
+      "name": "Suricata alert",
+      "match": {"artifact": ["suricata"], "channel": ["alert"]},
+      "text": "An alert shows that traffic matched a signature. It does not show that the attack succeeded. The alert's source address is not necessarily the attacker.",
+      "sources": [
+        {"title": "Suricata, EVE JSON format", "url": "https://docs.suricata.io/en/latest/output/eve/eve-json-format.html"},
+        {"title": "UCSB, Using Alert Verification to Identify Successful Intrusion Attempts (Kruegel, Robertson, and Vigna, 2004)", "url": "https://sites.cs.ucsb.edu/~vigna/publications/2004_kruegel_robertson_vigna_PIK_AlertVerification.pdf"}
+      ]
+    },
+    {
+      "id": "service_installed",
+      "name": "Service installed (7045)",
+      "match": {"artifact": ["evtx"], "event_code": ["7045"]},
+      "text": "A 7045 shows a service was registered with its image path. It does not show the binary ran. The account shown is the one the event's System element names. In the EVTX-ATTACK-SAMPLES events checked, that was the account that installed the service. This is inference beyond those samples. It is not the account the service runs as. Look for the file's creation, a Prefetch or process creation for the path, and the logon before it.",
+      "sources": [
+        {"title": "EVTX-ATTACK-SAMPLES, Lateral Movement folder, LM_Remote_Service02_7045.evtx: the account in the System element of its 7045 events", "url": "https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES/tree/master/Lateral%20Movement"},
+        {"title": "parsers/evtxecmd.py, the account from the System element", "path": "src/glessner/parsers/evtxecmd.py"},
+        {"title": "Valhuntir, services", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/event_logs_services.yaml"},
+        {"title": "Microsoft, event 4697", "url": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4697"}
+      ]
+    }
+  ]
+}

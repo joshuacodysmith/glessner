@@ -1,0 +1,729 @@
+"""The Details panel and the Event page's header in a real browser: the band and its one scroller, the default height, the
+trail in the band, the header's two rows, the provenance strip, the folds, and the reasons' layout. They drive the
+installed Microsoft Edge through Playwright, as test_browser_smoke does, and are skipped without it."""
+
+import re
+
+import pytest
+from conftest import SEC, T0, WS_LOG, logon
+from test_browser_design import computed, near, open_event, token
+from test_browser_frame import no_tool_scan, paint
+from test_browser_pivots import COUNTED, INSTALL, pv, select, uid, walk
+from test_browser_smoke import browser, case_menu, clock_page, event_point, page, served_page, to_timeline  # noqa: F401
+from test_clock import accepted, flow
+from test_pivots import RDP, load_events, pcase, pcase_events  # noqa: F401
+
+from glessner.events import Event, load
+from glessner.intake import intake
+from glessner.server import api_mark
+
+pytestmark = pytest.mark.browser
+READY = "() => window.__ready === true && window.__app.S.data !== null"
+PANEL = "(h) => { document.getElementById('details').style.flexBasis = `${h}px`; }"   # a panel of this height
+NODE_BOX = """(n) => { const b = n.getBoundingClientRect();
+    return { top: b.top, bottom: b.bottom, left: b.left, right: b.right, height: b.height, width: b.width }; }"""
+BOX = f"(sel) => ({NODE_BOX})(document.querySelector(sel))"
+DETAILS_KEY = "glessner.detailsShare"
+OLD_KEYS = ("glessner.detailsHeight", "glessner.detailsHeight2")   # legacy pixel heights: removed, never read
+PLAIN_DC01 = """() => {
+    for (const [row, items] of window.__app.S.index.entries()) {
+        if (window.__app.S.rows[row].label !== 'DC01') continue;
+        for (const it of items || []) if (it.kind === 'event' && it.e.code === '4624') return it.e.uid;
+    }
+    return null;
+}"""   # a drawn 4624 on DC01, which has no pair in the capture
+
+
+def box(p, selector):
+    return p.evaluate(BOX, selector)
+
+
+def inside(inner, outer, slack=1):
+    return inner["top"] >= outer["top"] - slack and inner["bottom"] <= outer["bottom"] + slack
+
+
+def stored(p, key):
+    return p.evaluate("(k) => localStorage.getItem(k)", key)
+
+
+def reload(p):
+    p.reload()
+    p.wait_for_function(READY)
+    to_timeline(p)
+
+
+@pytest.fixture
+def layout_page(browser, synthetic_case):  # noqa: F811
+    """The app with the browser's layout preferences untouched: served_page seeds a half-stage share for the other tests."""
+    yield from served_page(browser, synthetic_case, share=None)
+
+
+def stage_height(p):
+    return p.evaluate("() => document.getElementById('stage').clientHeight")
+
+
+def two_thirds_of_the_stage(p):
+    return round(stage_height(p) * 2 / 3)
+
+
+def test_the_panel_opens_at_two_thirds_of_the_stage(layout_page):
+    """The panel opens at two-thirds of the panel area, and the Timeline keeps the rest. The divider's hover says so."""
+    p = layout_page
+    height = box(p, "#details")["height"]
+    assert abs(height - two_thirds_of_the_stage(p)) <= 2, (height, two_thirds_of_the_stage(p))
+    assert height > 500
+    assert "Double-click to reset to two-thirds of the panel area." in p.locator("#divider").get_attribute("title")
+
+
+SPLIT = """() => {
+    const g = (id) => document.getElementById(id);
+    const stage = g('stage').clientHeight, details = g('details').offsetHeight, divider = g('divider').offsetHeight;
+    const fixed = g('tlToolbar').offsetHeight + g('stateLine').offsetHeight + g('axisRow').offsetHeight;
+    const lanes = g('scroller').clientHeight, rows = window.__app.S.tree.children.length;
+    const around = stage - details - divider - fixed - lanes;
+    const left = stage - divider - around - fixed - rows * 20;
+    return { stage, details, lanes, rows, around, two: Math.round(stage * 2 / 3), half: Math.round(stage / 2),
+             rule: Math.round(Math.max(stage / 2, Math.min(Math.round(stage * 2 / 3), left))) }; }"""
+
+
+def test_the_default_split_keeps_every_first_level_row_in_view(browser, synthetic_case):  # noqa: F811
+    """Details takes two-thirds of the stage unless that leaves the Timeline too short for every first-level row of the
+    preset folded; then it takes what is left, never under half the stage. With seven groups the synthetic case stays at
+    two-thirds at 1440 by 900, gives way at 1280 by 720 and 1280 by 600 with all seven rows in view, and holds the half
+    floor at 1280 by 560. The rows are counted from the tree's root, so opening a group moves nothing; a saved share still
+    wins, and a double-click returns to the rule."""
+    def marks(app):
+        for ts, value in ((T0 + 62 * SEC, "malicious"), (T0 + 60 * SEC, "suspicious"), (T0 + 874 * SEC, "authorized")):
+            uid_ = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [ts]).fetchone()[0]
+            api_mark(app, {"uids": [uid_], "value": value, "note": ""})
+
+    for p in served_page(browser, synthetic_case, setup=marks, share=None, folds=True):
+        assert p.evaluate("() => window.__app.S.tree.children.length") == 7
+        for size, where in (((1440, 900), "two"), ((1280, 720), "left"), ((1280, 600), "left"), ((1280, 560), "half")):
+            p.set_viewport_size({"width": size[0], "height": size[1]})
+            p.wait_for_timeout(300)
+            m = p.evaluate(SPLIT)
+            assert abs(m["details"] - m["rule"]) <= 2 and m["around"] == 24, (size, m)
+            if where == "two":
+                assert m["details"] == m["two"] == 570 and m["lanes"] >= 7 * 20, m
+            elif where == "left":
+                assert m["half"] < m["details"] < m["two"] and m["lanes"] == 7 * 20, m
+            else:   # the floor costs rows: the panel keeps half the stage
+                assert abs(m["details"] - m["half"]) <= 1 and m["lanes"] < 7 * 20, m
+        p.set_viewport_size({"width": 1280, "height": 720})
+        p.wait_for_timeout(300)
+        before = box(p, "#details")["height"]
+        p.locator("#labels .row.group", has_text="Unreviewed").click()   # opened groups don't move the default
+        p.wait_for_timeout(200)
+        assert box(p, "#details")["height"] == before
+        assert p.evaluate("() => document.querySelectorAll('#labels .row').length") > 7
+        p.evaluate("(k) => localStorage.setItem(k, '0.6500')", DETAILS_KEY)   # a saved share wins
+        reload(p)
+        assert abs(box(p, "#details")["height"] - 0.65 * stage_height(p)) <= 2
+        p.locator("#divider").dblclick()
+        assert abs(box(p, "#details")["height"] - p.evaluate(SPLIT)["rule"]) <= 2 and stored(p, DETAILS_KEY) is None
+
+
+def test_the_timeline_keeps_its_minimum(layout_page):
+    """A guard for the clamp against the two-thirds default: in a short window the Timeline keeps 160 px."""
+    p = layout_page
+    p.set_viewport_size({"width": 1280, "height": 400})
+    p.wait_for_timeout(300)
+    assert box(p, "#timeline")["height"] >= 160
+    assert box(p, "#details")["height"] >= 80
+
+
+def test_the_stored_heights_from_before_are_removed_once_and_never_read(layout_page):
+    """The legacy height keys hold a pixel height that is as often a default (240 px, or half the stage) as one the
+    analyst chose, so each is dropped, not read. A share that isn't one is ignored."""
+    p = layout_page
+    for key, value in zip(OLD_KEYS, ("240", "428"), strict=True):
+        p.evaluate("([k, v]) => localStorage.setItem(k, v)", [key, value])
+    p.evaluate("(k) => localStorage.setItem(k, '428')", DETAILS_KEY)
+    reload(p)
+    assert abs(box(p, "#details")["height"] - two_thirds_of_the_stage(p)) <= 2
+    assert all(stored(p, key) is None for key in OLD_KEYS)
+
+
+def test_a_dragged_height_is_kept_as_a_share_of_the_stage_and_a_double_click_resets(layout_page):
+    """A drag is kept under glessner.detailsShare as the panel's share of the stage, so a reload keeps the height and
+    a window of another size keeps the split; a double-click goes back to two-thirds and drops the key."""
+    p = layout_page
+    before = box(p, "#details")["height"]
+    grip = box(p, "#divider")
+    x, y = (grip["left"] + grip["right"]) / 2, (grip["top"] + grip["bottom"]) / 2
+    p.mouse.move(x, y)
+    p.mouse.down()
+    p.mouse.move(x, y + 120, steps=5)
+    p.mouse.up()
+    dragged = box(p, "#details")["height"]
+    assert dragged < before - 100
+    share = float(stored(p, DETAILS_KEY))
+    assert abs(share - dragged / stage_height(p)) < 0.001
+    reload(p)
+    assert abs(box(p, "#details")["height"] - dragged) <= 1
+    p.set_viewport_size({"width": 1280, "height": 720})
+    p.wait_for_timeout(300)
+    assert abs(box(p, "#details")["height"] - share * stage_height(p)) <= 2 and stage_height(p) < 700
+    assert stored(p, DETAILS_KEY) == f"{share:.4f}"   # a resize sets nothing
+    p.set_viewport_size({"width": 1400, "height": 900})
+    p.wait_for_timeout(300)
+    assert abs(box(p, "#details")["height"] - dragged) <= 1
+    p.locator("#divider").dblclick()
+    assert abs(box(p, "#details")["height"] - two_thirds_of_the_stage(p)) <= 2
+    assert stored(p, DETAILS_KEY) is None
+    reload(p)
+    assert abs(box(p, "#details")["height"] - two_thirds_of_the_stage(p)) <= 2
+    # The arrow keys set a share too
+    p.locator("#divider").focus()
+    p.keyboard.press("ArrowDown")
+    stepped = box(p, "#details")["height"]
+    assert abs(stepped - (two_thirds_of_the_stage(p) - 20)) <= 2
+    assert abs(float(stored(p, DETAILS_KEY)) - stepped / stage_height(p)) < 0.001
+
+
+def show_page(p, name, event):
+    """Open the event's page, a search's, or the Tools page, whichever `name` says."""
+    if name == "event":
+        select(p, event)
+    elif name == "search":
+        p.locator("#search").fill("DC01")
+        p.locator("#search").press("Enter")
+    else:
+        case_menu(p, "toolsButton")
+
+
+def test_the_details_band_stays_put(browser, pcase):  # noqa: F811
+    """Every page opens under the Details band: its name, what the page shows, the 3 px edge. The band is outside the
+    scroller, so scrolling the body to its end moves nothing in it, at the default width and at 900 px."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase, setup=no_tool_scan):
+        edge = token(p, "--band-details-edge")
+        assert computed(p, "#details", "borderTopWidth") == "3px"
+        assert near(computed(p, "#details", "borderTopColor"), edge)
+        assert near(computed(p, "#detailsBand", "backgroundColor"), token(p, "--band-details"))
+        assert p.locator("#detailsBand .name").inner_text() == "DETAILS"
+        for width in (1400, 900):
+            p.set_viewport_size({"width": width, "height": 900})
+            p.evaluate(PANEL, 200)
+            for name, title in (("event", "the DC01 event at 03:21:53"), ("search", "Search: DC01"), ("tools", "Tools")):
+                show_page(p, name, install)
+                p.wait_for_selector(f"#details[data-page='{name}']")
+                if name == "search":
+                    p.wait_for_selector("#details li.rel-row")
+                if name == "tools":
+                    p.wait_for_selector("#details .tools-table")
+                assert p.locator("#detailsBand .title").inner_text() == title, (name, width)
+                top = box(p, "#detailsBand")["top"]
+                p.locator("#detailsBody").evaluate("(n) => { n.scrollTop = n.scrollHeight; }")
+                if name != "tools":
+                    assert p.locator("#detailsBody").evaluate("(n) => n.scrollTop") > 0, (name, width)
+                assert box(p, "#detailsBand")["top"] == top, (name, width)
+                assert p.locator("#detailsBand .name").is_visible()
+
+
+def test_the_trail_stays_in_view_after_a_pivot(browser, pcase):  # noqa: F811
+    """A pivot never scrolls the trail away, nor the list out of the work column, at the default height and at a 200 px
+    panel."""
+    rdp = uid(pcase, RDP)
+    for panel in (None, 200):
+        for p in served_page(browser, pcase):
+            if panel:
+                p.evaluate(PANEL, panel)
+            select(p, rdp)
+            pv(p, "session").locator("button.pv-go").click()
+            p.locator("#relatedList strong", has_text="with the same host and logon ID").wait_for()
+            trail = box(p, "#details nav.trail")
+            assert trail["top"] - box(p, "#details")["top"] <= 40, (panel, trail)
+            assert trail["bottom"] <= box(p, "#detailsBody")["top"] + 1, panel   # in the band, over the scroller
+            assert inside(box(p, "#relatedList strong"), box(p, ".ev-work")), panel
+
+
+def test_the_trail_shows_on_a_search_taken_as_a_pivot(browser, pcase):  # noqa: F811
+    """A search run from a pivot keeps the trail, and the band shows it on the search page with that step current."""
+    reasoned = logon(T0 + 200 * SEC, 9600, WS_LOG, code="4625", user="admin", domain="", ltype="3",
+                     computer="DESKTOP-SDN1RPT.C137.local", extra={"SubStatus": "0xC000006A"})
+    load_events(pcase, [reasoned], "DESKTOP", run="p33")
+    with_reason = uid(pcase, "event_code = '4625' AND record_id = 9600")   # its "Same failure reason" row is a search
+    for p in served_page(browser, pcase):
+        select(p, with_reason)
+        pv(p, "search").locator("button.pv-go").click()
+        p.wait_for_selector("#details[data-page='search']")
+        trail = p.locator("#detailsBand nav.trail")
+        trail.wait_for()
+        assert trail.locator("[aria-current='step']").inner_text().startswith("Search ")
+        assert trail.locator("button.linklike").count() == 1   # the event it was taken from
+        trail.locator("button.linklike").click()   # back to the event
+        p.wait_for_selector("#details[data-page='event']")
+        p.wait_for_function("() => window.__app.S.trailAt === 0")   # the trail keeps the search step, dimmed
+        assert p.evaluate("window.__app.S.trail.length") == 2
+        assert p.locator("#detailsBand nav.trail button.dim").inner_text().startswith("Search ")
+
+
+def test_a_dimmed_step_is_still_a_link(browser, pcase):  # noqa: F811
+    """A step the analyst went back from keeps the link color and goes lighter and dashed, so the affordance rule holds;
+    the step on screen is bold. The dashes are a background of 6 px dashes and 4 px gaps in the link color, so their
+    spacing is fixed, where a dotted text-decoration is hard to make out; a hover underlines the text."""
+    rdp = uid(pcase, RDP)
+    for p in served_page(browser, pcase):
+        walk(p, rdp)
+        p.locator("#details nav.trail").get_by_role("button", name="Same logon session (2)").click()
+        p.wait_for_function("() => window.__app.S.trailAt === 1")
+        # the band is drawn last
+        p.locator("#relatedList strong", has_text="2 events with the same host and logon ID").wait_for()
+        step, link = "#details nav.trail button.dim", "#details nav.trail button.linklike:not(.dim)"
+        assert near(computed(p, step, "color"), token(p, "--accent"))
+        assert near(computed(p, link, "color"), token(p, "--accent"))
+        assert computed(p, step, "textDecorationLine") == "none" and computed(p, link, "backgroundImage") == "none"
+        assert computed(p, step, "backgroundSize") == "10px 1px" and computed(p, step, "backgroundRepeat") == "repeat-x"
+        stops = p.locator(step).first.evaluate("(n) => getComputedStyle(n).backgroundImage")
+        dashes = re.fullmatch(r"linear-gradient\(to right, (rgb\(\d+, \d+, \d+\)) 0px, \1 6px, "
+                              r"rgba\(0, 0, 0, 0\) 6px, rgba\(0, 0, 0, 0\) 10px\)", stops)
+        assert dashes, stops   # 6 px of the color, then 4 px of nothing, every 10 px
+        assert near(paint(dashes.group(1)), token(p, "--accent"))   # the link's color
+        p.locator(step).first.hover()
+        assert computed(p, step, "textDecorationLine") == "underline" and computed(p, step, "backgroundImage") == "none"
+        p.mouse.move(0, 0)
+        assert computed(p, step, "fontWeight") == "400"
+        assert int(computed(p, "#details nav.trail .here", "fontWeight")) >= 600
+
+
+def test_the_work_column_is_the_one_scroll_box(browser, pcase):  # noqa: F811
+    """A list in the work column has no height limit of its own, so the column scrolls and the list's heading sticks to
+    the top of it."""
+    rdp = uid(pcase, RDP)
+    for p in served_page(browser, pcase):
+        select(p, rdp)
+        pv(p, "window").locator("button.pv-go").click()
+        p.locator("#relatedList .sticky-head").wait_for()
+        assert computed(p, "#relatedList", "maxHeight") == "none"
+        assert computed(p, "#details .ev-work", "overflowY") == "auto"
+        p.locator("#details .ev-work").evaluate("(n) => { n.scrollTop = n.scrollHeight; }")
+        assert p.locator("#details .ev-work").evaluate("(n) => n.scrollTop") > 0
+        assert inside(box(p, "#relatedList .sticky-head"), box(p, ".ev-work"))
+        assert p.locator("#relatedList").evaluate("(n) => n.scrollTop") == 0
+
+
+def test_a_typed_search_starts_a_new_trail(browser, pcase):  # noqa: F811
+    """A search typed in the box begins a new trail, so the band does not carry the steps of an earlier one onto it. An
+    event opened from its list is then the one step."""
+    rdp = uid(pcase, RDP)
+    for p in served_page(browser, pcase):
+        select(p, rdp)
+        pv(p, "session").locator("button.pv-go").click()
+        p.wait_for_selector("#detailsBand nav.trail")
+        p.locator("#search").fill("code:4672")
+        p.locator("#search").press("Enter")
+        p.wait_for_selector("#details[data-page='search'] li.rel-row")
+        assert p.evaluate("window.__app.S.trail.length") == 0
+        assert p.locator("#detailsBand nav.trail").count() == 0
+        p.locator("#details li.rel-row").first.click()
+        p.wait_for_selector("#details[data-page='event'] .ev-ident")
+        assert p.evaluate("window.__app.S.trail.length") == 1
+        assert p.locator("#detailsBand nav.trail").count() == 0
+
+
+def test_the_header_is_two_rows(browser, synthetic_case):  # noqa: F811
+    """With a pending suggestion the decision sits level with the identity, and the header is two rows, at most 72 px. Two
+    suggested tags wait behind a toggle, and opened they show in the third row."""
+    from test_tags import ATTACK_HIT
+
+    load(synthetic_case.db_path, [ATTACK_HIT], host="DC01", tool="hayabusa", tool_version="t", run_id="r6",
+         replaces_sources=[ATTACK_HIT.source_file], staging_dir=synthetic_case.folder)
+    for p in served_page(browser, synthetic_case):
+        open_event(p)
+        decision = p.locator("#details .ev-head .decision")
+        decision.wait_for()
+        assert abs(box(p, ".ev-head .decision")["top"] - box(p, ".ev-ident")["top"]) <= 4
+        assert box(p, ".ev-head")["height"] <= 72
+        toggle = p.locator("#details .ev-head button.tw")
+        suggested = p.locator("#details .ev-head-more .tagchip.suggested")
+        assert toggle.inner_text().strip().startswith(f"{suggested.count()} suggested tags")
+        assert toggle.get_attribute("aria-expanded") == "false" and suggested.count() >= 2
+        assert suggested.first.is_hidden()
+        toggle.click()
+        assert toggle.get_attribute("aria-expanded") == "true"
+        assert suggested.first.is_visible()
+        p.set_viewport_size({"width": 1100, "height": 900})   # between 960 and 1,150 px the right cells drop under the left
+        assert box(p, ".ev-head .decision")["top"] > box(p, ".ev-ident")["bottom"] - 1
+
+
+def test_a_highlight_opens_its_fold(page):  # noqa: F811
+    """A search's match inside the closed Record and source fold opens it for that page, with the match in view and the
+    stored state unchanged; a plain open of another event shows it closed again."""
+    page.locator("#search").fill("C137.local")
+    page.locator("#search").press("Enter")
+    page.wait_for_selector("#details[data-page='search'] li.rel-row")
+    page.locator("#details .related li.rel-row span").first.click()
+    page.wait_for_selector("#details[data-page='event'] .ev-facts")
+    record = page.locator("#details .ev-facts details.fold", has=page.locator("summary", has_text="Record and source"))
+    assert record.evaluate("(d) => d.open")
+    assert record.locator("mark").first.is_visible()
+    page.wait_for_timeout(200)   # time for the toggle event of the page's own opening
+    assert stored(page, "glessner.recordSourceOpen") is None
+    page.locator("#searchHelp").click()   # another page clears the highlight
+    page.wait_for_selector("#details[data-page='searchHelp']")
+    open_event(page, "4672", hit=False)
+    record = page.locator("#details .ev-facts details.fold", has=page.locator("summary", has_text="Record and source"))
+    assert not record.evaluate("(d) => d.open")
+
+
+def test_the_provenance_strip_is_one_line(browser, synthetic_case):  # noqa: F811
+    """A long evidence path ellipsizes in the strip with the whole path in its hover; the strip is one line on --panel-2 and
+    the hash check is never cut."""
+    long_path = "DC01/" + "/".join(["a_folder_with_a_long_name"] * 12) + "/Security.evtx"
+    odd = Event(T0 + 5 * SEC, "Event Recorded", "evtx", long_path, "R" * 90, "a record from a long path", record_id=77)
+    load(synthetic_case.db_path, [odd], host="DC01", tool="evtxecmd", tool_version="t", run_id="r9",
+         replaces_sources=[long_path], staging_dir=synthetic_case.folder)
+    target = uid(synthetic_case, f"source_file = '{long_path}'")
+    for p in served_page(browser, synthetic_case):
+        select(p, target)
+        assert box(p, ".prov")["height"] <= 24
+        assert near(computed(p, ".prov", "backgroundColor"), token(p, "--panel-2"))
+        assert computed(p, ".prov", "flexWrap") == "nowrap"
+        part = p.locator(".prov .prov-part.file")
+        assert part.evaluate("(n) => n.scrollWidth > n.clientWidth")   # cut with an ellipsis
+        assert long_path in part.get_attribute("title")
+        check = p.locator(".prov .prov-check")
+        assert check.evaluate("(n) => n.scrollWidth <= n.clientWidth") and check.is_visible()
+        assert box(p, ".prov .prov-part.sha")["right"] <= box(p, ".prov")["right"] + 1
+        p.set_viewport_size({"width": 1000, "height": 900})
+        assert box(p, ".prov")["height"] <= 24
+
+
+def test_record_and_source_folds_and_remembers(browser, pcase):  # noqa: F811
+    """Record and source is closed on a fresh profile and its count is its rows; once opened it stays open on the next
+    event and after a reload. History says how many entries it holds, in a fold of its own."""
+    first, second = uid(pcase, RDP), uid(pcase, INSTALL)
+    for p in served_page(browser, pcase):
+        select(p, first)
+        record = p.locator("#details .ev-facts details.fold", has=p.locator("summary", has_text="Record and source"))
+        assert not record.evaluate("(d) => d.open")
+        count = int(record.locator("summary").text_content().split("(")[1].rstrip(")"))
+        assert count == record.locator("dd").count() > 5
+        assert p.locator("#details .ev-facts details.fold").evaluate_all("(n) => n.map((d) => d.open)") == [False] * 3
+        record.locator("summary").click()
+        p.wait_for_function("() => localStorage.getItem('glessner.recordSourceOpen') === '1'")
+        select(p, second)
+        assert record.evaluate("(d) => d.open")
+        reload(p)
+        select(p, first)
+        assert record.evaluate("(d) => d.open")
+        history = p.locator("#details .history-fold summary")
+        p.wait_for_function("() => /^History \\(\\d+\\+?\\)$/.test("
+                            "document.querySelector('#details .history-fold summary').textContent)")
+        assert history.text_content() == "History (0)"
+
+
+def test_the_reasons_layout(browser, pcase):  # noqa: F811
+    """A pivot's reason reads 12 px in --muted; the window row's breakdown is a child of the row and spans it; the work
+    column is wider than the facts."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase):
+        select(p, install)
+        assert computed(p, "#details .pv-reason", "fontSize") == "12px"
+        assert near(computed(p, "#details .pv-reason", "color"), token(p, "--muted"))
+        window = pv(p, "window")
+        window.locator(".pv-sources button").first.wait_for()
+        sources = window.locator(".pv-sources")
+        assert sources.evaluate("(n, row) => n.parentElement === row", window.element_handle())
+        row = '#details .pv[data-pivot="window"]'
+        assert box(p, f"{row} .pv-sources")["width"] > box(p, row)["width"] / 2
+        assert box(p, ".ev-work")["width"] > box(p, ".ev-facts")["width"]
+
+
+def test_the_ranked_rows_are_in_view(browser, pcase):  # noqa: F811
+    """The 7045's five ranked rows: at 1440 by 900 and the default height, three or more lie fully inside the work column
+    with their reasons showing."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase):
+        p.set_viewport_size({"width": 1440, "height": 900})
+        p.wait_for_timeout(300)
+        select(p, install)
+        p.wait_for_function(COUNTED)
+        work = box(p, ".ev-work")
+        rows = [r for r in p.locator("#details .pv").all() if inside(r.evaluate(NODE_BOX), work)]
+        assert len(rows) >= 3
+        assert all(r.locator(".pv-reason").is_visible() for r in rows)
+
+
+@pytest.mark.parametrize("size", [(1440, 900), (1280, 720)])
+def test_a_pivot_list_in_the_work_column_is_one_line_a_row(browser, pcase, size):  # noqa: F811
+    """A row's event text is one line cut with an ellipsis, whole in the hover, so the list shows its rows instead of three
+    or four lines a row at the work column's width. A search is as wide as the panel and still wraps."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase):
+        p.set_viewport_size({"width": size[0], "height": size[1]})
+        p.wait_for_timeout(300)
+        select(p, install)
+        pv(p, "window").locator("button.pv-go").click()
+        p.wait_for_selector("#relatedList li.rel-row")
+        rows = p.locator("#relatedList li.rel-row")
+        heights = rows.evaluate_all("(rs) => rs.map((r) => r.getBoundingClientRect().height)")
+        assert max(heights) <= 24, heights
+        text = rows.first.locator(".rel-text")
+        assert text.get_attribute("title") == text.inner_text() != ""
+        work = box(p, ".ev-work")
+        assert sum(1 for r in rows.all() if inside(r.evaluate(NODE_BOX), work)) >= 5
+        p.locator("#search").fill("code:4624")
+        p.locator("#search").press("Enter")
+        p.wait_for_selector("#details[data-page='search'] li.rel-row")
+        assert p.locator("#details li.rel-row .rel-text").first.evaluate("(n) => getComputedStyle(n).whiteSpace") == "normal"
+
+
+def test_folded_reasons_leave_all_five_rows_in_view(browser, pcase):  # noqa: F811
+    """With the reasons folded the 7045's five ranked rows all lie inside the work column at 1400 by 900 and the default
+    height."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase):
+        p.set_viewport_size({"width": 1400, "height": 900})
+        p.wait_for_timeout(300)
+        select(p, install)
+        p.wait_for_function(COUNTED)
+        p.locator("#details .pv-h input[type=checkbox]").uncheck()
+        work = box(p, ".ev-work")
+        rows = [r for r in p.locator("#details .pv").all() if inside(r.evaluate(NODE_BOX), work)]
+        assert len(rows) == 5
+        assert not any(r.locator(".pv-reason").is_visible() for r in rows)
+
+
+def test_the_search_head_stays_under_the_band_and_a_short_panel_lets_it_go(browser, synthetic_case):  # noqa: F811
+    """At 1280 by 720, in a panel at half the stage (where the search head was measured; at the default two-thirds the whole
+    list fits and nothing scrolls), the count line and buttons stay under the band while the list scrolls past them, with
+    eight or more rows beneath. In a panel too short for its head to leave rows, the head scrolls away."""
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1280, "height": 720})
+        p.wait_for_timeout(300)
+        p.evaluate(PANEL, round(stage_height(p) / 2))
+        p.locator("#search").fill("DC01")
+        p.locator("#search").press("Enter")
+        p.wait_for_selector("#details[data-page='search'] li.rel-row")
+        body = box(p, "#detailsBody")
+        head = box(p, "#details .sticky-head")
+        assert head["height"] / body["height"] < 0.2   # the head measured 16 percent of the body
+        assert not p.locator("#details").evaluate("(n) => n.classList.contains('short')")
+        p.locator("#detailsBody").evaluate("(n) => { n.scrollTop = n.scrollHeight; }")
+        head = box(p, "#details .sticky-head")
+        assert abs(head["top"] - body["top"]) <= 1   # stuck under the band
+        rows = [r for r in p.locator("#details li.rel-row").all()
+                if r.evaluate("(n, h) => n.getBoundingClientRect().top >= h - 1 && n.getBoundingClientRect().bottom <= "
+                              "document.getElementById('detailsBody').getBoundingClientRect().bottom", head["bottom"])]
+        assert len(rows) >= 8
+        p.evaluate(PANEL, 80)   # the head is more than half the body
+        p.wait_for_function("() => document.getElementById('details').classList.contains('short')")
+        assert computed(p, "#details .sticky-head", "position") == "static"
+        p.evaluate(PANEL, 400)
+        p.wait_for_function("() => !document.getElementById('details').classList.contains('short')")
+        assert computed(p, "#details .sticky-head", "position") == "sticky"
+
+
+def test_the_hosts_panel_opens_with_the_details_band(browser, synthetic_case):  # noqa: F811
+    """Hosts edits case records as the Details pages do, so it opens with the same band and its 3 px edge, and its body
+    scrolls under the band, which stays."""
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1400, "height": 420})
+        case_menu(p, "hostsButton")
+        p.wait_for_selector("#hostsTable tbody tr")
+        assert p.locator("#hostsPanel .band .name").text_content() == "Hosts"
+        assert near(computed(p, "#hostsPanel .band", "backgroundColor"), token(p, "--band-details"))
+        assert computed(p, "#hostsPanel", "borderTopWidth") == "3px"
+        assert near(computed(p, "#hostsPanel", "borderTopColor"), token(p, "--band-details-edge"))
+        assert computed(p, "#hostsBody", "overflowY") == "auto"
+        top = box(p, "#hostsPanel .band")["top"]
+        p.locator("#hostsBody").evaluate("(n) => { n.scrollTop = n.scrollHeight; }")
+        assert box(p, "#hostsPanel .band")["top"] == top
+
+
+def test_an_aligned_hosts_plain_event_keeps_a_two_row_header(clock_page):  # noqa: F811
+    """On a case aligned to its capture, nearly every event is on an aligned host, so the clock note must not draw a
+    third row. Its sentence is the hover of the row-1 chip, "Aligned -3599.5 s". An event with a pair in the capture
+    still draws the note, since it has Show the pair."""
+    p = clock_page
+    p.locator("#clockAligned").click()
+    p.wait_for_selector("#clockAligned[aria-pressed='true']")
+    plain = p.evaluate(PLAIN_DC01)
+    assert plain, "no drawn 4624 on DC01"
+    select(p, plain)
+    chip = p.locator("#details .ev-ident .chip")
+    assert chip.inner_text() == "Aligned -3599.5 s"
+    assert "Times here are aligned to the capture." in chip.get_attribute("title")
+    assert "DC01's clock ran 59 m 59.5 s ahead of the capture (10 of 10 pairs agree)." in chip.get_attribute("title")
+    assert p.locator("#details .ev-clock").count() == 0
+    assert not p.locator("#details .ev-head-more").is_visible()
+    assert box(p, ".ev-head")["height"] <= 72
+    paired = event_point(p, "131")["uid"]
+    p.evaluate("(uid) => window.__app.select(uid, false)", paired)
+    p.locator("#details .ev-clock", has_text="Times here are aligned to the capture.").wait_for()
+    assert p.locator("#details .ev-head-more").is_visible()
+
+
+@pytest.mark.parametrize(("panel", "height"), [(300, 800), (200, 800)])
+def test_a_pivot_at_900_px_lands_under_the_header(browser, pcase, panel, height):  # noqa: F811
+    """At 960 px and below the body scrolls as one. The header sticks unless it is taller than half the body, and the
+    pivot's list lands straight under whatever sticks, with its heading stuck there on scrolling and no row hidden behind
+    the header."""
+    rdp = uid(pcase, RDP)
+    for p in served_page(browser, pcase):
+        p.set_viewport_size({"width": 900, "height": height})
+        p.wait_for_timeout(300)
+        p.evaluate(PANEL, panel)
+        select(p, rdp)
+        pv(p, "window").locator("button.pv-go").click()
+        p.locator("#relatedList .sticky-head").wait_for()
+        p.wait_for_timeout(200)
+        body, head = box(p, "#detailsBody"), box(p, ".ev-head")
+        sticky = computed(p, ".ev-head", "position") == "sticky"
+        assert sticky == (head["height"] <= body["height"] / 2), (head, body)
+        assert sticky == (panel == 300)   # a roomy panel keeps the header, a short one lets it go
+        assert p.evaluate("document.getElementById('details').classList.contains('head-tall')") == (not sticky)
+        under = head["bottom"] if sticky else body["top"]
+        assert abs(box(p, "#relatedList .sticky-head")["top"] - under) <= 2   # landed straight under it
+        fits = "(n, [t, b]) => n.getBoundingClientRect().top >= t - 1 && n.getBoundingClientRect().bottom <= b + 1"
+        visible = [r for r in p.locator("#relatedList li").all() if r.evaluate(fits, [under, body["bottom"]])]
+        assert visible, (panel, under, body)
+        p.locator("#detailsBody").evaluate("(n) => { n.scrollTop = n.scrollTop + 150; }")
+        assert p.locator("#detailsBody").evaluate("(n) => n.scrollTop") > 100
+        assert abs(box(p, "#relatedList .sticky-head")["top"] - under) <= 1   # stuck under it, none of it cut
+        if sticky:
+            assert abs(box(p, ".ev-head")["top"] - body["top"]) <= 1
+
+
+def test_aligning_a_plain_event_keeps_the_focus_on_its_clock(clock_page):  # noqa: F811
+    """Align DC01 to the capture, pressed on a plain DC01 event, folds the clock note into the chip's hover, so the button
+    and the note are gone. The focus goes to the chip, and not to the page's body."""
+    p = clock_page
+    select(p, p.evaluate(PLAIN_DC01))
+    p.locator("#details .ev-clock").get_by_role("button", name="Align DC01 to the capture").focus()
+    p.keyboard.press("Enter")
+    p.locator("#details .ev-ident .chip", has_text="Aligned -3599.5 s").wait_for()
+    p.wait_for_selector("#clockSwitch button[aria-disabled]", state="detached")
+    assert p.locator("#details .ev-clock").count() == 0
+    p.wait_for_function("() => document.activeElement.matches('#details .ev-ident .chip')")
+
+
+def test_the_kind_gives_way_with_an_ellipsis(clock_page):  # noqa: F811
+    """Where row 1 is short of room, the event's kind is cut inside its row with an ellipsis. A minimum width on the kind
+    would cut it at the row's edge with no ellipsis, and the cut wouldn't show."""
+    p = clock_page
+    p.locator("#clockAligned").click()
+    p.wait_for_selector("#clockAligned[aria-pressed='true']")
+    select(p, p.evaluate(PLAIN_DC01))
+    p.set_viewport_size({"width": 1200, "height": 900})
+    p.wait_for_timeout(300)
+    kind, ident = box(p, ".ev-ident .kind"), box(p, ".ev-ident")
+    assert kind["right"] <= ident["right"] + 0.5, (kind, ident)
+    assert p.locator(".ev-ident .kind").evaluate("(n) => n.scrollWidth > n.clientWidth")   # cut, so the ellipsis shows
+
+
+def test_a_host_whose_clock_was_right_keeps_a_two_row_header(browser, synthetic_case):  # noqa: F811
+    """A host whose clock agrees with the capture as recorded needs no offset, so its events have no chip. The clock
+    note still must not draw a third row on each of them: its sentence is the hover of the time."""
+    flows, accepts = [], []
+    for i in range(10):
+        client, start = f"194.61.24.102:{51000 + i}", T0 - 3480 * SEC + i * 20 * SEC
+        flows.append(flow(start, client, "10.42.85.10:3389"))
+        accepts.append(accepted(start + SEC // 5, client, "DC01"))   # 0.2 s ahead, inside what agrees
+    for i, (host, loaded, tool) in enumerate((("network", flows, "suricata"), ("DC01", accepts, "evtxecmd"))):
+        load(synthetic_case.db_path, loaded, host=host, tool=tool, tool_version="t", run_id=f"right-{i}",
+             replaces_sources=[], staging_dir=synthetic_case.folder)
+    for p in served_page(browser, synthetic_case):
+        assert p.evaluate("window.__app.S.meta.hosts.find((h) => h.host === 'DC01').clock.state") == "agrees"
+        select(p, p.evaluate(PLAIN_DC01))
+        assert p.locator("#details .ev-ident .chip").count() == 0
+        assert p.locator("#details .ev-clock").count() == 0
+        assert not p.locator("#details .ev-head-more").is_visible()
+        assert box(p, ".ev-head")["height"] <= 72
+        title = p.locator("#details .ev-ident .time").get_attribute("title")
+        assert "DC01's clock ran 0.2 s ahead of the capture (10 of 10 pairs agree). Times here are aligned" in title
+
+
+def test_the_verdict_note_box_shows_its_whole_label(browser, synthetic_case):  # noqa: F811
+    """The note box's placeholder is its only visible label, so the 180 px box must not cut it, as to
+    'Note for this mark (optional'. The placeholder is short and the long wording is the box's title and its name."""
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1280, "height": 720})
+        open_event(p)
+        note = p.locator("#details .ev-verdict .mark-note")
+        note.wait_for()
+        assert note.evaluate(
+            "(i) => { i.value = i.placeholder; const fits = i.scrollWidth <= i.clientWidth; i.value = ''; return fits; }")
+        assert note.get_attribute("placeholder") == "Note (optional)"
+        assert note.get_attribute("title") == "Note for this mark (optional)"
+
+
+def test_the_band_does_not_grow_when_a_trail_shows(browser, pcase):  # noqa: F811
+    """The bordered 'Save trail as a note' button must not be taller than the band's content, or the band grows and the
+    page drops on the first pivot. Checked at 1440 by 900 and 1280 by 720."""
+    rdp = uid(pcase, RDP)
+    for size in ((1440, 900), (1280, 720)):
+        for p in served_page(browser, pcase):
+            p.set_viewport_size({"width": size[0], "height": size[1]})
+            select(p, rdp)
+            before = box(p, "#detailsBand")["height"]
+            top = box(p, ".ev-work")["top"]
+            pv(p, "session").locator("button.pv-go").click()
+            p.locator("#details nav.trail button.trail-save").wait_for()
+            assert box(p, "#detailsBand")["height"] == before, size
+            assert box(p, ".ev-work")["top"] == top, size
+
+
+def test_a_page_does_not_repeat_the_band_title_as_a_heading(browser, synthetic_case):  # noqa: F811
+    """The band names every Details page, so the Audit trail, Import, Tools, Export, and To investigate pages don't repeat
+    the name as an h2. The Rules page keeps its h2, which says more than the band's 'Rules', and so do the Findings page's
+    two columns."""
+    headings = "() => [...document.querySelectorAll('#details h2')].map((n) => n.textContent)"
+    intake(synthetic_case)   # the Import page lists the manifest's files
+    for p in served_page(browser, synthetic_case, setup=no_tool_scan):
+        for item, title in (("auditButton", "Audit trail"), ("importButton", "Import"), ("toolsButton", "Tools"),
+                            ("exportButton", "Findings")):   # Export opens the Findings page
+            case_menu(p, item)
+            p.wait_for_function("(t) => document.querySelector('#detailsBand .title')?.textContent === t", arg=title)
+            assert title not in p.evaluate(headings), title
+        p.locator("#investigateButton").click()
+        p.wait_for_function("() => document.querySelector('#detailsBand .title')?.textContent === 'To investigate'")
+        assert p.evaluate(headings) == ["Marked events to follow up", "Pending suggestions, by rule"]   # the worklist
+        case_menu(p, "rulesButton")
+        p.wait_for_function("() => document.querySelector('#detailsBand .title')?.textContent === 'Rules'")
+        assert p.evaluate(headings) == ["Suggestion rules"]
+
+
+def test_a_focused_control_scrolls_in_with_room_for_its_ring(browser, pcase):  # noqa: F811
+    """Tab must scroll a field near the bottom of the facts column in with room for its ring, or the column cuts the ring's
+    bottom 3 px. A focused control scrolls in with 4 px to spare."""
+    install = uid(pcase, INSTALL)
+    for p in served_page(browser, pcase, setup=no_tool_scan):
+        p.evaluate(PANEL, 200)
+        select(p, install)
+        p.wait_for_selector("#details .ev-facts button")
+        p.evaluate("() => document.querySelector('#details .ev-facts button').focus()")
+        tight, seen = [], 0
+        for _ in range(120):   # Tab through the page, so each ring is the keyboard's
+            p.keyboard.press("Tab")
+            gaps = p.evaluate("""() => {
+                const a = document.activeElement, facts = document.querySelector('#details .ev-facts');
+                if (!facts.contains(a)) return null;
+                const r = a.getBoundingClientRect(), f = facts.getBoundingClientRect();
+                return [f.bottom - r.bottom, r.top - f.top, getComputedStyle(a).scrollMarginBottom];
+            }""")
+            if gaps:
+                seen += 1
+                if gaps[0] < 3.5 or gaps[1] < 3.5:
+                    tight.append(gaps)
+        assert seen > 5, seen
+        assert not tight, tight
+
+
+def test_a_long_case_name_and_state_keep_the_case_panel_on_one_row(browser, synthetic_case):  # noqa: F811
+    """A long case name and state line must not widen #caseId, or the Case panel takes two rows at 1440 and at 1280 and the
+    stage loses 27 to 33 px. The name and the line ellipsize, with all their text in the hover."""
+    name = "Szechuan Sauce incident, DFIR Madness 2020"
+    for p in served_page(browser, synthetic_case):
+        p.evaluate("""(name) => {
+            document.getElementById('caseName').textContent = name;
+            document.getElementById('caseState').textContent =
+                'Open · full re-hash matched on 2026-10-18 · analyst Ana Lyst'; }""", name)
+        for size in ((1440, 900), (1280, 720)):
+            p.set_viewport_size({"width": size[0], "height": size[1]})
+            p.wait_for_timeout(100)
+            assert box(p, "header")["height"] <= 50, (size, box(p, "header"))
+        assert p.locator("#caseName").evaluate("(n) => n.scrollWidth > n.clientWidth")   # cut, so the ellipsis shows

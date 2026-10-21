@@ -1,0 +1,92 @@
+name: Bug report
+description: Report something that fails, or gives a wrong or surprising result.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This issue is public. Don't attach or paste evidence, case files, or real incident data.** Remove client names, host names, account names, addresses, and file paths that identify a real case. Show the problem with a small synthetic file or a public practice dataset.
+
+        Report a security problem privately instead, through the repository's **Security and quality** tab and **Report a vulnerability**. Don't open an issue for it.
+
+        Check known_limitations.md in the repository before you report something the app is known not to do.
+  - type: input
+    id: build
+    attributes:
+      label: Build
+      description: Run `uv run glessner --version` and paste the result.
+      placeholder: "0.2.0+abc1234"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows and Python versions
+      description: The Windows version and the Python version `uv` uses.
+      placeholder: "Windows 11 23H2, Python 3.12"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where it happened
+      options:
+        - Making a case or intake
+        - Running a tool
+        - Loading tool output or importing a log
+        - The timeline
+        - The Event page and pivots
+        - Search
+        - Marks, suggestions, and findings
+        - Exports and the report
+        - Closing a case, verify, or the journal
+        - Something else
+    validations:
+      required: true
+  - type: input
+    id: evidence_involved
+    attributes:
+      label: Which tool or kind of evidence
+      description: Name the tool or the kind of file, not the case. For example, EvtxECmd on Security.evtx, a Suricata run on a packet capture, or an imported syslog.
+    validations:
+      required: false
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: What did you do, and what happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What did you expect to happen instead?
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands or clicks, in order. Use neutral paths such as C:\Cases\CASE01.
+      placeholder: |
+        1. Run `uv run glessner new-case C:\Cases\CASE01 --evidence C:\Evidence\CASE01 --name "CASE01"`.
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: output
+    attributes:
+      label: Error message or output
+      description: Paste the text of the error. For a failed tool run, paste the end of the run's `stderr.txt` from the case's `runs` folder. Remove anything that identifies a real case. This field takes text only.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: no_evidence
+    attributes:
+      label: Evidence and real data
+      options:
+        - label: I have not attached or pasted evidence, case files, or real incident data.
+          required: true

@@ -1,0 +1,25 @@
+id: wxtcmd
+name: WxTCmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/net9/WxTCmd.zip
+detect:
+  executables: [WxTCmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+# The Windows 10 Timeline, ActivitiesCache.db: programs, files, and pages each user opened.
+# The .NET 9 build. It opens the database in place, so it runs on a copy with the database's log files.
+dotnet: 9
+handles: ["sqlite:ActivitiesCache"]
+input: each_file
+work_on_copies: true
+copy_also: [sqlite_log]
+run_in_run_folder: true
+run:
+  args: ["-f", "{input_file}", "--csv", "{output_dir}"]
+  timeout_minutes: 30
+options: []
+outputs: ["*_Activity.csv"]
+empty_result: "WxTCmd found no activities in the Timeline database."
+empty_ok: true
+parser: wxtcmd_csv
+notes: "The Windows 10 Timeline: programs, files, and pages each user opened, with when"

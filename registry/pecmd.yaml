@@ -1,0 +1,17 @@
+id: pecmd
+name: PECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/PECmd.zip
+detect:
+  executables: [PECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [prefetch]
+input: host_dir
+run:
+  args: ["-d", "{host_dir}", "-q", "--mp", "--csv", "{output_dir}", "--csvf", "pecmd.csv"]
+  timeout_minutes: 30
+options: []
+outputs: [pecmd.csv, pecmd_Timeline.csv]
+parser: pecmd_csv
+notes: Windows Server disables prefetch by default, so servers often have none.

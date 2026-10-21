@@ -1,0 +1,17 @@
+id: mftecmd
+name: MFTECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/MFTECmd.zip
+detect:
+  executables: [MFTECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [mft]
+input: each_file
+run:
+  args: ["-f", "{input_file}", "--csv", "{output_dir}", "--csvf", "mftecmd.csv"]
+  timeout_minutes: 60
+options: []
+outputs: [mftecmd.csv]
+parser: mftecmd_csv
+notes: ""

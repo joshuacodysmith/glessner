@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glessner</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<!-- The Case panel, grouped by job: the case and its state, the triage path, search, the Case menu for
+     setup and record work, and the status line. The Timeline's own controls are in its toolbar. -->
+<header>
+  <div id="caseId">
+    <strong id="caseName">Glessner</strong>
+    <span id="caseState"></span>
+  </div>
+  <nav id="path" aria-label="Triage path">
+    <button id="tabOverview" type="button" data-tab="overview">Overview</button>
+    <button id="tabTimeline" type="button" data-tab="timeline">Timeline</button>
+    <button id="investigateButton" type="button" data-tab="investigate">To investigate<span class="count flagged" id="flaggedCount" hidden></span><span class="count pending" id="pendingCount" hidden></span></button>
+    <button id="tabFindings" type="button" data-tab="findings">Findings</button>
+    <button id="tabAudit" type="button" data-tab="audit">Audit trail</button>
+  </nav>
+  <span class="grow"></span>
+  <input id="search" type="search" placeholder="Search events  ( / )" aria-label="Search events" autocomplete="off" spellcheck="false">
+  <button id="searchHelp" type="button" aria-label="Search help">?</button>
+  <div id="caseMenuBox">
+    <button id="caseMenuButton" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="caseMenu">Case<span class="count review" id="caseMenuCount" hidden></span><span aria-hidden="true"> ▾</span></button>
+    <div id="caseMenu" role="menu" aria-labelledby="caseMenuButton" hidden>
+      <button id="hostsButton" type="button" role="menuitem" tabindex="-1">Hosts<span class="count review" id="hostsCount" hidden></span></button>
+      <button id="toolsButton" type="button" role="menuitem" tabindex="-1">Tools</button>
+      <button id="importButton" type="button" role="menuitem" tabindex="-1">Import</button>
+      <button id="rulesButton" type="button" role="menuitem" tabindex="-1">Rules<span class="count error" id="ruleErrorCount" hidden></span></button>
+      <button id="exportButton" type="button" role="menuitem" tabindex="-1">Export</button>
+      <button id="auditButton" type="button" role="menuitem" tabindex="-1">Audit trail</button>
+      <button id="casesButton" type="button" role="menuitem" tabindex="-1">Cases</button>
+    </div>
+  </div>
+  <span id="status" aria-live="polite">Loading</span>
+</header>
+<!-- Hosts edits case records, as the Details pages do, so it opens with the Details' band -->
+<section id="hostsPanel" hidden>
+  <div class="band details"><span class="name">Hosts</span></div>
+  <div id="hostsBody">
+    <div id="hostSplits" hidden></div>
+    <table id="hostsTable"><thead><tr><th>Host</th><th>Role</th><th>OS</th><th>Needs review</th><th>Names</th><th>IPs</th><th>Add IP or name</th><th>Clock offset</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+<div id="stage">
+<div id="work">
+<aside id="filterPanel" hidden aria-label="Sources panel"></aside>
+<aside id="viewPanel" hidden aria-label="View filter panel"></aside>
+<main id="timeline">
+  <div id="tlToolbar" class="band timeline" role="toolbar" aria-label="Timeline controls">
+    <span class="name">Timeline</span>
+    <label id="lanesLabel">Lanes <select id="groupby"></select></label>
+    <button id="fit" type="button">Fit case</button>
+    <span class="sep" aria-hidden="true"></span>
+    <button id="filtersButton" type="button" aria-pressed="false" aria-expanded="false" aria-controls="filterPanel">Sources<span class="count review" id="filterCount" hidden></span></button>
+    <button id="viewButton" type="button" aria-pressed="false" aria-expanded="false" aria-controls="viewPanel">View<span class="count review" id="viewCount" hidden></span></button>
+    <label id="linksLabel"><input type="checkbox" id="showLinks" checked> Logon links</label>
+    <label id="machineLabel"><input type="checkbox" id="hideMachine" checked> Hide machine accounts ($)</label>
+    <span class="sep" aria-hidden="true"></span>
+    <span id="clockSwitch" role="group" aria-label="Host times" hidden>
+      <span class="switch-label">Times</span>
+      <button id="clockRecorded" type="button" aria-pressed="false">Recorded</button>
+      <button id="clockAligned" type="button" aria-pressed="false">Aligned to capture</button>
+      <span id="clockPartly" hidden>partly aligned</span>
+    </span>
+    <button id="addZone" type="button">+ zone</button>
+    <button id="legendButton" type="button" aria-pressed="false" aria-expanded="false" aria-controls="legendPanel">Legend</button>
+  </div>
+  <!-- The state line: what the timeline shows of the case, what is hidden with a way back, which clock,
+       and the window -->
+  <div id="stateLine">
+    <span id="stShown"></span>
+    <span id="stInWindow"></span>
+    <span id="stHidden"></span>
+    <span id="stClock"></span>
+    <span id="stWindow"></span>
+  </div>
+  <div id="lanesBox">
+    <div id="labelDivider" role="separator" aria-orientation="vertical" aria-label="Resize the lane labels" tabindex="0"
+         title="Drag to resize the lane labels. Double-click to fit the longest label. Arrow keys work when focused."><span class="grip" aria-hidden="true"></span></div>
+    <div id="axisRow">
+      <!-- The lane labels' corner holds Open all or Fold all, out of the toolbar, which keeps one row -->
+      <div id="axisSpacer"><span>UTC</span><button id="foldAll" type="button" hidden>Open all</button></div>
+      <canvas id="axis"></canvas>
+    </div>
+    <div id="scroller">
+      <div id="labels"></div>
+      <canvas id="lanes"></canvas>
+    </div>
+  </div>
+</main>
+<aside id="legendPanel" hidden aria-label="Legend"></aside>
+</div>
+<div id="divider" role="separator" aria-orientation="horizontal" aria-label="Resize the Details panel" tabindex="0"
+     title="Drag to resize the Details panel. Double-click to reset to two-thirds of the panel area. Arrow keys work when focused."><span class="grip" aria-hidden="true"></span></div>
+<!-- The Details panel opens with its band, which names the page and holds Back and the trail outside the scroller;
+     the page itself scrolls in #detailsBody -->
+<section id="details">
+  <div id="detailsBand" class="band details"><span class="name">Details</span></div>
+  <div id="detailsBody">
+    <p class="hint">Scroll to zoom, drag to pan. Click an event to see it; shift-click to select several. Click a group label to open or fold it.</p>
+  </div>
+</section>
+<section id="overview" hidden aria-label="Case overview"></section>
+</div>
+<div id="quickMenu" role="menu" tabindex="-1" aria-label="Quick actions" hidden></div>
+<div id="tooltip" hidden></div>
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

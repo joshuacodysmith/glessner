@@ -1,0 +1,23 @@
+id: hayabusa
+name: Hayabusa
+publisher: Yamato Security
+license: AGPL-3.0 (rules under DRL 1.1)
+download_url: https://github.com/Yamato-Security/hayabusa/releases
+detect:
+  executables: [hayabusa.exe, "hayabusa-*-win-x64.exe"]
+  version: {args: ["help"], regex: 'Hayabusa v(\d+\.\d+\.\d+)'}
+handles: [evtx]
+input: host_dir
+run:
+  # -p verbose adds EvtxFile, -b writes full channel and level names, -O writes UTC ISO-8601,
+  # -w skips the question wizard, -Q skips error log files.
+  args: ["dfir-timeline", "-d", "{host_dir}", "-o", '{output_dir}\hayabusa.csv', "-p", "verbose",
+         "-b", "-w", "-q", "-K", "-O", "-C", "-Q"]
+  timeout_minutes: 60
+options:
+  - id: min_level
+    label: Minimum rule level (informational, low, medium, high, critical)
+    args: ["-m", "{value}"]
+outputs: [hayabusa.csv]
+parser: hayabusa_csv
+notes: Output quotes attacker command lines and encoded payloads that antivirus quarantines. Rule updates (update-rules) need network access and are the analyst's step.

@@ -1,0 +1,18 @@
+id: amcacheparser
+name: AmcacheParser
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/AmcacheParser.zip
+detect:
+  executables: [AmcacheParser.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: ["registry:AMCACHE"]   # only the Amcache.hve hive, not every registry file
+input: each_file
+run:
+  # -i adds the file entries linked to programs. Transaction logs beside the hive are used when present.
+  args: ["-f", "{input_file}", "-i", "--csv", "{output_dir}"]
+  timeout_minutes: 15
+options: []
+outputs: ["*_Amcache_ProgramEntries.csv"]
+parser: amcache_csv
+notes: "Amcache: programs and executable files Windows saw, with SHA-1 values"

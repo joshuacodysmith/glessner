@@ -1,0 +1,17 @@
+id: evtxecmd
+name: EvtxECmd
+publisher: Eric Zimmerman
+license: MIT
+download_url: https://download.ericzimmermanstools.com/EvtxECmd.zip
+detect:
+  executables: [EvtxECmd.exe]
+  version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+handles: [evtx]
+input: host_dir
+run:
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--csvf", "evtxecmd.csv"]
+  timeout_minutes: 30
+options: []
+outputs: [evtxecmd.csv]
+parser: evtxecmd_csv
+notes: Output can quote attacker payloads that antivirus quarantines.
