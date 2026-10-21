@@ -1,0 +1,38 @@
+# Dependabot checks the Python packages (uv.lock), the ESLint packages (package-lock.json), and the workflow's
+# actions once a week. Minor and patch updates come as one pull request per ecosystem. A major update comes on its own.
+# A version update waits until its release is 7 days old, which gives a compromised release time to be found and
+# pulled first. Security updates don't wait.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

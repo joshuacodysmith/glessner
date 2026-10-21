@@ -1,0 +1,49 @@
+# Runs the linters and the test suite on Windows for each push to main and each pull request.
+# The lab tests skip here, since they need local copies of the public datasets and tools that the runner doesn't have.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels the run still going for the older one. Runs on main always finish, so each
+# commit there gets a result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint and tests
+    runs-on: windows-latest
+    # The runner's 4 vCPUs give the suite 2 xdist workers (tests/conftest.py). On 2 workers of a 16-thread desktop it
+    # takes about 10 minutes, so 40 leaves room for slower vCPUs and stops a hung browser test early.
+    timeout-minutes: 40
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Install the Python packages
+        run: uv sync --locked
+
+      # ESLint runs on the runner's own Node.js. Its packages in package-lock.json take Node.js 20.19 or a later 20,
+      # 22.13 or a later 22, or 24 and up.
+      - name: Install ESLint
+        run: |
+          node --version
+          npm ci --ignore-scripts
+
+      - name: Run the linters
+        run: uv run --no-sync python scripts/lint.py
+
+      - name: Run the test suite
+        run: uv run --no-sync pytest -ra
