@@ -3,6 +3,6 @@
   "private": true,
   "description": "ESLint for the page's ES modules; install with npm ci --ignore-scripts, run with scripts/lint.py",
   "devDependencies": {
-    "eslint": "10.11.0"
+    "eslint": "10.12.0"
   }
 }
