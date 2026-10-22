@@ -1190,9 +1190,9 @@ def test_new_case_and_copy_case_record_the_head(tmp_path, synthetic_case):
 
 
 def test_a_case_made_where_another_was_has_none_of_its_head(tmp_path, synthetic_case):
-    """Question 2's record is per folder, so a case made where another was starts from its own head: a new case's
+    """The head record is per folder, so a case made where another was starts from its own head: a new case's
     start_chain records it, and a copy of an older source, whose journal its upgrade seals, isn't refused for the
-    earlier case's record (case._start_journal forgets it)."""
+    earlier case's record (copy_case removes it, as create_case does)."""
     folder = synthetic_case.folder
     old = heads.read(folder)
     assert old is not None

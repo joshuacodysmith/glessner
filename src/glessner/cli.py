@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import duckdb
 
@@ -22,8 +22,9 @@ from .intake import add_new, check_files, current_entries, intake, matched_text,
 from .journal import REPLAY_ERRORS, Journal, JournalError, check, head_of, replay
 from .line_logs import LAYOUTS
 from .overview import counted_actions, utc_minute
+from .parsers.common import evidence_relative
 from .rekey import upgraded, upgraded_copy
-from .runner import LEFT_OUT, RunError, RunPlan, check_options, plan_runs, read_runs, rebuild
+from .runner import LEFT_OUT, NOT_READ, RunError, RunPlan, check_options, plan_runs, read_runs, rebuild
 from .tools import detect, load_registry, recommend
 from .version import build_id
 
@@ -170,6 +171,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
+def _require_intake(case: Case) -> None:
+    """Refuse a command that reads the intake manifest before the case has one, in add_new's words."""
+    if not case.manifest_path.exists():
+        raise CaseError("No intake manifest yet; run intake first.")
+
+
 def cmd_copy_case(args) -> int:
     source = open_case(args.source)
     case = copy_case(source, args.case_folder, args.name, args.analyst, client="cli")
@@ -215,7 +222,9 @@ def cmd_intake(case: Case, args) -> int:
 
 def cmd_verify(case: Case, args) -> int:
     """Re-hash every evidence file, then check the journal. A file intake couldn't read is named as
-    unverified, never counted as matching; it fails nothing, since no later check can give it a hash.
+    unverified, never counted as matching; it fails nothing, since no later check can give it a hash, even when it is
+    the only file. A manifest with no entry at all leaves nothing to check, which is not a match: the evidence's exit
+    is 1.
     With --journal, only the journal, which needs no evidence and writes nothing, journal.lock included."""
     expect, file = getattr(args, "expect_head", None), getattr(args, "file", None)
     if expect is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", expect):
@@ -226,6 +235,7 @@ def cmd_verify(case: Case, args) -> int:
         lines, code, _ = journal_verify(case, expect, file)
         print("\n".join(lines))
         return code
+    _require_intake(case)
     found = check_files(case, reason="manual full verification")
     unread = unverified_text(found.unverified, shown=len(found.unverified))
     code = 0
@@ -238,8 +248,11 @@ def cmd_verify(case: Case, args) -> int:
         code = 1
     elif unread:
         print(f"{matched_text(found.checked)} {unread}")
-    else:
+    elif found.checked:
         print("All evidence files match the manifest.")
+    else:
+        print("No evidence file to check: the intake manifest lists none.")
+        code = 1
     lines, journal_code, unchained = journal_verify(case, expect, file)
     print("\n".join(lines))
     # A case below format 3 has no chain to check until its upgrade, so its exit is the evidence's
@@ -360,6 +373,7 @@ def cmd_tools(case: Case, args) -> int:
 
 
 def cmd_run(case: Case, args) -> int:
+    _require_intake(case)
     if args.all:
         return _run_all(case)
     if not args.tool:
@@ -383,8 +397,9 @@ def _run_and_load(case: Case, plans: list[RunPlan], groups: list[dict], options:
     """Run the plans and load the groups of found output as the Tools page's jobs do (toolbox.run_and_load), which
     stops at the first step that finds the evidence changed, printing each step. 1 when a step failed or stopped.
     Refused before the first step while another program holds the events database: each load would fail on it after
-    its tool had run, and a rebuild loads no failed run."""
-    from .toolbox import run_and_load
+    its tool had run, and a rebuild loads no failed run. Past that check, any earlier run still recorded as running is
+    marked failed (toolbox.close_interrupted), and the command says which."""
+    from .toolbox import close_interrupted, run_and_load
 
     if case.db_path.exists():
         try:
@@ -393,6 +408,9 @@ def _run_and_load(case: Case, plans: list[RunPlan], groups: list[dict], options:
             raise CaseError(f"{case.settings.name} can't load events now: another program has its events database open, "
                             "such as glessner serving the case. Stop the server first, or run and load from its Tools "
                             f"page. ({exc})") from exc
+    if closed := close_interrupted(case):
+        print(f"Marked {plural(len(closed), 'earlier run')} still recorded as running as failed, since "
+              f"{'it' if len(closed) == 1 else 'they'} stopped before finishing: {', '.join(r.run_id for r in closed)}.")
     failed = 0
 
     def started(step) -> None:
@@ -443,15 +461,18 @@ def _print_load(record, per_file: bool) -> None:
     n = record.loaded_rows or 0
     which = f"{record.inputs[0]}: " if per_file else ""
     print(f"  {which}{record.status}: {plural(n, 'row')}{replaced} in {record.seconds}s, "
-          f"evidence {record.evidence_check or 'not read'}{note}")
+          f"evidence {record.evidence_check or NOT_READ}{note}")
 
 
 def cmd_import(case: Case, args) -> int:
-    """Import text logs. Each file is its own run; see imports.py."""
+    """Import text logs. Each file is its own run; see imports.py. Before the first load, any earlier run still recorded
+    as running is marked failed (toolbox.close_interrupted), and the command says which, as run and load-output do."""
     import fnmatch
 
     from .imports import MappingError, check_mapping_name, importable, mapping_named, run_import, save_mapping
+    from .toolbox import close_interrupted
 
+    _require_intake(case)
     if args.list:
         for f in importable(case):
             done, loaded = f["imported"], f["loaded"]
@@ -474,6 +495,7 @@ def cmd_import(case: Case, args) -> int:
         files += [m for m in matched if m not in files]
     base = mapping_named(case, args.mapping) if args.mapping else None
     failed = 0
+    interrupted_closed = False
     for rel in files:
         mapping = _with_options(_preview(case, rel, base)["mapping"], args)
         shown = _preview(case, rel, mapping)
@@ -493,6 +515,11 @@ def cmd_import(case: Case, args) -> int:
             failed += 1
             continue
         case = upgraded(case)   # right before the first load: the mapping and each preview read the case as it is
+        if not interrupted_closed:   # once, past the previews, which refuse an events database another program holds
+            interrupted_closed = True
+            if closed := close_interrupted(case):
+                print(f"Marked {plural(len(closed), 'earlier run')} still recorded as running as failed, since "
+                      f"{'it' if len(closed) == 1 else 'they'} stopped before finishing: {', '.join(r.run_id for r in closed)}.")
         try:
             record = run_import(case, rel, shown["mapping"])
         except MappingError as exc:
@@ -555,13 +582,16 @@ def _with_options(mapping: dict, args) -> dict:
 
 
 def _evidence_relative(case: Case, text: str) -> str:
+    """An import argument as an evidence-relative path with forward slashes. An absolute path and the evidence folder are
+    each resolved, and compared in their plain form, so the folder written in extended-length form, as a junction, or as
+    both still holds the files in it. A path outside the folder is refused."""
     path = Path(text)
-    if path.is_absolute():
-        try:
-            return path.resolve().relative_to(case.evidence).as_posix()
-        except ValueError:
-            raise CaseError(f"{text} isn't in the evidence folder {case.evidence}; copy it there and use intake --add.") from None
-    return text.replace("\\", "/")
+    if not path.is_absolute():
+        return text.replace("\\", "/")
+    rel = evidence_relative(str(path.resolve()), case.evidence.resolve())
+    if PureWindowsPath(rel).anchor:   # evidence_relative leaves a path outside the folder as it was, drive and all
+        raise CaseError(f"{text} isn't in the evidence folder {case.evidence}; copy it there and use intake --add.")
+    return rel
 
 
 def _fmt_us(us: int) -> str:
@@ -586,6 +616,7 @@ def cmd_load_output(case: Case, args) -> int:
     """Tools' output found in the evidence: list it, or load one kind of it host by host."""
     from .toolbox import found_outputs
 
+    _require_intake(case)
     specs = load_registry()
     groups = found_outputs(case, specs, detect(specs.values(), _tools_folder(case)))
     if not args.kind:
@@ -911,6 +942,8 @@ def cmd_close(case: Case, args) -> int:
         return 1
     if unread_text:
         print(f"Case closed. {matched_text(entries)} {unread_text} Recorded in the journal.")
+    elif not entries:
+        print("Case closed. No evidence file was checked: the intake manifest lists none. Recorded in the journal.")
     else:
         each = "The 1 evidence file matches" if entries == 1 else f"All {entries:,} evidence files match"
         print(f"Case closed. {each} the intake manifest. Recorded in the journal.")

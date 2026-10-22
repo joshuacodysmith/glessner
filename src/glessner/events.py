@@ -10,7 +10,8 @@ import csv
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Iterator
+from bisect import bisect_right
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -40,6 +41,19 @@ COLUMNS = (
 )
 BIGINT_COLUMNS = {"ts_us", "record_id"}
 NULLABLE = {*BIGINT_COLUMNS, "extra"}   # the columns a load leaves NULL when the event has no value; text is '' instead
+EXTRA = COLUMNS.index("extra")
+MESSAGE = COLUMNS.index("message")
+# The columns a cut never shortens: they identify the event, its time, and its lane, and none is long.
+UNCUT = {"event_uid", "ts_us", "ts_desc", "host", "origin_host", "tool", "tool_version", "run_id", "artifact",
+         "source_file", "source_record", "record_id"}
+CUTTABLE = tuple(i for i, column in enumerate(COLUMNS) if column not in UNCUT)
+# A row over MAX_LINE_SIZE bytes in the staging CSV fails read_csv, and with it the whole load. A row over ROW_BUDGET
+# bytes is cut; the budget sits far enough under the limit to cover the delimiters, which the measure leaves out. A
+# character is at most 4 bytes in UTF-8 and the measure adds 2 for the quotes around each field, so a row of CUT_CHECK
+# characters or fewer measures at most ROW_BUDGET, and only a longer row is measured.
+MAX_LINE_SIZE = 20_000_000
+ROW_BUDGET = 16_000_000
+CUT_CHECK = (ROW_BUDGET - 2 * len(COLUMNS)) // 4
 SURROGATE = re.compile(r"[\ud800-\udfff]")
 # The tools whose rows a split moves by the computer each records: event logs and Hayabusa's hits on them. An import
 # never moves, whatever its artifact; neither does a reader whose recorded name isn't the computer's own, such as an
@@ -300,6 +314,8 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
     inserts. In the same transaction, accounts known only by their SID on the lanes whose event log rows or logons the
     load changed take the names those lanes' logons record (accounts.py). Each row's
     account key and hashes are computed in the insert (accounts.key_sql, hashes.HASHES_SQL; case format 3).
+    A row too long for one CSV line has its longest text fields cut to fit, each ending in a note of how much text it
+    held (_fit). Its ID and the other rows are unchanged.
     """
     from .accounts import AFFECTS_SQL, NAMING_CODES, key_sql, name_sids  # imported here: accounts.py uses this module
     from .hashes import HASHES_SQL
@@ -325,6 +341,13 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
             if replace_seen_sources:
                 named.add(ev.source_file)
             row = _row(ev, uid, lane, tool, tool_version, run_id, origin)
+            try:
+                characters = len("".join(row))
+            except TypeError:   # a field that isn't text, such as a parser's None for a column its source row lacks
+                row = _as_text(row)
+                characters = len("".join(row))
+            if characters > CUT_CHECK:
+                row = _fit(row)
             try:
                 writer.writerow(row)
             except UnicodeEncodeError:   # a failed row writes nothing, so it's written again without the surrogate
@@ -354,7 +377,7 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
         # older rows with, so no Python copy of either rule exists
         con.execute(f"INSERT INTO events SELECT * REPLACE ({key_sql('user_name', 'user_domain')} AS account_key, "
                     f"{HASHES_SQL} AS hashes) FROM read_csv(?, header = false, columns = {types!r}, "
-                    "quote = '\"', escape = '\"', max_line_size = 20000000, new_line = '\\n', nullstr = '', "
+                    f"quote = '\"', escape = '\"', max_line_size = {MAX_LINE_SIZE}, new_line = '\\n', nullstr = '', "
                     f"force_not_null = {text!r}, auto_detect = false)", [str(staging)])
         # The lanes whose event log rows or logons this load removed or added: a lane's lookup reads only its own rows.
         name_sids(con, lookup | set(replaced_hosts or ()))
@@ -369,17 +392,113 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
 
 
 def _row(ev: Event, uid: str, host: str, tool: str, tool_version: str, run_id: str, origin: str) -> tuple:
-    """One CSV row in COLUMNS order. Built directly, without an intermediate dict: this runs once per event. None is
-    written as an empty field, which loads as NULL in the NULLABLE columns."""
-    # NULL rather than '' when there are no extra fields: DuckDB's JSON functions reject an empty string.
-    extra = (ev.extra if isinstance(ev.extra, str) else json.dumps(ev.extra, ensure_ascii=False)) if ev.extra else None
-    return (uid, ev.ts_us, ev.ts_desc, host, ev.host_name_recorded, tool, tool_version,
-            run_id, ev.artifact, ev.source_file, ev.source_record, ev.record_id,
+    """One CSV row in COLUMNS order. Built directly, without an intermediate dict: this runs once per event. The ID, host,
+    tool, tool version, run ID, and origin come from the arguments, and the account key and the hashes are empty for the
+    load's insert to fill, so those eight fields are always text. The two number columns and extra are text too, empty
+    when the event has no value, which loads as NULL in the NULLABLE columns. The event's other fields pass through as
+    they are, and a parser may leave None or a number in one, so the row is text throughout only after _as_text."""
+    # With no extra fields the field is empty, which loads as NULL: DuckDB's JSON functions reject an empty string.
+    extra = (ev.extra if isinstance(ev.extra, str) else json.dumps(ev.extra, ensure_ascii=False)) if ev.extra else ""
+    ts_us = "" if ev.ts_us is None else str(ev.ts_us)
+    record_id = "" if ev.record_id is None else str(ev.record_id)
+    return (uid, ts_us, ev.ts_desc, host, ev.host_name_recorded, tool, tool_version,
+            run_id, ev.artifact, ev.source_file, ev.source_record, record_id,
             ev.event_code, ev.event_provider, ev.log_channel, ev.message, ev.user_name, ev.user_domain, ev.source_ip,
             ev.source_workstation, ev.logon_type, ev.logon_id, ev.process_executable, ev.process_command_line,
             ev.file_path, ev.registry_path, ev.registry_value, ev.rule_title, ev.rule_level, extra, ev.file_key,
             ev.source_port, ev.dest_ip, ev.dest_port, ev.process_parent_executable, ev.process_parent_command_line,
             ev.registry_data, origin, "", "")   # the account key and the hashes, which load's insert computes
+
+
+def _as_text(row: tuple) -> tuple[str, ...]:
+    """The row with each field as csv.writer writes it: None as an empty field and any other value as its text."""
+    return tuple("" if value is None else str(value) for value in row)
+
+
+def _csv_size(text: str) -> int:
+    """The most bytes a field takes in the staging CSV: its UTF-8 bytes (a lone surrogate takes 3, as its replacement
+    does), each double quote written twice, and the quotes around it."""
+    return len(text.encode("utf-8", "surrogatepass")) + text.count('"') + 2
+
+
+def _json_size(text: str) -> int:
+    """The bytes a string takes in the staging CSV as a value in JSON text: _csv_size of the JSON string, less the
+    quotes around the whole field, so the sizes of a JSON text's strings and its other characters add up to its size."""
+    return _csv_size(json.dumps(text, ensure_ascii=False)) - 2
+
+
+def _fit(row: tuple[str, ...]) -> tuple[str, ...]:
+    """The row with its longest text fields cut until it takes at most ROW_BUDGET bytes in the staging CSV, or the row
+    itself when it already fits. The fields larger than a common size are cut to it and the smaller ones stay whole, so
+    the longest lose the most. The UNCUT columns stay whole. extra is cut as JSON, so it still parses: when it can't be
+    made to fit, it is left out and the message says so."""
+    sizes = [_csv_size(text) for text in row]
+    excess = sum(sizes) - ROW_BUDGET
+    if excess <= 0:
+        return row
+    cap = _cap([sizes[i] for i in CUTTABLE], sum(sizes[i] for i in CUTTABLE) - excess)
+    fitted = list(row)
+    for i in CUTTABLE:
+        if sizes[i] > cap:
+            fitted[i] = _cut_extra(row[i], cap) if i == EXTRA else _cut_text(row[i], cap, _csv_size)
+    if row[EXTRA] and not fitted[EXTRA]:
+        fitted[MESSAGE] += " [extra fields left out to fit one row]"
+    return tuple(fitted)
+
+
+def _cap(sizes: list[int], room: int) -> int:
+    """The largest size to cut every larger item to so that all the items fit in room. An item under it keeps its size,
+    and room it leaves unused goes to the larger ones."""
+    ordered = sorted(sizes)
+    for position, size in enumerate(ordered):
+        share = room // (len(ordered) - position)
+        if size > share:
+            return share
+        room -= size
+    return ordered[-1]
+
+
+def _cut_text(text: str, room: int, size: Callable[[str], int]) -> str:
+    """The longest start of the text that, followed by a note of how many characters the text held, takes at most `room`
+    bytes, where `size` measures a candidate. A longer start never takes fewer bytes, so the bisection finds it."""
+    note = f" [cut to fit one row: {len(text):,} characters in all]"
+    # A start of more than `room` characters can't fit, since a character takes at least one byte
+    starts = range(min(len(text), room) + 1)
+    fitting = bisect_right(starts, room, key=lambda length: size(text[:length] + note))
+    return text[:max(fitting - 1, 0)] + note
+
+
+def _cut_extra(text: str, room: int) -> str:
+    """extra's JSON text with its longest strings cut so it takes at most `room` bytes in the staging CSV, or '' when
+    the text isn't JSON, or cutting its strings can't make it fit."""
+    try:
+        value = json.loads(text)
+        strings = list(_strings(value))
+    except (ValueError, RecursionError):
+        return ""
+    sizes = [_json_size(container[key]) for container, key in strings]
+    excess = _csv_size(json.dumps(value, ensure_ascii=False)) - room
+    cap = _cap(sizes, sum(sizes) - excess) if sizes else 0
+    for (container, key), size in zip(strings, sizes):
+        if size > cap:
+            container[key] = _cut_text(container[key], cap, _json_size)
+    cut = json.dumps(value, ensure_ascii=False)
+    return cut if _csv_size(cut) <= room else ""
+
+
+def _strings(value) -> Iterator[tuple[dict | list, str | int]]:
+    """Where each string in parsed JSON sits: its container and its key or position."""
+    if isinstance(value, dict):
+        children = value.items()
+    elif isinstance(value, list):
+        children = enumerate(value)
+    else:
+        return
+    for key, child in children:
+        if isinstance(child, str):
+            yield value, key
+        else:
+            yield from _strings(child)
 
 
 def well_formed(text: str) -> str:

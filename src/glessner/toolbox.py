@@ -13,6 +13,7 @@ until the analyst scans again.
 from __future__ import annotations
 
 import fnmatch
+import json
 import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import yaml
 
-from .case import Case
+from .case import Case, CaseError
 from .identify import IMPORTABLE
 from .imports import MappingError, listed_as, loaded_as_output, run_import
 from .intake import current_entries
@@ -29,10 +30,14 @@ from .parsers import LOCAL_TIME
 from .runner import (
     IMPORT,
     LEFT_OUT,
+    NOT_CHECKED,
+    NOT_READ,
+    RUN_FILE,
     UNREADABLE,
     RunError,
     RunPlan,
     RunRecord,
+    finish_run,
     handles,
     load_found_output,
     own_inputs,
@@ -101,6 +106,40 @@ def run_gaps(runs: list[RunRecord], specs: dict[str, ToolSpec]) -> list[dict]:
              "inputs": len(r.inputs), "from_output": r.from_output, "at": r.finished_utc or r.started_utc}
             for r in sorted(latest.values(), key=lambda r: r.run_id)
             if r.status == "failed" or (r.status == "ok" and not r.loaded_rows)]
+
+
+INTERRUPTED = ("interrupted: the run was still marked running when the case was next opened for work, so it stopped "
+               "before it finished, such as at Ctrl+C, a closed window, or a crash. Run it again.")
+
+
+def close_interrupted(case: Case) -> list[RunRecord]:
+    """Mark each run still recorded as running as failed, with INTERRUPTED as its reason, and return the records it
+    marked. A run's record says running from before its tool starts until the run ends, so one found so when the case is
+    opened for work was stopped before it ended; run_gaps leaves a running run out, since a job may be running it, so
+    without this it would never show in the Gaps. A run that another command line process is still running at that
+    moment is marked too, and its own final write replaces the mark. A run's record is read again just before its mark
+    is written, and a run that has ended since is left as it is; one that ends in the instant between that read and the
+    write can still have its final record replaced. Never raises: a record this build can't read (CaseError for one that
+    isn't an object, lacks a key, or has a key it doesn't know; ValueError for text that isn't JSON; TypeError for a
+    value of the wrong type, such as a run ID that isn't text), or one that can't be read or written (OSError), ends the
+    pass with the runs marked so far."""
+    closed = []
+    try:
+        for record in read_runs(case):
+            folder = case.runs_folder / record.run_id
+            if record.status == "running" and _still_running(folder):
+                record.status, record.reason = "failed", INTERRUPTED
+                finish_run(folder, record)
+                closed.append(record)
+    except (CaseError, OSError, TypeError, ValueError):
+        pass
+    return closed
+
+
+def _still_running(folder: Path) -> bool:
+    """Whether the run's record, read now, still says running."""
+    data = json.loads((folder / RUN_FILE).read_text(encoding="utf-8"))
+    return isinstance(data, dict) and data.get("status") == "running"
 
 
 def _noun(key: str, n: int) -> str:
@@ -331,7 +370,7 @@ def _refused(plan: RunPlan, reason: str) -> RunRecord:
     It has no run ID or folder, and nothing is written."""
     return RunRecord(run_id="", tool=plan.tool.spec.id, tool_version=plan.tool.version,
                      executable=str(plan.tool.executable), host=plan.host, argv=[], cwd="", inputs=list(plan.inputs),
-                     started_utc="", status="failed", reason=reason, evidence_check="not checked")
+                     started_utc="", status="failed", reason=reason, evidence_check=NOT_CHECKED)
 
 
 def _step_input(step: RunPlan | dict) -> str:
@@ -354,11 +393,12 @@ def _step_name(step: RunPlan | dict) -> str:
 
 
 def _step_result(label: str, step: RunPlan | dict, records: list[RunRecord]) -> dict:
-    """A finished step as the page lists it: a run's own record, or a group's runs together. `hits` says its rows are
-    Hayabusa's hits, which the page counts apart from events. `loaded` says a load committed, which
-    a run records with its rows once events.load has committed them: a run can fail after that, when the evidence
-    changed while it was read, and a group fails when any of its runs does, so a step's status doesn't say whether
-    the events changed."""
+    """A finished step as the page lists it: a run's own record, or a group's runs together. A group's `evidence` is the
+    most serious check of its runs: mismatch, then unreadable, then not checked, then not read (a load that failed
+    while it read, which records no check), then ok. `hits` says its rows are Hayabusa's hits, which the page counts
+    apart from events. `loaded` says a load committed, which a run records with its rows once events.load has committed
+    them: a run can fail after that, when the evidence changed while it was read, and a group fails when any of its runs
+    does, so a step's status doesn't say whether the events changed."""
     hits = (step.tool.spec.id if isinstance(step, RunPlan) else step["tool"]) == "hayabusa"
     loaded = any(r.loaded_rows is not None for r in records)
     if isinstance(step, RunPlan):
@@ -372,6 +412,10 @@ def _step_result(label: str, step: RunPlan | dict, records: list[RunRecord]) -> 
         evidence = "mismatch"
     elif UNREADABLE in checks:
         evidence = UNREADABLE
+    elif NOT_CHECKED in checks:
+        evidence = NOT_CHECKED
+    elif "" in checks:
+        evidence = NOT_READ
     else:
         evidence = "ok"
     return {"host": label, "status": "failed" if bad else "ok", "reason": "; ".join(r.reason for r in bad),

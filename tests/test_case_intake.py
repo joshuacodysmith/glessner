@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 import stat
@@ -8,11 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from conftest import junction
+from conftest import flip_a_byte, junction
 
 from glessner import case as case_module
 from glessner.case import CaseError, copy_case, create_case, open_case, write_atomically
-from glessner.intake import add_new, entry_kind, intake, read_manifest, sha256_file, verify
+from glessner.intake import CHUNK, add_new, entry_kind, intake, read_manifest, sha256_file, verify
 
 
 @pytest.fixture
@@ -346,6 +347,56 @@ def test_add_new_evidence_appends_only_new_files(tmp_path, evidence):
     assert (added.path, added.artifact, added.method) == ("FIREWALL/traffic.csv", "csv", "content")
     assert added.added_utc and added.sha256 == sha256_file(evidence / "FIREWALL" / "traffic.csv")
     assert add_new(case).files == 0 and case.manifest_path.read_bytes() == after
+
+
+def test_intake_add_leaves_a_changed_listed_file_s_line_alone_and_verify_flags_it(tmp_path, evidence, capsys):
+    """Adding new evidence never replaces the intake baseline: a listed file that changed keeps its original hash, whether
+    its size changed or stayed, so verify still names it, and the manifest gains one line, for the new file."""
+    from glessner.cli import main
+
+    case = create_case(tmp_path / "case", "Test", evidence, "cody")
+    intake(case)
+    before = case.manifest_path.read_bytes()
+    flip_a_byte(evidence / "Users" / "bob" / "NTUSER.DAT")
+    security = evidence / "Windows" / "System32" / "winevt" / "Logs" / "Security.evtx"
+    security.write_bytes(security.read_bytes() + b"\x00")
+    (evidence / "FIREWALL").mkdir()
+    (evidence / "FIREWALL" / "traffic.csv").write_text("receive_time,src,dst\n2024/02/05 10:21:48,203.0.113.9,10.0.0.12\n")
+    assert main(["intake", str(case.folder), "--add"]) == 0
+    assert "1 new file" in capsys.readouterr().out
+    after = case.manifest_path.read_bytes()
+    assert after.startswith(before)
+    (added,) = (json.loads(line) for line in after[len(before):].decode("utf-8").splitlines())
+    traffic = evidence / "FIREWALL" / "traffic.csv"
+    assert added["path"] == "FIREWALL/traffic.csv" and added["sha256"] == hashlib.sha256(traffic.read_bytes()).hexdigest()
+    assert main(["verify", str(case.folder)]) == 1
+    output = capsys.readouterr().out
+    assert ("2 problems:\n  Users/bob/NTUSER.DAT: SHA-256 changed\n"
+            "  Windows/System32/winevt/Logs/Security.evtx: SHA-256 changed\n") in output
+    assert "traffic.csv" not in output
+
+
+def test_a_file_longer_than_one_read_is_hashed_whole(tmp_path, evidence, capsys):
+    """Intake and verify hash all of a file, not only its first read (CHUNK bytes). The manifest holds the SHA-256 of the
+    whole file, as hashlib gives it, and verify names a file with a byte changed after the first read, which keeps its
+    size."""
+    from glessner.cli import main
+
+    big = evidence / "Windows" / "System32" / "config" / "SYSTEM"
+    big.parent.mkdir(parents=True)
+    data = b"regf" + bytes(range(256)) * (CHUNK // 256 + 16)
+    big.write_bytes(data)
+    assert len(data) > CHUNK + 4096
+    case = create_case(tmp_path / "case", "Test", evidence, "cody")
+    intake(case)
+    (entry,) = (e for e in read_manifest(case) if e.path == "Windows/System32/config/SYSTEM")
+    assert (entry.size, entry.sha256) == (len(data), hashlib.sha256(data).hexdigest())
+    assert verify(case) == []
+
+    flip_a_byte(big, at=CHUNK + 100)
+    assert verify(case) == ["Windows/System32/config/SYSTEM: SHA-256 changed"]
+    assert main(["verify", str(case.folder)]) == 1
+    assert "1 problem:\n  Windows/System32/config/SYSTEM: SHA-256 changed\n" in capsys.readouterr().out
 
 
 def test_add_new_names_a_listed_file_that_a_folder_of_its_name_replaced(tmp_path, evidence):

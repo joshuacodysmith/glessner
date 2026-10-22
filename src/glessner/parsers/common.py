@@ -37,6 +37,7 @@ class ParseContext:
 
 
 LOCAL_TIME_NOTE = "Local times read in "   # a note the next load replaces (runner.load_output)
+SKIPPED_NOTE = "No event was made of "   # likewise: a count of the lines or rows a parser dropped
 
 
 def output_paths(ctx: ParseContext, kind: str, name: str) -> list[Path]:

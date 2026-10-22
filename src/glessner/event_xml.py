@@ -21,13 +21,16 @@ not EvtxECmd's maps, which this module doesn't have.
 from __future__ import annotations
 
 import csv
+import io
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .identify import text_encoding
 
+LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 OUTPUT_FILE = "event_xml.csv"
 COLUMNS = ("SourceFile", "TimeCreated", "EventId", "Level", "Provider", "Channel", "ProcessId", "ThreadId", "Computer",
            "UserId", "EventRecordId", "MapDescription", "PayloadData1", "PayloadData2", "ExecutableInfo", "Payload")
@@ -230,6 +233,12 @@ def _drain(parser: ET.XMLPullParser, stack: list[ET.Element]):
                 stack[-1].remove(elem)
 
 
+def well_formed(text: str) -> str:
+    """The text with each lone surrogate as U+FFFD. A Windows file name may hold one, and UTF-8 can't encode it, so the
+    CSV, the output, and the error message write the name this way, as the events table does."""
+    return LONE_SURROGATE.sub("\ufffd", text)
+
+
 def convert(inputs: list[Path], output_dir: Path) -> int:
     rows = 0
     with (output_dir / OUTPUT_FILE).open("w", encoding="utf-8", newline="") as out:
@@ -237,26 +246,39 @@ def convert(inputs: list[Path], output_dir: Path) -> int:
         writer.writeheader()
         for path in inputs:
             n = 0
+            source = well_formed(str(path))
             try:
                 for event in events_in(path):
-                    writer.writerow(row_for(event, str(path)))
+                    writer.writerow(row_for(event, source))
                     n += 1
             except (ET.ParseError, UnicodeError) as exc:
                 raise ValueError(f"{path}: {exc}, after {n} events") from exc
-            print(f"{path}: {n} events")
+            print(f"{source}: {n} events")
             rows += n
     return rows
 
 
+def write_utf8() -> None:
+    """Make stdout and stderr write UTF-8, with a character UTF-8 can't encode as an escape. The runner starts this module
+    with `python -I`, which ignores PYTHONIOENCODING, so a stream sent to a file would take the locale's code page, which
+    can't write the name of a file in another script."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def main(argv: list[str]) -> int:
+    write_utf8()
     if len(argv) != 2:
         print(__doc__.split("\n\n")[2], file=sys.stderr)
         return 2
-    inputs = [Path(line) for line in Path(argv[0]).read_text(encoding="utf-8").splitlines() if line.strip()]
+    # The runner writes the list with surrogatepass, so a name with a lone surrogate reads back as it is on disk
+    listing = Path(argv[0]).read_text(encoding="utf-8", errors="surrogatepass")
+    inputs = [Path(line) for line in listing.splitlines() if line.strip()]
     try:
         rows = convert(inputs, Path(argv[1]))
     except (ValueError, OSError) as exc:
-        print(f"Could not read the event XML: {exc}", file=sys.stderr)
+        print(f"Could not read the event XML: {well_formed(str(exc))}", file=sys.stderr)
         return 3
     print(f"{rows} events from {len(inputs)} files")
     return 0

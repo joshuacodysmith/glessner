@@ -585,10 +585,13 @@ def _iso(us: int | None) -> str:
 
 def _evidence_check(found: Check) -> str:
     """What the report's re-hash found. "Every evidence file" only when it checked every one: a file intake couldn't
-    read has no hash, so it can't count as matching. A folder walk couldn't list counts as no file, since how many files
-    it holds is unknown, and has a sentence of its own (unverified_text)."""
+    read has no hash, so it can't count as matching. A manifest that lists no file says so, since nothing was there to
+    match. A folder walk couldn't list counts as no file, since how many files it holds is unknown, and has a sentence
+    of its own (unverified_text)."""
     n, problems, unread = found.checked, found.problems, found.unverified
     total = n + len(unread) - found.folders
+    if not n and not unread:
+        return "No evidence file was re-hashed when this report was written: the intake manifest lists none."
     if not unread:
         text = f"Every evidence file ({n:,}) was re-hashed when this report was written"
     elif not n:

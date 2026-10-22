@@ -8,13 +8,14 @@ re-hashes the evidence files the run read, and loads the output through the tool
 from __future__ import annotations
 
 import csv
+import fnmatch
 import json
 import os
 import shutil
 import subprocess
 import time
-from contextlib import suppress
-from dataclasses import asdict, dataclass, field, replace
+from contextlib import closing, suppress
+from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,11 +23,12 @@ import duckdb
 
 from .case import CASE_FILE, Case, CaseError, check_outside_evidence, write_atomically
 from .events import connect, load
-from .intake import current_entries, sha256_file, verify, walk_evidence
+from .intake import NOT_IN_MANIFEST, current_entries, sha256_file, verify, walk_evidence
 from .journal import host_layout
 from .long_paths import long_path
 from .parsers import LOCAL_TIME, PARSERS, ParseContext
-from .parsers.common import LOCAL_TIME_NOTE
+from .parsers.common import LOCAL_TIME_NOTE, SKIPPED_NOTE
+from .parsers.sbecmd import MESSAGES
 from .timezones import ZoneError, fmt_offset, host_timezones, resolve_zone
 from .tools import DetectedTool, ToolSpec, load_registry, rules_file, tool_env
 from .version import build_id
@@ -47,6 +49,7 @@ class RunPlan:
     host: str
     inputs: tuple[str, ...]    # evidence-relative paths the tool will read
     input_file: str = ""       # set in each_file mode
+    left_out: tuple[str, ...] = ()   # inputs the tool won't open, as its name patterns select files (ToolSpec.selects)
 
 
 @dataclass
@@ -71,7 +74,7 @@ class RunRecord:
     # A run recorded without it holds only the files the registry's outputs patterns name.
     outputs_all: bool = False
     missing_outputs: list[str] = field(default_factory=list)
-    evidence_check: str = ""                 # ok, mismatch, or unreadable (check_result)
+    evidence_check: str = ""                 # ok, mismatch, unreadable (check_result), NOT_CHECKED, or "" when none was recorded
     evidence_problems: list[str] = field(default_factory=list)
     parser: str = ""
     loaded_rows: int | None = None
@@ -95,6 +98,11 @@ class RunRecord:
     zone: dict | None = None
 
 
+# The keys a run.json may hold, which are the record's fields, and those it must hold, which have no default
+RECORD_KEYS = frozenset(f.name for f in fields(RunRecord))
+REQUIRED_KEYS = frozenset(f.name for f in fields(RunRecord) if f.default is MISSING and f.default_factory is MISSING)
+
+
 def plan_runs(case: Case, tool: DetectedTool, hosts: list[str] | None = None) -> list[RunPlan]:
     """One plan per host (host_dir tools) or per matching file (each_file tools)."""
     by_host: dict[str, list[str]] = {}
@@ -106,10 +114,20 @@ def plan_runs(case: Case, tool: DetectedTool, hosts: list[str] | None = None) ->
     plans = []
     for host, paths in sorted(by_host.items()):
         if tool.spec.input == "host_dir":
-            plans.append(RunPlan(tool, host, tuple(paths)))
+            plans.append(RunPlan(tool, host, tuple(paths), left_out=_unselected(tool.spec, paths)))
         else:
             plans.extend(RunPlan(tool, host, (p,), input_file=p) for p in paths)
     return plans
+
+
+def _unselected(spec: ToolSpec, paths: list[str]) -> tuple[str, ...]:
+    """The paths a tool with name patterns (ToolSpec.selects) wouldn't read in a folder: those whose file name fits none
+    of them, without regard to case."""
+    if not spec.selects:
+        return ()
+    patterns = [pattern.lower() for pattern in spec.selects]
+    return tuple(path for path in paths
+                 if not any(fnmatch.fnmatchcase(path.rsplit("/", 1)[-1].lower(), p) for p in patterns))
 
 
 def handles(spec: ToolSpec, artifact: str | None, detail: str) -> bool:
@@ -139,6 +157,9 @@ def build_argv(case: Case, plan: RunPlan, output_dir: Path, options: dict[str, s
     for rel in spec.related:   # another of the host's files, such as $MFT for MFTECmd reading $J
         for path in related_files(case, plan, rel["artifact"]):
             args += [_fill(a.replace("{related}", str(base / path)), values, spec) for a in rel.get("args", [])]
+    for entry in spec.without_related:   # such as SBECmd's --nl, when a hive has no transaction log beside it
+        if inputs_without(case, plan, entry["artifact"]):
+            args += [_fill(a, values, spec) for a in entry.get("args", [])]
     rules = rules_file(spec, plan.tool.executable)
     if rules is not None:   # a rule set beside the tool, such as Suricata's; without one it runs without rules
         args += [_fill(a.replace("{rules_file}", str(rules)), values, spec) for a in spec.rules.get("args", [])]
@@ -173,6 +194,39 @@ def related_files(case: Case, plan: RunPlan, artifact: str) -> list[str]:
     return sorted(found, key=lambda path: (-path.count("/"), path))[:1]   # the deepest folder is the nearest
 
 
+def files_beside(case: Case, plan: RunPlan, artifact: str) -> dict[str, list[str]]:
+    """Each of the plan's inputs with the files of an artifact beside it: those in the input's folder named for it with
+    .log after its name, as a hive's transaction logs are (NTUSER.DAT.LOG1), without regard to case. An input with none
+    has an empty list."""
+    in_folder: dict[str, list[str]] = {}
+    for e in current_entries(case):
+        if e.artifact == artifact and not e.error:
+            in_folder.setdefault(e.path.rpartition("/")[0], []).append(e.path)
+    beside = {}
+    for path in plan.inputs:
+        folder, _, name = path.rpartition("/")
+        prefix = f"{name}.log".lower()
+        beside[path] = [other for other in in_folder.get(folder, ()) if other.rpartition("/")[2].lower().startswith(prefix)]
+    return beside
+
+
+def inputs_without(case: Case, plan: RunPlan, artifact: str) -> list[str]:
+    """The plan's inputs that have no file of an artifact beside them (files_beside)."""
+    return [path for path, found in files_beside(case, plan, artifact).items() if not found]
+
+
+def read_beside(case: Case, plan: RunPlan) -> list[str]:
+    """The files the tool reads beside the plan's inputs because build_argv left out the arguments of a without_related
+    entry, which it does when every input has a file of the entry's artifact beside it (files_beside): those files, as
+    sorted evidence-relative paths. A run's inputs don't list them, and the evidence check after the run covers them."""
+    read = set()
+    for entry in plan.tool.spec.without_related:
+        beside = files_beside(case, plan, entry["artifact"])
+        if all(beside.values()):
+            read.update(path for found in beside.values() for path in found)
+    return sorted(read)
+
+
 def _input_of(plan: RunPlan) -> str:
     return plan.input_file or plan.inputs[0]
 
@@ -188,22 +242,25 @@ def reads_host_folder(spec: ToolSpec) -> bool:
 
 def check_host_folder(case: Case, plan: RunPlan) -> None:
     """Refuse a run of a tool that lists the host's folder itself (reads_host_folder) when the folder holds what intake
-    didn't hash: a file the manifest doesn't list, which the tool would load though no evidence check covers it, or a
-    link, which the tool may follow out of the evidence. The folder is listed as intake lists it (intake.walk), from
-    its extended-length path, so a name that is long or ends in a dot is listed as it is."""
+    didn't hash: a file the manifest doesn't list, which the tool would load though no evidence check covers it, a
+    link, which the tool may follow out of the evidence, or a cloud placeholder, which the tool would download by
+    reading it. The folder is listed as intake lists it (intake.walk), from its extended-length path, so a name that is
+    long or ends in a dot is listed as it is."""
     spec = plan.tool.spec
     if not reads_host_folder(spec):
         return
     host = "" if case.settings.single_host else plan.host
     prefix = f"{host}/" if host else ""
     known = {e.path for e in current_entries(case)}
-    links = []
-    new = [path for rel in walk_evidence(long_path(case.evidence, host), links) if (path := prefix + rel) not in known]
-    if new or links:
-        raise RunError(_unhashed(spec, plan.host, new, [prefix + link for link in links]))
+    links, placeholders = [], []
+    listing = walk_evidence(long_path(case.evidence, host), links, placeholders=placeholders)
+    new = [path for rel in listing if (path := prefix + rel) not in known]
+    if new or links or placeholders:
+        raise RunError(_unhashed(spec, plan.host, new, [prefix + link for link in links],
+                                 [prefix + path for path in placeholders]))
 
 
-def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str]) -> str:
+def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str], placeholders: list[str]) -> str:
     """Why check_host_folder refused a run, with what the analyst can do about it."""
     text = f"{spec.name} wasn't run on {host}: it lists the host's folder itself, which holds what intake didn't hash."
     if new:
@@ -214,7 +271,26 @@ def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str]) -> st
         what = "1 link" if len(links) == 1 else f"{len(links):,} links"
         text += (f" {what}, which the tool may follow out of the evidence: {_paths(links)}. Remove each link, or "
                  "replace it with a copy of the files it points to and add those.")
+    if placeholders:
+        what = ("1 cloud placeholder, whose content isn't on this disk" if len(placeholders) == 1
+                else f"{len(placeholders):,} cloud placeholders, whose content isn't on this disk")
+        text += (f" {what}, which the tool would download by reading {'it' if len(placeholders) == 1 else 'them'}: "
+                 f"{_paths(placeholders)}. Make the folder available on this disk and start a new case from it, or "
+                 f"remove {'it' if len(placeholders) == 1 else 'them'}.")
     return text
+
+
+def check_selected(plan: RunPlan) -> None:
+    """Refuse a run whose every input the tool would leave out (RunPlan.left_out), which would read nothing."""
+    if plan.left_out and len(plan.left_out) == len(plan.inputs):
+        spec, count = plan.tool.spec, len(plan.inputs)
+        raise RunError(f"{spec.name} wasn't run on {plan.host}: it reads only files named {' or '.join(spec.selects)}, and "
+                       f"the {_files(count)} intake identified for it {'is' if count == 1 else 'are'} named otherwise: "
+                       f"{_paths(list(plan.left_out))}.")
+
+
+def _files(count: int) -> str:
+    return "1 file" if count == 1 else f"{count:,} files"
 
 
 def _paths(paths: list[str]) -> str:
@@ -225,12 +301,14 @@ def _paths(paths: list[str]) -> str:
 
 def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> RunRecord:
     """Run a tool on its plan's evidence, check its output and the evidence, load the output, and record it all in the
-    run's folder. Refused before anything is made: RunError when the tool can't run here, its arguments can't be
-    filled, or its host's folder holds what intake didn't hash (check_host_folder); CaseError for a run folder that
-    can't be made safely (_new_run_folder)."""
+    run's folder. The evidence check covers the run's inputs and the files the tool reads beside them (read_beside).
+    Refused before anything is made: RunError when the tool can't run here, would read none of its inputs, as its name
+    patterns select files (check_selected), has arguments that can't be filled, or has a host folder that holds what
+    intake didn't hash (check_host_folder); CaseError for a run folder that can't be made safely (_new_run_folder)."""
     spec = plan.tool.spec
     if plan.tool.missing:
         raise RunError(f"{spec.name} can't run here: {plan.tool.missing}.")
+    check_selected(plan)
     run_id, folder = _new_run_folder(case, spec.id, plan.host)
     output_dir = folder / "output"
     copies_root = folder / "input" if spec.work_on_copies else None
@@ -244,6 +322,17 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         else:
             notes.append(f"Ran without {rel['args'][0]}: no {rel['artifact']} file is in a folder above "
                          f"{_input_of(plan)}, where its volume's would be.")
+    for entry in spec.without_related:
+        if lacking := inputs_without(case, plan, entry["artifact"]):
+            one = len(lacking) == 1
+            notes.append(f"Ran with {' '.join(entry.get('args', []))}, so {spec.name} skipped the transaction logs of every "
+                         f"hive on this host: {_paths(lacking)} {'has' if one else 'have'} none beside "
+                         f"{'it' if one else 'them'}.")
+    if plan.left_out:
+        one = len(plan.left_out) == 1
+        notes.append(f"{_files(len(plan.left_out))} that intake identified for {spec.name} {'was' if one else 'were'} not "
+                     f"read: it reads only files named {' or '.join(spec.selects)} in a folder, and "
+                     f"{'this one is' if one else 'these are'} named otherwise: {_paths(list(plan.left_out))}.")
     record = RunRecord(run_id=run_id, tool=spec.id, tool_version=plan.tool.version,
                        executable=str(plan.tool.executable), host=plan.host, argv=argv,
                        cwd=str(folder if spec.run_in_run_folder else plan.tool.executable.parent),
@@ -255,10 +344,14 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
             record.working_copies = _make_copies(case, plan, copies_root)
         except (OSError, RunError) as exc:
             record.reason = f"could not make working copies: {exc}"
-    if any("{input_list}" in a for a in spec.args):   # exactly the files the evidence check covers, no more
+    _write_record(folder, record)   # before the input list, so a run that fails to write it still has its record
+    if not record.reason and any("{input_list}" in a for a in spec.args):   # exactly the files the evidence check covers
         base = copies_root or case.evidence
-        (folder / INPUT_LIST).write_text("".join(f"{base / p}\n" for p in plan.inputs), encoding="utf-8")
-    _write_record(folder, record)
+        listing = "".join(f"{base / p}\n" for p in plan.inputs)
+        try:   # surrogatepass: a file name may hold a lone surrogate, which strict UTF-8 can't write
+            (folder / INPUT_LIST).write_text(listing, encoding="utf-8", errors="surrogatepass")
+        except OSError as exc:
+            record.reason = f"could not write the input list: {exc}"
 
     t0 = time.perf_counter()
     with (folder / "stdout.txt").open("wb") as out, (folder / "stderr.txt").open("wb") as err:
@@ -277,7 +370,7 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         record.working_copy_changes = _changed_copies(case, copies_root, record.working_copies)
 
     _check_outputs(spec, output_dir, record)
-    problems = verify(case, record.inputs, reason=f"after run {run_id}")
+    problems = verify(case, [*record.inputs, *read_beside(case, plan)], reason=f"after run {run_id}")
     record.evidence_check = check_result(problems)
     record.evidence_problems = problems
     record.status, record.reason = _status(record, spec.empty_result)
@@ -322,8 +415,10 @@ def load_output(case: Case, record: RunRecord, folder: Path, layout: dict[str, d
     record.load_seconds = round(time.perf_counter() - t0, 2)
     # Replaced on each load, so a rebuild doesn't repeat them: the parser's own, such as the offset Autoruns' local
     # times were read at, which it notes only when it read one, and the count of events without a
-    # time, since nothing on the page shows one: Autoruns entries without one mustn't vanish silently.
-    record.notes = [n for n in record.notes if not (n.startswith(LOCAL_TIME_NOTE) or n.endswith(NO_TIME_NOTE))]
+    # time, since nothing on the page shows one: Autoruns entries without one mustn't vanish silently. Also the count
+    # of lines or rows a parser made no event of (SKIPPED_NOTE).
+    record.notes = [n for n in record.notes
+                    if not (n.startswith((LOCAL_TIME_NOTE, SKIPPED_NOTE)) or n.endswith(NO_TIME_NOTE))]
     record.notes += ctx.notes
     if result.without_time:
         n = result.without_time
@@ -338,26 +433,35 @@ def parse_context(case: Case, record: RunRecord, folder: Path, former: int = 0) 
     (parsers.FORMER_RULES), for that format's upgrade (rekey.py), which parses each run as its load did."""
     # Output found in the evidence is read where it lies, by the extended-length path intake hashed it by, so a name
     # that ends in a dot or runs past 260 characters opens its own file. Its events name the files the tool read, which
-    # they replace. The evidence root is the one the run recorded, in whatever form the case keeps it;
+    # they replace. Its evidence root is the resolved one the files are opened under, since the case may keep the
+    # evidence by a junction, a substituted drive, or a mapped one, which a resolved file path doesn't start with;
     # evidence_relative reads a found file's path and the root each in its plain form.
     files = ()
-    if record.from_output:
-        root = long_path(case.evidence)
-        files = tuple(long_path(root, p) for p in record.inputs)
     evidence = Path(record.evidence_root) if record.evidence_root else case.evidence   # as the output names it
+    if record.from_output:
+        evidence = long_path(case.evidence)
+        files = tuple(long_path(evidence, p) for p in record.inputs)
     return ParseContext(folder / "output", evidence, tuple(record.inputs), files, record.zone, record.input_root,
                         former=former)
 
 
 def read_runs(case: Case) -> list[RunRecord]:
-    """Every run's record, oldest first. A run.json key RunRecord doesn't declare was written by a newer build, and is refused
-    by name, as open_case refuses a setting, rather than failing as a TypeError."""
+    """Every run's record, oldest first. A run.json that isn't a JSON object, lacks a key every record has, or has a key
+    RunRecord doesn't declare (written by a newer build) is refused by name, as open_case refuses a setting, rather than
+    failing as a TypeError."""
     records = []
     for path in sorted(case.runs_folder.glob(f"*/{RUN_FILE}")):
         data = json.loads(path.read_text(encoding="utf-8"))
-        if unknown := sorted(set(data) - set(RunRecord.__dataclass_fields__)):
+        run = path.parent.name
+        if not isinstance(data, dict):
+            raise CaseError(f"{path} isn't a JSON object, so run {run} can't be read. "
+                            "Restore the file from a copy of the case.")
+        if unknown := sorted(set(data) - RECORD_KEYS):
             raise CaseError(f"{path} has keys this build of glessner ({build_id()}) doesn't read: {', '.join(unknown)}. "
                             "A newer build may have written them; open the case with that build.")
+        if missing := sorted(REQUIRED_KEYS - set(data)):
+            raise CaseError(f"{path} lacks the {'key' if len(missing) == 1 else 'keys'} {', '.join(missing)} that every "
+                            f"run's record has, so run {run} can't be read. Restore the file from a copy of the case.")
         records.append(RunRecord(**data))
     return records
 
@@ -371,12 +475,13 @@ def rebuild(case: Case, progress=None, report=None) -> list[RunRecord]:
 
     The runs load into a new database beside events.duckdb, which takes its place only once every run has loaded, and
     the runs' records are written after that. A load that raises, or a stop such as Ctrl-C, leaves the events and the
-    records as they were, and the error is raised. A case with no database yet, such as a copy, is then left with none,
-    and an open makes an empty one, so before the loads each run's record is written with no rows and a note that no
-    database holds them (UNFINISHED_NOTE); the records written once the rebuild ends replace them."""
+    records as they were, and the error is raised. A case with no database yet, or an empty one, such as a copy, is then
+    left with no events (an open makes an empty database where there is none), so before the loads each run's record is
+    written with no rows and a note that no database holds them (UNFINISHED_NOTE); the records written once the
+    rebuild ends replace them."""
     loaded = latest_runs(read_runs(case))
     _refuse_held(case)
-    if not case.db_path.exists():
+    if not _holds_events(case):
         for record in loaded:
             _write_record(case.runs_folder / record.run_id, _unfinished(record))
     built = replace(case, db_file=case.db_file + REBUILT)
@@ -403,9 +508,17 @@ def rebuild(case: Case, progress=None, report=None) -> list[RunRecord]:
 REBUILT = ".rebuild"   # added to the events database's name for the one a rebuild loads
 
 
+def _holds_events(case: Case) -> bool:
+    """Whether the case's events database exists and holds an event."""
+    if not case.db_path.exists():
+        return False
+    with closing(connect(case.db_path)) as con:
+        return con.execute("SELECT EXISTS (SELECT 1 FROM events)").fetchone()[0]
+
+
 def _unfinished(record: RunRecord) -> RunRecord:
-    """A run's record as a rebuild of a case with no events database leaves it until the rebuild ends: no rows, and a
-    note saying why, which the Tools page and the overview's Gaps show as its reason."""
+    """A run's record as a rebuild of a case whose events database is missing or empty leaves it until the rebuild ends:
+    no rows, and a note saying why, which the Tools page and the overview's Gaps show as its reason."""
     notes = [n for n in record.notes if not n.endswith(UNFINISHED_NOTE)]
     return replace(record, loaded_rows=0, notes=[*notes, f"Rebuild at {_utc_now()}{LEFT_OUT}{UNFINISHED_NOTE}"])
 
@@ -457,11 +570,13 @@ def own_inputs(record: RunRecord, specs: dict[str, ToolSpec]) -> tuple[str, ...]
 
 def run_problems(case: Case, record: RunRecord, reason: str) -> tuple[list[str], list[str]]:
     """What a run's load would read that differs from its record: its evidence files' hashes for an import or a load of
-    output found in the evidence, which read evidence files again rather than the run's own output; otherwise its output
-    folder against the hashes its run recorded. Also the output files the run never hashed. `reason` goes to the
-    verification record."""
+    output found in the evidence, which read evidence files again rather than the run's own output, and for found output
+    the files its parser reads beside its inputs that the manifest lists (companions); otherwise its output folder
+    against the hashes its run recorded. Also the files the load would read that have no hash: a run's output files it
+    never hashed, and the companions the manifest doesn't list. `reason` goes to the verification record."""
     if record.parser == IMPORT or record.from_output:
-        return verify(case, record.inputs, reason=reason), []
+        listed, unlisted = companions(case, record)
+        return verify(case, [*record.inputs, *listed], reason=reason), unlisted
     return output_problems(record, case.runs_folder / record.run_id / "output")
 
 
@@ -502,23 +617,62 @@ LEFT_OUT = " left it out: "
 
 
 FOUND_OUTPUT = "found output"   # the tool version of a load of output found in the evidence; the CSV doesn't say
+# The files a parser reads beside a found output's inputs, by parser: SBECmd's messages file names each CSV's hive
+COMPANIONS = {"sbecmd_csv": (MESSAGES,)}
+
+
+def companions(case: Case, record: RunRecord) -> tuple[list[str], list[str]]:
+    """The files a load of found output reads beside its inputs (COMPANIONS): each one in an input's folder that the
+    manifest lists, and each that is on disk but not in the manifest (named as given), as two lists of evidence-relative
+    paths, sorted and without repeats. Both are empty for any other run."""
+    names = COMPANIONS.get(record.parser, ()) if record.from_output else ()
+    listed = {e.path.lower(): e.path for e in current_entries(case)} if names else {}
+    base = long_path(case.evidence)
+    found, unlisted = set(), set()
+    for folder in {rel.rpartition("/")[0] for rel in record.inputs}:
+        for name in names:
+            rel = f"{folder}/{name}" if folder else name
+            if rel.lower() in listed:
+                found.add(listed[rel.lower()])
+            elif long_path(base, rel).is_file():
+                unlisted.add(rel)
+    return sorted(found), sorted(unlisted)
+
+
+NOT_CHECKED = "not checked"   # the evidence_check of a run refused before it read anything
+NOT_READ = "not read"   # how a run that recorded no evidence check is shown, such as a load that failed while it read
+
+
+def _unlisted_reason(paths: list[str]) -> str:
+    """Why a load of found output stopped before it read anything: files its parser reads beside the output, which the
+    manifest doesn't list, so no evidence check can cover them."""
+    one = len(paths) == 1
+    return (f"the load reads {'a file' if one else 'files'} beside the output that the manifest doesn't list, so no check "
+            f"covers {'it' if one else 'them'}: {_paths([f'{path}: {NOT_IN_MANIFEST}' for path in paths])}. Add the files "
+            "the manifest doesn't list with Add new evidence, then load it again")
 
 
 def load_found_output(case: Case, tool: str, parser: str, host: str, inputs: list[str]) -> RunRecord:
     """Load a tool's output found in the evidence, such as KAPE's module output, as a run: the files' hashes
-    are checked before and after reading, run.json records them, and a rebuild reads them again."""
+    are checked before and after reading, run.json records them, and a rebuild reads them again. The check covers the
+    files the parser reads beside the output too (companions), though the run's inputs are the output alone. A companion
+    the manifest doesn't list fails the load before it reads, as NOT_CHECKED, since nothing changed; one that appears
+    while the load reads fails its check."""
     zone = host_zone(case, host) if parser in LOCAL_TIME else None   # local time, such as Autoruns'
     record, folder = start_run(case, tool, host, tool_version=FOUND_OUTPUT, host=host, inputs=sorted(inputs),
                                parser=parser, from_output=True, zone=zone)
     (folder / "output").mkdir()
     t0 = time.perf_counter()
-    before = verify(case, record.inputs, reason=f"before loading {record.run_id}")
+    listed, unlisted = companions(case, record)
+    before = verify(case, [*record.inputs, *listed], reason=f"before loading {record.run_id}")
     if before:
         record.evidence_check, record.evidence_problems = check_result(before), before
         record.status = "failed"
         record.reason = (not_reread("the check before loading", before, "load it again")
                          if record.evidence_check == UNREADABLE
                          else f"the output doesn't match its intake hash: {'; '.join(before)}")
+    elif unlisted:
+        record.status, record.evidence_check, record.reason = "failed", NOT_CHECKED, _unlisted_reason(unlisted)
     else:
         try:
             load_output(case, record, folder)
@@ -527,7 +681,8 @@ def load_found_output(case: Case, tool: str, parser: str, host: str, inputs: lis
         except Exception as exc:   # noqa: BLE001  (recorded failed with its reason, never left "running")
             record.status, record.reason = "failed", f"could not load: {type(exc).__name__}: {exc}"
         else:
-            after = verify(case, record.inputs, reason=f"after loading {record.run_id}")
+            listed, unlisted = companions(case, record)   # one that appeared during the load is evidence that changed
+            after = verify(case, [*record.inputs, *listed, *unlisted], reason=f"after loading {record.run_id}")
             record.evidence_check, record.evidence_problems = check_result(after), after
             record.status = "ok" if not after else "failed"
             if record.evidence_check == UNREADABLE:

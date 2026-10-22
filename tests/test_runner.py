@@ -14,7 +14,7 @@ from glessner.runner import RunError, plan_runs, read_runs, run
 from glessner.tools import DetectedTool, ToolOption, ToolSpec
 
 FAKE_TOOL = """
-import os, pathlib, sys, time
+import json, os, pathlib, sys, time
 host_dir, out_dir, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 names = sorted(p.name for p in host_dir.rglob('*.evtx'))
 if mode == 'sleep':
@@ -25,6 +25,8 @@ if mode == 'unreadable-output':
     (out_dir / 'out.txt').mkdir()   # matches the output name but cannot be opened as a file
 elif mode == 'env':
     (out_dir / 'out.txt').write_text(os.environ.get('DOTNET_ROOT', '') + '|' + os.environ.get('DOTNET_ROOT_X64', ''))
+elif mode == 'argv':
+    (out_dir / 'out.txt').write_text(json.dumps(sys.argv))
 elif mode not in ('no-output', 'fail-no-output'):
     (out_dir / 'out.txt').write_text('\\n'.join(names))
 print('read', len(names), 'files')
@@ -160,6 +162,22 @@ def test_working_copies_keep_the_evidence_unchanged(case, tmp_path):
     assert str(case.runs_folder / record.run_id / "input" / "DC01") in record.argv
     # The folders the output names files in, for a copied or moved case
     assert (record.input_root, record.evidence_root) == (str(case.runs_folder / record.run_id / "input"), str(case.evidence))
+
+
+def test_the_recorded_command_line_is_the_one_the_tool_received(case, tmp_path):
+    """run.json's argv is the list the tool was started with, after the working copies' paths replaced the evidence's:
+    the executable first, then what the tool read from its own command line. The case folder's name holds a space, as a
+    folder an analyst names can, so a command line joined into one string would split the paths."""
+    spaced = create_case(tmp_path / "case folder", "Spaced", case.evidence, "cody")
+    intake(spaced)
+    record = run_mode(spaced, with_spec(fake_spec(tmp_path), work_on_copies=True), "argv")
+    folder = spaced.runs_folder / record.run_id
+    saved = json.loads((folder / "run.json").read_text())
+    received = json.loads((folder / "output" / "out.txt").read_text())
+    assert record.status == "ok"
+    assert saved["argv"][0] == sys.executable and saved["argv"][1:] == received
+    assert received[1:] == [str(folder / "input" / "DC01"), str(folder / "output"), "argv"]
+    assert " " in received[1] and " " in received[2]
 
 
 def test_working_copies_are_copied_from_the_files_the_manifest_names(tmp_path):

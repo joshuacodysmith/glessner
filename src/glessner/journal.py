@@ -1610,11 +1610,14 @@ def event_ids(entry: dict) -> Iterator[str]:
 
 
 def referenced_ids(path: Path) -> set[str]:
-    """Every event ID the journal names, each entry read through the rekeys that follow it, for a case format upgrade's
-    map (rekey.py)."""
+    """Every event ID the journal names, for a case format upgrade's map (rekey.py): each entry's, read through the rekeys
+    that follow it, and each event an earlier rekey's unplaced ID may have meant (unplaced), by the ID the event has now,
+    since the Event page looks those events up by it, and the map has to place them."""
     if not path.exists():
         return set()
-    return {uid for entry in entries(path) for uid in event_ids(entry)}
+    read = entries(path)
+    rekeys = [{**entry["rekey"], "seq": entry.get("seq")} for entry in read if is_rekey(entry)]   # as State.rekeys
+    return {uid for entry in read for uid in event_ids(entry)} | set(unplaced(State(rekeys=rekeys)))
 
 
 def upgrade_recorder(journal: Journal):
@@ -1645,15 +1648,44 @@ def renamed(state: State, uid: str) -> tuple[str, list[int]] | None:
     return (uid, seqs) if seqs else None
 
 
+def _successors(uid: str, rekey: dict) -> list[str]:
+    """The IDs the event ID `uid` has after one rekey: the one its pairs give, the several its unplaced map lists, or
+    `uid` itself when the rekey names it in neither."""
+    new = rekey_map(rekey, "pairs").get(uid)
+    if isinstance(new, str):
+        return [new]
+    several = rekey_map(rekey, "unplaced").get(uid)
+    if isinstance(several, list) and (ids := [each for each in several if isinstance(each, str)]):
+        return ids
+    return [uid]
+
+
+def _read_through(uid: str, rekeys: list[dict]) -> list[str]:
+    """The IDs the event ID `uid` has after `rekeys`, the rekeys that follow the record naming it: one lookup in each,
+    in file order (_successors), and an ID that several lookups reach once."""
+    ids = [uid]
+    for rekey in rekeys:
+        ids = list(dict.fromkeys(new for each in ids for new in _successors(each, rekey)))
+    return ids
+
+
 def unplaced(state: State) -> dict[str, list[dict]]:
     """Each event a rekey's unplaced ID may have meant -> those IDs: an ID that named different records in different
-    runs stays as written, with its candidates listed. Each is {seq, id, candidates}."""
+    runs stays as written, with its candidates listed. Each is {seq, id, candidates}. A rekey lists its candidates by the
+    IDs of its own format, so each is read through the rekeys after that one, as translate reads an entry's IDs, and an
+    event is keyed by the ID it has now. A candidate a later rekey leaves unplaced becomes that rekey's candidates, and
+    candidates that read as one ID are listed once. `id`, the ID the entries named, stays as written. A rekey names a
+    candidate in its own map only if it places it (referenced_ids). A rekey's `merged` and `dropped_runs` need no
+    translation, since nothing looks them up by event ID."""
     out: dict[str, list[dict]] = {}
-    for rekey in state.rekeys:
+    for i, rekey in enumerate(state.rekeys):
         for old, candidates in rekey_map(rekey, "unplaced").items():
-            for uid in candidates if isinstance(candidates, list) else ():
-                if isinstance(uid, str):
-                    out.setdefault(uid, []).append({"seq": rekey["seq"], "id": old, "candidates": list(candidates)})
+            if not isinstance(candidates, list):
+                continue
+            now = list(dict.fromkeys(uid for candidate in candidates if isinstance(candidate, str)
+                                     for uid in _read_through(candidate, state.rekeys[i + 1:])))
+            for uid in now:
+                out.setdefault(uid, []).append({"seq": rekey["seq"], "id": old, "candidates": list(now)})
     return out
 
 

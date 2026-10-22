@@ -52,6 +52,13 @@ def junction(link, target):
     subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
 
 
+def flip_a_byte(path, at=0):
+    """Change one byte of a file, leaving its size as it was: the edit a check by size alone would miss."""
+    data = bytearray(path.read_bytes())
+    data[at] ^= 0x01
+    path.write_bytes(data)
+
+
 def nested_list(depth):
     """A list nested `depth` deep, built without json, so json.dumps can't write it back, wherever the stack lets
     json.loads read to."""
@@ -254,12 +261,11 @@ def on_this_machine(address) -> bool:
         return False
 
 
-@pytest.fixture(autouse=True)
-def network_guard(monkeypatch):
-    """Every test runs with nothing reaching past this machine. A socket's connect, bind, or sendto to an address that
-    isn't loopback, and a name lookup of anything but localhost or a loopback address, raises OSError and is listed
-    here, and a test that made one fails. The server's 127.0.0.1 listener and the browser tests' loopback traffic pass.
-    It sees Python's sockets only: native code, such as DuckDB's own HTTP client, is out of its sight, so
+def refuse_off_machine(monkeypatch) -> list[str]:
+    """Make nothing reach past this machine, for as long as `monkeypatch` holds its patches. A socket's connect, bind, or
+    sendto to an address that isn't loopback, and a name lookup of anything but localhost or a loopback address, raises
+    OSError and is added to the list returned. The server's 127.0.0.1 listener and the browser tests' loopback traffic
+    pass. It sees Python's sockets only: native code, such as DuckDB's own HTTP client, is out of its sight, so
     test_no_network.py checks DuckDB's settings instead."""
     refused = []
 
@@ -280,6 +286,14 @@ def network_guard(monkeypatch):
     for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex", "gethostbyaddr", "getnameinfo"):
         monkeypatch.setattr(socket, name, guarded(f"socket.{name}", getattr(socket, name),
                                                   lambda host, *rest, **options: host))
+    return refused
+
+
+@pytest.fixture(autouse=True)
+def network_guard(monkeypatch):
+    """Every test runs with nothing reaching past this machine (refuse_off_machine), and a test that made an attempt
+    fails. The fixture's value is the list of attempts."""
+    refused = refuse_off_machine(monkeypatch)
     yield refused
     assert not refused, f"The test reached past this machine: {refused}"
 

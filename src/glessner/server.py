@@ -164,7 +164,7 @@ from .start import browse, check, forget_missing, load_recent, remember, start_c
 from .tags import TACTICS, TagError, normalize_tag, tactic_order, tag_kind, tag_label
 from .timezones import validate_axes, zone_names
 from .tool_outputs import KINDS
-from .toolbox import everything_ready, overview, run_gaps, start_all_job, start_load_job
+from .toolbox import close_interrupted, everything_ready, overview, run_gaps, start_all_job, start_load_job
 from .toolbox import start_job as start_tool_job
 from .tools import detect, load_registry
 from .version import build_id
@@ -226,7 +226,8 @@ class App:
         An open for work runs in this order: the upgrade, whose steps hold the events database themselves; the
         connection, so a database another program holds stops the open before any other journal write; then, under the
         journal's held context, its checks, recovery, case_yaml, case_open, and the built-in rules. A broken chain writes
-        none of them, and the journal then refuses every write with the reason (Journal.read_only). `report(stage, done,
+        none of them, and the journal then refuses every write with the reason (Journal.read_only). Last, any run still
+        recorded as running is marked failed (toolbox.close_interrupted). `report(stage, done,
         total)`, when given, gets the upgrade's stages and then "Opening" (the start page's open job)."""
         self.token = token or secrets.token_urlsafe(32)
         # This open's ID, which /api/meta gives the page and the page sends with each request, so a page whose case
@@ -257,6 +258,8 @@ class App:
         except BaseException:
             self.con.close()
             raise
+        if for_work:
+            close_interrupted(case)   # after the connection: a run another process is loading holds the database
         self.opened_at = _now()   # when the open checked the journal, which Integrity's row says
         self.last_check: tuple | None = None   # Check now's (Check, the head record it compared, when)
         self.manifest = manifest_hashes(case) if case.manifest_path.exists() else {}

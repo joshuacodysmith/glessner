@@ -96,12 +96,12 @@ Sixteen files under `registry/`, loaded by `tools.load_registry`. A tool is foun
 | Hayabusa | `evtx` | host_dir | `hayabusa_csv` | `dfir-timeline -d {host_dir} -o {output_dir}\hayabusa.csv -p verbose -b -w -q -K -O -C -Q`. Option `min_level` adds `-m`. Its rows are hits, not timeline events. |
 | Event XML reader, built in | `event_xml` | host_dir | `event_xml_csv` | `python -I -m glessner.event_xml`. Writes EvtxECmd's CSV layout. Its version is the app's build. |
 | RECmd | `registry`, `registry_log` | host_dir | `recmd_csv` | `--bn {tool_dir}\BatchExamples\DFIRBatch.reb --nl` |
-| SBECmd | `registry:NTUSER`, `registry:USRCLASS` | host_dir | `sbecmd_csv` | `--nl`. The parser reads `!SBECmd_Messages.txt` too. |
+| SBECmd | `registry:NTUSER`, `registry:USRCLASS` | host_dir | `sbecmd_csv` | `--nl` only when a planned hive has no transaction log beside it (`without_related`): the argument makes SBECmd skip the logs of every hive in the run, so the run's notes name the hives without one. Otherwise SBECmd replays the logs collected beside each hive, and the run's evidence check covers those logs. The parser reads `!SBECmd_Messages.txt` too; a load of SBECmd output found in the evidence checks the one beside its CSVs, and fails before it reads when the manifest doesn't list that file, until Add new evidence adds it. |
 | AmcacheParser | `registry:AMCACHE` | each_file | `amcache_csv` | `-f {input_file} -i --csv {output_dir}` |
 | MFTECmd | `mft` | each_file | `mftecmd_csv` | `-f {input_file} --csv {output_dir} --csvf mftecmd.csv` |
 | MFTECmd for `$J` | `usnjrnl` | each_file | `mftecmd_j_csv` | The `$MFT` in the nearest folder above the `$J` as `-m`, for folder paths. With none above it, the run has no `-m`, and its notes say so. |
-| PECmd | `prefetch` | host_dir | `pecmd_csv` | `--mp` |
-| LECmd | `lnk` | host_dir | `lecmd_csv` | |
+| PECmd | `prefetch` | host_dir | `pecmd_csv` | `--mp`. Reads only files named `*.pf` in a folder (`selects`). A prefetch file that intake identified by its signature but that is named otherwise is left out, and the run's notes name it. A host whose every prefetch file is named otherwise isn't run. |
+| LECmd | `lnk` | host_dir | `lecmd_csv` | Reads only files named `*.lnk` in a folder (`selects`). A link file that intake identified by its signature but that is named otherwise is left out, and the run's notes name it. A host whose every link file is named otherwise isn't run. |
 | JLECmd | `jumplist` | host_dir | `jlecmd_csv` | |
 | RBCmd | `recycle_bin` | host_dir | `rbcmd_csv` | .NET 9 build. An empty result explains that the .NET 4 build needs administrator rights. |
 | SrumECmd | `srum` | host_dir | `srumecmd_csv` | Works on copies in the run's folder, with the host's SOFTWARE hive copied too, each at its evidence path (`runner._make_copies`) |

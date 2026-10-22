@@ -1,8 +1,10 @@
 """Parses Suricata's EVE JSON: from the app's own Suricata runs on packet captures, and EVE files found in the
 evidence.
 
-One event per record. Stats records, Suricata's own counters every few seconds, are left out. The channel is the
-record's event_type, such as alert, dns, http, tls, fileinfo, or flow; an alert's event code is its rule's signature ID.
+One event per record. Stats records, Suricata's own counters every few seconds, are left out. A line that holds no JSON
+object, such as a last line cut short when Suricata stopped, makes no event, and the run's notes count such lines. The
+channel is the record's event_type, such as alert, dns, http, tls, fileinfo, or flow; an alert's event code is its
+rule's signature ID.
 
 Times. A record's timestamp is in the sensor's local time with its offset. A flow record's timestamp is only when it was
 logged, at the flow's end, a timeout, or shutdown, so a flow is placed at its start. Suricata's default multi-threaded
@@ -24,7 +26,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from ..events import Event, from_us, to_us
-from .common import ParseContext, evidence_relative, file_key, flatten, normalize_ip, output_paths
+from .common import SKIPPED_NOTE, ParseContext, evidence_relative, file_key, flatten, normalize_ip, output_paths
 
 OUTPUT_FILE = "eve.json"
 SKIPPED = {"stats"}
@@ -39,17 +41,25 @@ def parse_suricata_eve(ctx: ParseContext) -> Iterator[Event]:
         starts = _flow_starts(path)
         seen: Counter[str] = Counter()
         seen_former: Counter[str] = Counter()   # format 1's keys, counted apart: they repeat as the new ones do
+        dropped = 0
         for n, rec in _records(path):
-            if rec.get("event_type") not in SKIPPED:
+            if rec is None:
+                dropped += 1
+            elif rec.get("event_type") not in SKIPPED:
                 key = _numbered(seen, _record_key(rec, starts))
                 former = _numbered(seen_former, _record_key(rec, starts, as_written=True)) if ctx.former == 1 else key
                 try:
                     event = _event(rec, source, n, starts, key)
                 except RecursionError:   # a list nested too deep to write back as JSON text
+                    dropped += 1
                     continue
                 if former != key:
                     event.former = (source, former)
                 yield event
+        if dropped:
+            name = source if ctx.files else (f"{path.name} for {source}" if source else path.name)
+            ctx.notes.append(f"{SKIPPED_NOTE}{dropped:,} {'line' if dropped == 1 else 'lines'} of {name}: not a JSON record, "
+                             "or nested too deep to read, such as a last line cut short when Suricata stopped.")
 
 
 def _numbered(seen: Counter[str], key: str) -> str:
@@ -94,7 +104,9 @@ def _dns_name(d: dict) -> str:
     return next((str(q["rrname"]) for q in queries if isinstance(q, dict) and q.get("rrname")), "")
 
 
-def _records(path: Path) -> Iterator[tuple[int, dict]]:
+def _records(path: Path) -> Iterator[tuple[int, dict | None]]:
+    """Each non-empty line of the file as its number and the JSON object it holds, or None for a line that holds none:
+    not JSON, nested too deep to read, or JSON of another kind."""
     with path.open(encoding="utf-8", errors="replace") as f:
         for n, line in enumerate(f, 1):
             if not line.strip():
@@ -102,9 +114,8 @@ def _records(path: Path) -> Iterator[tuple[int, dict]]:
             try:
                 rec = json.loads(line)
             except (ValueError, RecursionError):   # not JSON, or nested too deep to read
-                continue
-            if isinstance(rec, dict):
-                yield n, rec
+                rec = None
+            yield n, rec if isinstance(rec, dict) else None
 
 
 def _flow_starts(path: Path) -> dict[str, tuple[int, str]]:
@@ -112,7 +123,7 @@ def _flow_starts(path: Path) -> dict[str, tuple[int, str]]:
     of its traffic, so this is a first pass over the file."""
     starts = {}
     for _, rec in _records(path):
-        if rec.get("event_type") == "flow" and rec.get("flow_id") is not None:
+        if rec is not None and rec.get("event_type") == "flow" and rec.get("flow_id") is not None:
             text = str((rec.get("flow") or {}).get("start", ""))
             start = to_us(text)
             if start is not None:

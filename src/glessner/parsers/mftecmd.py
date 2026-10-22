@@ -2,7 +2,8 @@
 
 Each MFT record carries four $STANDARD_INFORMATION (0x10) and four $FILE_NAME (0x30) times. Times
 that share a value become one event labeled with MACB letters (Modified, Accessed, Changed, Born),
-as a supertimeline does. Deleted records and timestomping indicators are kept and flagged.
+as a supertimeline does. Deleted records and timestomping indicators are kept and flagged. A row with no readable time
+makes no event, and the run's notes count such rows.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import json
 from collections.abc import Iterator
 
 from ..events import Event, to_us
-from .common import ParseContext, evidence_relative, file_key, output_paths, read_csv_rows
+from .common import SKIPPED_NOTE, ParseContext, evidence_relative, file_key, output_paths, read_csv_rows
 
 OUTPUT_FILE = "mftecmd.csv"
 TIME_COLUMNS = (("M", "LastModified"), ("A", "LastAccess"), ("C", "LastRecordChange"), ("B", "Created"))
@@ -22,8 +23,16 @@ EXTRA_COLUMNS = ("EntryNumber", "SequenceNumber", "ParentEntryNumber", "ParentSe
 
 
 def parse_mftecmd(ctx: ParseContext) -> Iterator[Event]:
+    dropped = 0
     for row in (row for path in output_paths(ctx, "mftecmd", OUTPUT_FILE) for row in read_csv_rows(path)):
-        yield from events_from_row(row, ctx)
+        events = list(events_from_row(row, ctx))   # a row has at most eight
+        if not events:
+            dropped += 1
+        yield from events
+    if dropped:
+        one = dropped == 1
+        ctx.notes.append(f"{SKIPPED_NOTE}{dropped:,} {'row' if one else 'rows'} of MFTECmd's CSV: none of "
+                         f"{'its' if one else 'their'} times could be read.")
 
 
 def events_from_row(row: dict[str, str], ctx: ParseContext) -> Iterator[Event]:

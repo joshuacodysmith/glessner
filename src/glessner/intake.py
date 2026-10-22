@@ -29,6 +29,16 @@ from .long_paths import long_path
 CHUNK = 4 * 1024 * 1024
 TEXT_SUFFIXES = {".log", ".txt", ".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".old", ""}   # names a text log may have
 UNLISTED = "folder can't be opened, so its files aren't in the manifest"   # how the error of a folder's entry begins
+NOT_IN_MANIFEST = "not in the manifest"   # what check_files says of a path the manifest doesn't list
+# Windows file attributes of a cloud file whose content isn't on the disk, which opening it downloads: stat has no
+# constants for the first two
+RECALL_ON_OPEN = 0x40000
+RECALL_ON_DATA_ACCESS = 0x400000
+PLACEHOLDER_ATTRIBUTES = RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN | stat.FILE_ATTRIBUTE_OFFLINE
+# The error of the manifest entry of a placeholder intake didn't read, and what a later check says of one. Neither holds
+# ": ", since the reader of a problem takes the file's name from before the last one.
+PLACEHOLDER = "a cloud placeholder whose content isn't on this disk, so intake didn't read it, since reading would download it"
+PLACEHOLDER_NOW = "a cloud placeholder whose content isn't on this disk"
 
 
 @dataclass(frozen=True)
@@ -67,8 +77,8 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def walk(root: Path, links: list[str] | None = None,
-         unreadable: list[tuple[str, str]] | None = None) -> Iterator[tuple[str, list[str]]]:
+def walk(root: Path, links: list[str] | None = None, unreadable: list[tuple[str, str]] | None = None,
+         placeholders: list[str] | None = None) -> Iterator[tuple[str, list[str]]]:
     """os.walk without following links, for the evidence and the tools folder: each folder under root, as (path, its
     files' names), depth first in name order, as os.walk with sorted names gives them.
 
@@ -78,13 +88,14 @@ def walk(root: Path, links: list[str] | None = None,
     added to `links` as "path -> target", the path relative to root. A volume mounted in a folder is a junction here,
     since both carry the mount point tag. A folder that is another reparse point is mostly a cloud-sync placeholder,
     such as a OneDrive folder: its files are the user's own, but it is skipped. A file that is a reparse point but not a
-    link, such as a deduplicated or cloud file, is read like any other file.
+    link, such as a deduplicated file, is read like any other file.
 
     Each folder is listed through its extended-length path (long_paths.long_path), so one past 260 characters, or
     whose name ends in a dot or a space, is listed as it is. The path it gives for a folder is root joined with the
     names scandir gave, which a plain open may not reach, so a caller opens a file through long_path. A folder that
     still can't be listed is skipped, as os.walk skips one, and added to `unreadable` as (its path relative to root, "."
-    for root itself, and the error)."""
+    for root itself, and the error). A file that is a cloud placeholder (is_placeholder) is still listed, and added to
+    `placeholders` as its path relative to root, so that a caller can leave it unread."""
     base = long_path(root)
     stack = [(os.fspath(root), "")]
     while stack:
@@ -107,6 +118,8 @@ def walk(root: Path, links: list[str] | None = None,
                 folders.append((os.path.join(top, entry.name), path))
             else:
                 files.append(entry.name)
+                if placeholders is not None and is_placeholder(entry):
+                    placeholders.append(path)
         yield top, files
         stack.extend(reversed(folders))
 
@@ -126,6 +139,29 @@ def entry_kind(entry: os.DirEntry) -> str:
         return "file"   # as os.walk takes an entry it can't check
 
 
+def is_placeholder(entry: os.DirEntry) -> bool:
+    """Whether a file is a cloud placeholder, such as a OneDrive file whose content isn't on the disk, by the attributes
+    the folder listing carries, so nothing is opened. False where files have no such attributes, and for an entry that
+    can't be statted."""
+    try:
+        return _has_placeholder_attributes(entry.stat(follow_symlinks=False))
+    except OSError:
+        return False
+
+
+def file_attributes(path: Path) -> int:
+    """A file's Windows attributes from one stat, which opens nothing; 0 where files have none, and for a file that
+    can't be statted."""
+    try:
+        return getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return 0
+
+
+def _has_placeholder_attributes(result: os.stat_result) -> bool:
+    return bool(getattr(result, "st_file_attributes", 0) & PLACEHOLDER_ATTRIBUTES)
+
+
 def _target(path: str) -> str:
     """Where a link points, written as Windows shows it: readlink gives a junction's target as \\\\?\\D:\\..."""
     try:
@@ -135,11 +171,11 @@ def _target(path: str) -> str:
     return target[4:] if target.startswith("\\\\?\\") and target[5:6] == ":" else target
 
 
-def walk_evidence(root: Path, links: list[str] | None = None,
-                  unreadable: list[tuple[str, str]] | None = None) -> Iterator[str]:
+def walk_evidence(root: Path, links: list[str] | None = None, unreadable: list[tuple[str, str]] | None = None,
+                  placeholders: list[str] | None = None) -> Iterator[str]:
     """Yield every file under root, by its path relative to root with forward slashes, in a stable order, without
-    following links (walk)."""
-    for dirpath, filenames in walk(root, links, unreadable):
+    following links (walk), which also fills `links`, `unreadable`, and `placeholders`."""
+    for dirpath, filenames in walk(root, links, unreadable, placeholders):
         folder = Path(dirpath).relative_to(root)
         for name in filenames:
             yield (folder / name).as_posix()
@@ -147,15 +183,16 @@ def walk_evidence(root: Path, links: list[str] | None = None,
 
 def intake(case: Case, progress: Callable[[int, int], None] | None = None) -> IntakeSummary:
     """Hash and identify every evidence file, then write manifest.jsonl. progress(done, total) follows the hashing,
-    for the start page. A folder that can't be listed has an entry of its own, with its error."""
+    for the start page. A folder that can't be listed has an entry of its own, with its error, and so does a cloud
+    placeholder, which is not read, since reading would download it (is_placeholder)."""
     if case.manifest_path.exists():
         raise CaseError(f"Intake already done for this case: {case.manifest_path}")
-    root, links, folders = case.evidence, [], []
-    paths = list(walk_evidence(root, links, folders))
-    base = long_path(root)
+    root, links, folders, placeholders = case.evidence, [], [], []
+    paths = list(walk_evidence(root, links, folders, placeholders))
+    base, held = long_path(root), set(placeholders)
     entries = []
     for i, rel in enumerate(paths, 1):
-        entries.append(_entry(base, rel))
+        entries.append(_entry(base, rel, rel in held))
         if progress:
             progress(i, len(paths))
     entries += [_unlisted(rel, error) for rel, error in folders]
@@ -173,7 +210,7 @@ def add_new(case: Case) -> IntakeSummary:
 
     A folder that can't be listed gets an entry only when the manifest lists nothing under it. Otherwise the files it
     lists there keep their entries and aren't called gone, since they can't be looked for, and the summary's errors
-    name the folder and how many they are.
+    name the folder and how many they are. A cloud placeholder is added without being read, as intake adds one.
     """
     if not case.manifest_path.exists():
         raise CaseError("No intake manifest yet; run intake first.")
@@ -181,13 +218,11 @@ def add_new(case: Case) -> IntakeSummary:
     listed = read_manifest(case)
     known = {e.path for e in listed}
     folder_entries = {e.path for e in listed if e.is_folder}
-    root, seen, new, not_looked_for, links, folders = case.evidence, set(), [], [], [], []
-    base = long_path(root)
+    root, not_looked_for, links, folders, placeholders = case.evidence, [], [], [], []
+    paths = list(walk_evidence(root, links, folders, placeholders))
+    base, held, seen = long_path(root), set(placeholders), set(paths)
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    for rel in walk_evidence(root, links, folders):
-        seen.add(rel)
-        if rel not in known:
-            new.append(replace(_entry(base, rel), added_utc=now))
+    new = [replace(_entry(base, rel, rel in held), added_utc=now) for rel in paths if rel not in known]
     for rel, error in folders:
         inside = {path for path in known if _under(path, rel)}
         if rel not in known and not inside:
@@ -235,8 +270,9 @@ def manifest_hashes(case: Case) -> dict[str, str]:
 
 def current_entries(case: Case) -> list[ManifestEntry]:
     """The manifest with identification brought up to date: each entry an earlier intake may have identified by older
-    rules (_read_again) is read again, and takes the new identification when it names an artifact. The Tools page,
-    runs, and the Import page all read the evidence this way. The manifest itself never changes."""
+    rules (_read_again) is read again, and takes the new identification when it names an artifact; one that is a cloud
+    placeholder now is not read, and keeps its entry. The Tools page, runs, and the Import page all read the evidence
+    this way. The manifest itself never changes."""
     return list(_current_entries(case, *file_stamp(case.manifest_path)))
 
 
@@ -275,9 +311,10 @@ def file_stamp(path: Path) -> tuple[int, int]:
 
 
 def _reidentify(evidence: str, e: ManifestEntry) -> Identification | None:
-    """A file's identification by today's rules; None when it can't be read. It is read once per process for the size
-    and hash the manifest records, which verify checks before any run reads the file, so no evidence file is statted
-    to look it up, and a manifest that add_new changed reads only the files it added."""
+    """A file's identification by today's rules; None when it can't be read, and when it is a cloud placeholder now,
+    which reading would download. It is read once per process for the size and hash the manifest records, which verify
+    checks before any run reads the file, so no evidence file is statted to look it up, and a manifest that add_new
+    changed reads only the files it added."""
     try:
         return _identify_cached(evidence, e.path, e.size, e.sha256)
     except OSError:
@@ -286,8 +323,13 @@ def _reidentify(evidence: str, e: ManifestEntry) -> Identification | None:
 
 @lru_cache(maxsize=65536)
 def _identify_cached(evidence: str, path: str, size: int, sha256: str) -> Identification:
-    """identify_file for a manifest path under `evidence`, the evidence root in extended-length form."""
-    return identify_file(long_path(Path(evidence), path))
+    """identify_file for a manifest path under `evidence`, the evidence root in extended-length form. A file that is a
+    cloud placeholder (PLACEHOLDER_ATTRIBUTES) raises OSError, which the cache doesn't keep, instead of being read; only
+    a file about to be read is statted for that."""
+    full = long_path(Path(evidence), path)
+    if file_attributes(full) & PLACEHOLDER_ATTRIBUTES:
+        raise OSError(f"{path}: {PLACEHOLDER_NOW}")
+    return identify_file(full)
 
 
 def summarize(entries: Iterable[ManifestEntry]) -> IntakeSummary:
@@ -341,12 +383,15 @@ def check_files(case: Case, paths: Iterable[str] | None = None, reason: str = ""
     for rel in wanted:
         entry = manifest.get(rel)
         if entry is None:
-            problems.append(f"{rel}: not in the manifest")
+            problems.append(f"{rel}: {NOT_IN_MANIFEST}")
             continue
         if entry.error:
             unverified.append(f"{rel}/" if entry.is_folder else rel)
             continue
         full = long_path(base, rel)
+        if file_attributes(full) & PLACEHOLDER_ATTRIBUTES:   # reading it would download it
+            problems.append(f"{rel}: unreadable ({PLACEHOLDER_NOW})")
+            continue
         try:
             if not full.is_file():
                 problems.append(f"{rel}: missing")
@@ -476,9 +521,12 @@ def _brief(check: dict) -> dict:
             "result": check.get("result", ""), "problems": len(check.get("problems") or [])}
 
 
-def _entry(base: Path, rel: str) -> ManifestEntry:
+def _entry(base: Path, rel: str, placeholder: bool = False) -> ManifestEntry:
     """The manifest entry of the file at `rel`, read under `base`, the evidence root in extended-length form
-    (long_path)."""
+    (long_path). A cloud placeholder (is_placeholder) is not read: its entry is unreadable, with PLACEHOLDER as its
+    error."""
+    if placeholder:
+        return ManifestEntry(rel, 0, "", None, "unreadable", error=PLACEHOLDER)
     path = long_path(base, rel)
     try:
         size = path.stat().st_size

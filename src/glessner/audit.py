@@ -442,6 +442,8 @@ def _closed_evidence(value: dict) -> str:
             return "Closed the case. The evidence matches the intake manifest."
         if skipped:
             return f"Closed the case. {matched_text(files)}{skipped}"
+        if not files:
+            return "Closed the case. No evidence file was checked: the intake manifest lists none."
         return ("Closed the case. Its 1 evidence file matches the intake manifest." if files == 1
                 else f"Closed the case. All {files:,} evidence files match the intake manifest.")
     found = "; ".join(problems[:3]) + ("; and more" if len(problems) > 3 else "")

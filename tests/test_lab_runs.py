@@ -1,17 +1,22 @@
 """End-to-end check with the real EvtxECmd and Hayabusa on the Szechuan Sauce collection.
 
-Skipped when the lab collection or tools are absent. Takes about a minute.
+Skipped when the lab collection or tools are absent. Takes about three minutes on an idle machine: the tools run on the
+whole collection, EvtxECmd on DC01 twice.
 """
 
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import pytest
 from conftest import links_in
 
 from glessner.analysis import build_identity, build_tables
-from glessner.case import create_case
+from glessner.case import create_case, open_case
 from glessner.events import connect
 from glessner.intake import intake
 from glessner.journal import Journal
@@ -32,6 +37,13 @@ pytestmark = [
 ]
 
 
+def remove_case_folder(folder: Path) -> None:
+    """Delete a test case's folder under CASES, and warn when part of it is left, as a file held open leaves it."""
+    shutil.rmtree(folder, ignore_errors=True)
+    if folder.exists():
+        warnings.warn(f"{folder} was not deleted completely; delete it by hand", stacklevel=2)
+
+
 @pytest.fixture(scope="module")
 def loaded_case():
     # The case lives under D:/DFIR-Lab, which has a Defender exclusion. In %TEMP%, Defender locked
@@ -44,7 +56,7 @@ def loaded_case():
     detected = detect(specs.values(), TOOLS)
     records = [run(case, plan) for tool in ALL_TOOLS for plan in plan_runs(case, detected[tool])]
     yield case, detected, records
-    shutil.rmtree(folder, ignore_errors=True)
+    remove_case_folder(folder)
 
 
 def query(case, sql, *params):
@@ -185,3 +197,36 @@ def test_ids_survive_rerun_and_rebuild(loaded_case):
     assert query(case, "SELECT event_uid, ts_us FROM events ORDER BY event_uid") == before
     rebuild(case)
     assert query(case, "SELECT event_uid, ts_us FROM events ORDER BY event_uid") == before
+
+
+def test_a_second_build_gives_the_same_events(loaded_case):
+    """A second case built from the collection holds the same events as this one for the real Hayabusa's lane on DC01:
+    the same IDs and the same value in every other column but run_id, since the two cases' runs have different IDs. The
+    second case is built by the command line in a Python process of its own with another seed for string hashing, so
+    neither the seed nor a cache the first build filled can make the two agree. Only Hayabusa's lane is compared, because
+    its run on DC01 takes a fraction of EvtxECmd's. The raw output files are not compared."""
+    case, _, _ = loaded_case
+    folder = Path(tempfile.mkdtemp(prefix="lab_runs_again_", dir=CASES))
+    try:
+        again = folder / "case"
+        for command in (["new-case", str(again), "--evidence", str(TRIAGE), "--name", "Szechuan again", "--analyst", "test",
+                         "--tools", str(TOOLS)],
+                        ["intake", str(again)],
+                        ["run", str(again), "--tool", "hayabusa", "--host", "DC01"]):
+            done = subprocess.run([sys.executable, "-m", "glessner", *command], env={**os.environ, "PYTHONHASHSEED": "2"},
+                                  capture_output=True, text=True, timeout=900, check=False)
+            assert done.returncode == 0, f"glessner {command[0]} failed:\n{done.stdout}\n{done.stderr}"
+        lane = "host = 'DC01' AND tool = 'hayabusa'"
+        con = connect(case.db_path, read_only=True)
+        try:
+            con.execute(f"ATTACH '{open_case(again).db_path}' AS again (READ_ONLY)")
+            counts = [con.execute(f"SELECT count(*) FROM {db}.events WHERE {lane}").fetchone()[0] for db in ("main", "again")]
+            assert counts[0] == counts[1] > 0
+            for here, there in (("main", "again"), ("again", "main")):
+                (differ,) = con.execute(f"SELECT count(*) FROM (SELECT * EXCLUDE (run_id) FROM {here}.events WHERE {lane} "
+                                        f"EXCEPT ALL SELECT * EXCLUDE (run_id) FROM {there}.events WHERE {lane})").fetchone()
+                assert differ == 0, f"{differ} events in the {here} case have no equal in the {there} case"
+        finally:
+            con.close()
+    finally:
+        remove_case_folder(folder)

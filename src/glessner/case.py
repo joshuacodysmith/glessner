@@ -104,6 +104,9 @@ def create_case(folder: Path, name: str, evidence: Path, analyst: str, tools_fol
     goes into each run folder's name, so it has no slash or backslash, as an import's lane name has none, none of the
     characters Windows refuses in a file's name (NOT_IN_FILE_NAMES), and no space or dot at its end, which Windows drops
     from a folder's name. Its journal starts with case_created, written by `client`, the kind of process making it.
+    The journal head record that an earlier case in the same folder path left outside the folder is removed as the folder
+    is made (_make_folder), so the new journal is compared with no head but its own, and a record that can't be removed
+    is a CaseError.
     HOST_NAME is imported here, since imports.py imports the runner, which imports this module."""
     from .imports import HOST_NAME
 
@@ -125,7 +128,7 @@ def create_case(folder: Path, name: str, evidence: Path, analyst: str, tools_fol
         raise CaseError(problem)
     if folder.exists() and any(folder.iterdir()):
         raise CaseError(f"Case folder is not empty: {folder}")
-    folder.mkdir(parents=True, exist_ok=True)
+    _make_folder(folder)
     for sub in SUBFOLDERS:
         (folder / sub).mkdir()
     settings = CaseSettings(
@@ -143,18 +146,40 @@ def create_case(folder: Path, name: str, evidence: Path, analyst: str, tools_fol
     return case
 
 
+def _make_folder(folder: Path) -> None:
+    """Make the case folder, after removing the journal head record (heads.py) that an earlier case in `folder` left
+    outside it, so the journal of a case made there now is compared with no head but its own: the record of a case that
+    was deleted would otherwise put the new journal in read-only mode, also when the new case's own record can't be
+    written. The record goes only once the folder's parent exists, so a path that can't be reached, such as one on an
+    absent drive or share, raises the OS's error and keeps the record of the case that is there. CaseError, naming the
+    record's file, when it can't be removed; the disk is as it was then: the folder is not made, and the folders above
+    it that this call made are removed again, each only while it is empty. Imported here, since heads.py imports this
+    module."""
+    from .heads import forget, path_for
+
+    made = [each for each in (folder.parent, *folder.parent.parents) if not each.exists()]   # deepest first
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        forget(folder)
+    except OSError as exc:
+        for each in made:
+            with suppress(OSError):   # rmdir refuses a folder that something has put a file in since, which stays
+                each.rmdir()
+        raise CaseError(f"Can't remove the journal head record an earlier case in this folder left: {path_for(folder)} "
+                        f"({exc.strerror or exc}). Remove that file, then make the case again.") from exc
+    folder.mkdir(exist_ok=True)
+
+
 def _start_journal(case: Case, client: str, payload: dict) -> None:
     """A case's journal at its making: case_created at byte 0 for a case of a format with a hash chain, so no crash can
     leave the empty journal that a chained format calls "chain missing"; empty for an older one, whose
-    upgrade seals it first. Imported here, since the journal imports this module, as _rekey reaches rekey.py."""
-    from .heads import forget
+    upgrade seals it first. The caller has removed any head record of an earlier case in the folder (_make_folder).
+    Imported here, since the journal imports this module, as _rekey reaches rekey.py."""
     from .journal import start_chain
 
     (case.folder / JOURNAL_FILE).touch()
     if case.settings.case_format >= FIRST_CHAINED:
         start_chain(case, client, **payload)
-    else:   # a new case where another was gives no head of that one's to the seal step, which would refuse it
-        forget(case.folder)
 
 
 def copy_case(source: Case, folder: Path, name: str, analyst: str, client: str = "cli") -> Case:
@@ -165,7 +190,8 @@ def copy_case(source: Case, folder: Path, name: str, analyst: str, client: str =
     output is copied rather than run again, so the copy needs a rebuild to load it (the copy-case command does both).
     A copy of a format 3 source starts its journal with case_created naming the source and its head; an older source's
     copy keeps the source's format, so its journal stays empty until its upgrade seals it and case_created follows
-    (rekey.upgraded_copy).
+    (rekey.upgraded_copy). As create_case does, it removes the journal head record that an earlier case in the same
+    folder path left outside the folder as it makes the folder, and a record that can't be removed is a CaseError.
     """
     folder = folder.resolve()
     if _overlaps(folder, source.evidence) or _overlaps(folder, source.folder):
@@ -175,7 +201,7 @@ def copy_case(source: Case, folder: Path, name: str, analyst: str, client: str =
         raise CaseError(problem)
     if folder.exists() and any(folder.iterdir()):
         raise CaseError(f"Case folder is not empty: {folder}")
-    folder.mkdir(parents=True, exist_ok=True)
+    _make_folder(folder)
     for file in (MANIFEST_FILE, VERIFICATION_FILE):
         if (source.folder / file).is_file():
             shutil.copy2(source.folder / file, folder / file)

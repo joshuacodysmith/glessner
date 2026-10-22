@@ -9,10 +9,15 @@ detect:
   version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
 handles: ["registry:NTUSER", "registry:USRCLASS"]   # the user hives only
 input: host_dir
+# SBECmd replays a dirty hive's transaction logs when they sit beside it, so the newest ShellBags are read. --nl skips
+# the logs of every hive, but lets it process a dirty hive whose logs were not collected, where it would otherwise stop
+# at that hive. So the runner adds --nl only when a planned hive has no transaction log beside it.
+without_related:
+  - {artifact: registry_log, args: ["--nl"]}
 run:
-  # SBECmd finds every NTUSER.DAT and UsrClass.dat under the host folder and writes one CSV per hive. --nl lets it
-  # process dirty hives whose transaction logs were not collected, as RECmd does. Never -l: that reads this machine.
-  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--nl"]
+  # SBECmd finds every NTUSER.DAT and UsrClass.dat under the host folder and writes one CSV per hive. Never -l: that
+  # reads this machine.
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}"]
   timeout_minutes: 30
 options: []
 # The messages file is written on every run; a host whose hives hold no ShellBags still gets header-only CSVs.

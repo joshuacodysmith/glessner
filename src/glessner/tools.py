@@ -79,6 +79,14 @@ class ToolSpec:
     # With empty_result: output simply absent means nothing to report, not a failure. The run is ok, with no events and
     # the empty_result as a note, as for WxTCmd on an empty Timeline. Without it, such a run fails with the reason.
     empty_ok: bool = False
+    # The name patterns a host_dir tool reads in the host's folder, such as LECmd's *.lnk. Intake identifies a file by its
+    # signature, so one named otherwise is an input the tool never opens, and the run notes the files it left out.
+    selects: tuple[str, ...] = ()
+    # Arguments a tool takes when a planned input has none of an artifact beside it, as `related` names files beside an
+    # input: SBECmd takes --nl when a hive has no transaction log (registry_log) beside it, a file in its folder named
+    # for it with .log in its extension. The run notes it. Without the arguments the tool reads those files, and the
+    # run's evidence check covers them.
+    without_related: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -229,6 +237,8 @@ def _parse_spec(data: dict, source: str) -> ToolSpec:
             related=tuple(data.get("related") or ()),
             run_in_run_folder=bool(data.get("run_in_run_folder", False)),
             empty_ok=bool(data.get("empty_ok", False)),
+            selects=tuple(data.get("selects") or ()),
+            without_related=tuple(data.get("without_related") or ()),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError(f"Registry file {source} is missing a field or is malformed: {exc}") from exc
