@@ -372,7 +372,7 @@ def test_every_write_is_refused_on_a_broken_chain(synthetic_case, tmp_path, caps
     rule_file.write_text(RULE, encoding="utf-8")
     for app, port, _ in serving(case):
         assert app.journal.read_only
-        cookie = login(port, app)
+        session = login(port, app)
         writes = {"/api/mark": {"uids": [uid], "value": "malicious"}, "/api/note": {"uid": uid, "text": "x"},
                   "/api/tag": {"uids": [uid], "add": ["tactic:TA0008"]},
                   "/api/tag_suggestion": {"uids": [uid], "tags": ["tactic:TA0008"], "decision": "dismissed"},
@@ -387,7 +387,7 @@ def test_every_write_is_refused_on_a_broken_chain(synthetic_case, tmp_path, caps
                   "/api/export": {"start": 0, "end": 2**53, "format": "csv", "marks": "all"},
                   "/api/report": {}, "/api/audit_export": {}}
         for path, body in writes.items():
-            res, answer = request(port, "POST", path, cookie=cookie, body=body)
+            res, answer = request(port, "POST", path, session=session, body=body)
             error = json.loads(answer).get("error", "")
             assert res.status == 400 and error.startswith(f"{WRITES}line {line}"), (path, error)
     for argv in (["close", str(case.folder)], ["rule", str(case.folder), "add", str(rule_file)],

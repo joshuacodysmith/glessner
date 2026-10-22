@@ -301,10 +301,10 @@ def test_forget_missing_takes_off_only_cases_whose_folder_is_gone(tmp_path, monk
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     try:
-        cookie = login(port, hub)
-        res, body = request(port, "POST", "/api/start/forget", cookie=cookie, body={})
+        session = login(port, hub)
+        res, body = request(port, "POST", "/api/start/forget", session=session, body={})
         assert res.status == 400 and json.loads(body)["error"] == "Name the case to remove, or all."
-        res, body = request(port, "POST", "/api/start/forget", cookie=cookie, body={"folder": str(tmp_path / "d")})
+        res, body = request(port, "POST", "/api/start/forget", session=session, body={"folder": str(tmp_path / "d")})
         assert res.status == 200 and json.loads(body)["removed"] == 1 and names() == ["Here"]
     finally:
         server.shutdown()
@@ -353,9 +353,9 @@ def test_a_copy_whose_recent_cases_list_can_t_be_written_still_succeeds(syntheti
     assert "Recent cases not updated" in capsys.readouterr().err
 
 
-def wait_job(port, cookie):
+def wait_job(port, session):
     for _ in range(200):
-        job = json.loads(request(port, "GET", "/api/start/job", cookie=cookie)[1])["job"]
+        job = json.loads(request(port, "GET", "/api/start/job", session=session)[1])["job"]
         if job["finished"]:
             return job
         time.sleep(0.05)
@@ -369,42 +369,42 @@ def test_start_page_creates_takes_in_and_opens_a_case(tmp_path):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     try:
-        cookie = login(port, hub)
-        res, body = request(port, "GET", "/", cookie=cookie)
+        session = login(port, hub)
+        res, body = request(port, "GET", "/", session=session)
         assert b"/js/start.js" in body   # no case open: the start page
-        res, body = request(port, "GET", "/api/meta", cookie=cookie)
+        res, body = request(port, "GET", "/api/meta", session=session)
         assert res.status == 409 and json.loads(body)["no_case"]
-        res, body = request(port, "POST", "/api/start/new", cookie=cookie, body={
+        res, body = request(port, "POST", "/api/start/new", session=session, body={
             "name": "Acme", "evidence": str(ev), "case_folder": str(tmp_path / "cases" / "acme"), "tools": "", "host": "",
             "analyst": "  Ana Lyst  "})
         assert res.status == 200
-        job = wait_job(port, cookie)
+        job = wait_job(port, session)
         assert job["opened"] and not job["error"] and job["result"]["files"] == 3
         assert open_case(tmp_path / "cases" / "acme").settings.analyst == "Ana Lyst"   # the analyst name is trimmed
-        meta = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+        meta = json.loads(request(port, "GET", "/api/meta", session=session)[1])
         assert meta["case"] == "Acme" and meta["rows"] == 0
-        res, body = request(port, "GET", "/", cookie=cookie)
+        res, body = request(port, "GET", "/", session=session)
         assert b"/js/main.js" in body   # a case open: its timeline
-        assert b"/js/start.js" in request(port, "GET", "/start", cookie=cookie)[1]
+        assert b"/js/start.js" in request(port, "GET", "/start", session=session)[1]
         # A second case with the same folder is refused at once, not in the job.
-        res, body = request(port, "POST", "/api/start/new", cookie=cookie, body={
+        res, body = request(port, "POST", "/api/start/new", session=session, body={
             "name": "Again", "evidence": str(ev), "case_folder": str(tmp_path / "cases" / "acme")})
         assert res.status == 400 and "not empty" in json.loads(body)["error"]
         # Copy it, then open the copy.
-        res, body = request(port, "POST", "/api/start/copy", cookie=cookie, body={
+        res, body = request(port, "POST", "/api/start/copy", session=session, body={
             "source": str(tmp_path / "cases" / "acme"), "case_folder": str(tmp_path / "cases" / "acme-copy"),
             "name": "Acme copy", "analyst": " "})
         assert res.status == 200
-        job = wait_job(port, cookie)
+        job = wait_job(port, session)
         assert not job["error"] and job["result"] == {"runs": 0, "left_out": []}
         assert open_case(tmp_path / "cases" / "acme-copy").settings.analyst == getpass.getuser()   # none given
         assert open_case(tmp_path / "cases" / "acme-copy").settings.copied_from.startswith(str(tmp_path / "cases" / "acme"))
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie,
+        res, body = request(port, "POST", "/api/start/open", session=session,
                             body={"folder": str(tmp_path / "cases" / "acme-copy")})
         assert json.loads(body)["job"]["kind"] == "open" and json.loads(body)["job"]["name"] == "Acme copy"
-        job = wait_job(port, cookie)
+        job = wait_job(port, session)
         assert not job["error"] and job["opened"] and job["result"] == {"opened": "Acme copy"}
-        info = json.loads(request(port, "GET", "/api/start", cookie=cookie)[1])
+        info = json.loads(request(port, "GET", "/api/start", session=session)[1])
         assert [r["name"] for r in info["recent"][:2]] == ["Acme copy", "Acme"] and info["open_case"]["name"] == "Acme copy"
     finally:
         server.shutdown()
@@ -431,25 +431,25 @@ def test_a_request_from_a_page_showing_another_open_is_refused_before_it_runs(sy
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     try:
-        cookie = login(port, hub)
-        first = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+        session = login(port, hub)
+        first = json.loads(request(port, "GET", "/api/meta", session=session)[1])
         uid = hub.app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' ORDER BY ts_us").fetchone()[0]
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(copy.folder)})
-        assert res.status == 200 and wait_job(port, cookie)["result"] == {"opened": "Copy"}
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": str(copy.folder)})
+        assert res.status == 200 and wait_job(port, session)["result"] == {"opened": "Copy"}
         stale = {CASE_HEADER: first["case_id"]}
         for method, path, body in (("POST", "/api/mark", {"uids": [uid], "value": "malicious"}),
                                    ("POST", "/api/note", {"uid": uid, "text": "from the first tab"}),
                                    ("POST", "/api/setting", {"name": "event_threshold", "value": 1000}),
                                    ("GET", "/api/lanes?groupby=host", None), ("GET", "/api/meta", None)):
-            res, answer = request(port, method, path, cookie=cookie, body=body, headers=stale)
+            res, answer = request(port, method, path, session=session, body=body, headers=stale)
             assert res.status == 409 and json.loads(answer) == {
                 "error": "Another case is open now: Copy. Reload the page to work on it; this page's request did nothing.",
                 "case_changed": True}, path
         state = replay(copy.folder / "journal.jsonl")
         assert (state.marks, state.notes, state.settings) == ({}, {}, {})
-        now = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])   # a page loading afresh
+        now = json.loads(request(port, "GET", "/api/meta", session=session)[1])   # a page loading afresh
         assert now["case"] == "Copy" and now["case_id"] != first["case_id"]
-        res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [uid], "value": "malicious"},
+        res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": [uid], "value": "malicious"},
                          headers={CASE_HEADER: now["case_id"]})
         assert res.status == 200 and replay(copy.folder / "journal.jsonl").marks[uid].value == "malicious"
         assert replay(synthetic_case.folder / "journal.jsonl").marks == {}
@@ -472,14 +472,14 @@ def test_a_page_whose_case_was_opened_again_is_told_so(synthetic_case):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     try:
-        cookie = login(port, hub)
-        first = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+        session = login(port, hub)
+        first = json.loads(request(port, "GET", "/api/meta", session=session)[1])
         uid = hub.app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' ORDER BY ts_us").fetchone()[0]
-        res, _ = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(synthetic_case.folder)})
-        assert res.status == 200 and wait_job(port, cookie)["opened"]
+        res, _ = request(port, "POST", "/api/start/open", session=session, body={"folder": str(synthetic_case.folder)})
+        assert res.status == 200 and wait_job(port, session)["opened"]
         for method, path, body in (("POST", "/api/mark", {"uids": [uid], "value": "malicious"}),
                                    ("GET", "/api/lanes?groupby=host", None)):
-            res, answer = request(port, method, path, cookie=cookie, body=body, headers={CASE_HEADER: first["case_id"]})
+            res, answer = request(port, method, path, session=session, body=body, headers={CASE_HEADER: first["case_id"]})
             assert res.status == 409 and json.loads(answer) == {
                 "error": "This case was opened again in another tab or window. Reload the page to go on; this page's "
                          "request did nothing.", "case_changed": True}, path
@@ -584,16 +584,16 @@ def test_a_request_running_on_the_old_case_answers_after_a_switch(synthetic_case
 
     monkeypatch.setitem(server.GET_ROUTES, "/api/marks", slow_marks)
     try:
-        cookie = login(port, hub)
+        session = login(port, hub)
 
         def ask():
-            answers.append(request(port, "GET", "/api/marks", cookie=cookie))
+            answers.append(request(port, "GET", "/api/marks", session=session))
 
         asking = threading.Thread(target=ask)
         asking.start()
         assert started.wait(10)
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(copy.folder)})
-        assert res.status == 200 and wait_job(port, cookie)["result"] == {"opened": "Copy"}   # not held up by the request
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": str(copy.folder)})
+        assert res.status == 200 and wait_job(port, session)["result"] == {"opened": "Copy"}   # not held up by the request
         release.set()
         asking.join(10)
         (res, body), = answers
@@ -629,8 +629,8 @@ def test_a_request_that_read_the_old_app_before_a_switch_is_passed_to_the_new_on
 
     monkeypatch.setattr(App, "enter", enter_after_a_switch)
     try:
-        cookie = login(port, hub)
-        res, body = request(port, "GET", "/api/meta", cookie=cookie)
+        session = login(port, hub)
+        res, body = request(port, "GET", "/api/meta", session=session)
         assert switched and res.status == 200 and json.loads(body)["case"] == "Copy"   # not 500
     finally:
         server_.shutdown()
@@ -737,19 +737,20 @@ def test_opening_a_case_is_a_job_the_page_can_poll(synthetic_case, monkeypatch):
 
     monkeypatch.setattr(Hub, "open", slow)
     try:
-        cookie = login(port, hub)
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(synthetic_case.folder)})
+        session = login(port, hub)
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": str(synthetic_case.folder)})
         job = json.loads(body)["job"]
         assert res.status == 200 and inside.wait(10)
         assert (job["kind"], job["name"], job["stage"], job["finished"], job["opened"]) == (
             "open", synthetic_case.settings.name, "Opening", False, False)
         assert hub.app is None   # not open yet
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(synthetic_case.folder)})
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": str(synthetic_case.folder)})
         assert res.status == 400 and "Still working on" in json.loads(body)["error"]
         release.set()
-        job = wait_job(port, cookie)
+        job = wait_job(port, session)
         assert job["opened"] and not job["error"] and hub.app.case.settings.name == synthetic_case.settings.name
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(synthetic_case.folder / "nope")})
+        missing = str(synthetic_case.folder / "nope")
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": missing})
         assert res.status == 400 and json.loads(body)["error"]
     finally:
         release.set()

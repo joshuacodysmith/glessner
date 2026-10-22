@@ -150,26 +150,26 @@ def test_audit_markdown_escapes_event_text(synthetic_case):
 
 def test_audit_api_undo_and_export(running):
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     uids = [u for (u,) in app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND event_code = '4624'")
             .fetchall()]
-    request(port, "POST", "/api/mark", cookie=cookie, body={"uids": uids, "value": "malicious"})
+    request(port, "POST", "/api/mark", session=session, body={"uids": uids, "value": "malicious"})
     lanes = lambda: {tuple(lane["keys"])
-                     for lane in json.loads(request(port, "GET", "/api/lanes?groupby=mark", cookie=cookie)[1])["lanes"]}
+                     for lane in json.loads(request(port, "GET", "/api/lanes?groupby=mark", session=session)[1])["lanes"]}
     assert ("Malicious",) in lanes()
-    trail = json.loads(request(port, "GET", "/api/audit", cookie=cookie)[1])
+    trail = json.loads(request(port, "GET", "/api/audit", session=session)[1])
     seq = trail["rows"][0]["seq"]
     assert trail["rows"][0]["undoable"] and trail["rows"][0]["text"] == f"Marked {len(uids)} events Malicious"
-    plan = json.loads(request(port, "GET", f"/api/undo_plan?seq={seq}", cookie=cookie)[1])
+    plan = json.loads(request(port, "GET", f"/api/undo_plan?seq={seq}", session=session)[1])
     assert (plan["changed"], plan["kept"]) == (len(uids), 0)
-    res, body = request(port, "POST", "/api/undo", cookie=cookie, body={"seq": seq, "note": "slip"})
+    res, body = request(port, "POST", "/api/undo", session=session, body={"seq": seq, "note": "slip"})
     assert res.status == 200 and json.loads(body)["changed"] == len(uids)
     assert ("Malicious",) not in lanes()   # the marks table follows the undo
-    res, body = request(port, "POST", "/api/undo", cookie=cookie, body={"seq": seq})
+    res, body = request(port, "POST", "/api/undo", session=session, body={"seq": seq})
     assert res.status == 400 and "already undone" in json.loads(body)["error"]
-    events = json.loads(request(port, "GET", f"/api/audit_events?seq={seq}", cookie=cookie)[1])
+    events = json.loads(request(port, "GET", f"/api/audit_events?seq={seq}", session=session)[1])
     assert events["total"] == len(uids) and all(e["mark"] != "Malicious" for e in events["events"])
-    res, body = request(port, "POST", "/api/audit_export", cookie=cookie, body={})
+    res, body = request(port, "POST", "/api/audit_export", session=session, body={})
     path = Path(json.loads(body)["path"])
     assert path.exists() and "correction of an accident" in path.read_text(encoding="utf-8")
 

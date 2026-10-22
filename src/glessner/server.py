@@ -1,11 +1,13 @@
 """Local HTTP server for the timeline page and its JSON API.
 
-Security: listens on 127.0.0.1 only. The launch link carries a
-random session token, which the server swaps for an HttpOnly, SameSite=Strict cookie. Every
-other request needs that cookie, and a Host header naming this server, which blocks DNS
-rebinding. A POST from another origin is refused by its Origin header, and a GET by the browser's
-Sec-Fetch-Site header, since a page on another 127.0.0.1 port gets the cookie sent with its requests.
-Pages get a Content-Security-Policy that forbids external requests.
+Security: listens on 127.0.0.1 only. The start link carries a token that works once: the page trades it for the run's
+session (POST /api/session) and keeps the session for this server's address and port. The page sends the session in a
+header, X-Glessner-Session, on every API request, and the server answers no other API request. A browser adds no header
+of its own accord, so another web server on 127.0.0.1 never receives the session as it would a cookie, and a page
+served from one can't make the browser send it. Every request needs a Host header naming this server, which blocks DNS
+rebinding. A POST from another origin is refused by its Origin header, and a GET by the browser's Sec-Fetch-Site header.
+The page's own files need no session, since they hold no case data. Pages get a Content-Security-Policy that forbids
+external requests.
 """
 
 from __future__ import annotations
@@ -22,14 +24,13 @@ import time
 import traceback
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import duckdb
 
-from . import attack
+from . import attack, heads
 from .analysis import (
     BUILTIN_SOURCES,
     MARK_LABELS,
@@ -57,8 +58,9 @@ from .audit import (
 from .case import Case, CaseError, open_case, upgrade
 from .caveats import CAVEAT_COLUMNS, caveat_for, caveats_for
 from .clock import MEASURED, alignment, in_segment
-from .events import BIGINT_COLUMNS, connect, id_table, transaction, well_formed
+from .events import BIGINT_COLUMNS, connect, id_table, insert_columns, transaction, well_formed
 from .export import (
+    REPORT_CHECK,
     WHOLE_CASE,
     export_path,
     export_timeline,
@@ -84,7 +86,8 @@ from .imports import (
     saved_mappings,
 )
 from .imports import PRESETS as IMPORT_PRESETS
-from .intake import add_new, current_entries, evidence_checks, manifest_hashes, read_manifest
+from .intake import Check as EvidenceCheck
+from .intake import add_new, check_files, current_entries, evidence_checks, manifest_hashes, read_manifest, sha256_file
 from .journal import (
     REPLAY_ERRORS,
     SYSTEM,
@@ -118,6 +121,7 @@ from .queries import (
     event_keys,
     event_pairs,
     fit_range,
+    flagged_uids,
     investigate,
     lanes,
     listed_events,
@@ -176,10 +180,8 @@ STATIC.update({f"/js/{p.name}": (f"js/{p.name}", "text/javascript; charset=utf-8
                for p in sorted((STATIC_DIR / "js").glob("*.js"))})
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-# The session cookie's name carries the port (cookie_name), since a browser keeps cookies by host and not by port: two runs
-# at once, one on PREFERRED_PORT and one on a free port, would share one name, and the second's link would make the first
-# refuse its own tab as an earlier run. A tab whose run is gone still sends the old token under this run's name.
-COOKIE = "glessner_session"
+SESSION_HEADER = "X-Glessner-Session"   # the run's session (Hub.session), which the page sends on every API request
+SESSION_PATH = "/api/session"           # where the page trades the start link's token for the session
 CASE_HEADER = "X-Glessner-Case"   # the case open, App.case_id, as the page last read it from /api/meta
 # Measured on the Szechuan case: canvas drawing costs about 0.6 ms per 1,000 events; query plus
 # transfer dominates (67,333 events: 512 ms end to end; 77,016: 608 ms). 50,000 keeps a refresh near 0.5 s.
@@ -200,11 +202,14 @@ REOPEN_WAIT_SECONDS = 5   # how long Hub.open waits for a retired App of the sam
 # dynamic range, 49152 and up, and outside the ranges `netsh interface ipv4 show excludedportrange protocol=tcp` listed
 # when it was chosen. When another program holds it, serve_hub falls back to a free port.
 PREFERRED_PORT = 47613
-# The answer to an API request whose session cookie is missing or not this run's: a tab left open from an earlier run
+# The answer to an API request whose session is missing or not this run's: a tab left open from an earlier run
 # reaches the new run's server on the same port. JSON, so the page can show it as it shows the refusal of a request
 # meant for another case.
 STALE_SESSION = ("This page is from an earlier run of glessner serve, or has no session. Open the link the new run "
                  "printed; this page's request did nothing.")
+# The answer to a start link's token that was spent already or is not the newest (Hub.spend)
+LINK_USED = ("This link was used already: each start link opens the app once. Use the tab it opened, or restart "
+             "glessner serve for a new link.")
 MAX_OFFSET_SECONDS = 86_400
 # A host's clock result as the event page gives it
 EVENT_CLOCK = ("state", "reference", "seconds", "skew_seconds", "skew_text", "display", "basis_text", "inliers",
@@ -218,7 +223,7 @@ class App:
     take it only briefly, to fill a cache or name a search's saved matches, and only those wait behind a long holder:
     a search not yet saved waited 1.8 s behind an undo of 200,000 events."""
 
-    def __init__(self, case: Case, token: str | None = None, *, client: str = "server", for_work: bool = False,
+    def __init__(self, case: Case, session: str | None = None, *, client: str = "server", for_work: bool = False,
                  report=None):
         """`for_work` for the server's case open (Hub.open), which upgrades an older case format and journals the build
         when it differs from the newest the journal names. The command line's commands open the case
@@ -229,11 +234,14 @@ class App:
         none of them, and the journal then refuses every write with the reason (Journal.read_only). Last, any run still
         recorded as running is marked failed (toolbox.close_interrupted). `report(stage, done,
         total)`, when given, gets the upgrade's stages and then "Opening" (the start page's open job)."""
-        self.token = token or secrets.token_urlsafe(32)
+        self.session = session or secrets.token_urlsafe(32)
         # This open's ID, which /api/meta gives the page and the page sends with each request, so a page whose case
         # another tab has since replaced is refused rather than written into the case open now
         self.case_id = secrets.token_hex(8)
         self.lock = threading.RLock()   # reentrant, so an alignment holds it across its rebuild
+        # One evidence re-hash at a time, so two reports' hashing and their lines in verification.jsonl don't interleave.
+        # Held only for the re-hash, which takes no other lock, and never while taking self.lock.
+        self.check_lock = threading.Lock()
         # The requests running on this App (Handler._api), so a switch of case closes its connection once they end.
         # The count has its own lock, held only to change it, never across a request's work.
         self.counting = threading.Lock()
@@ -283,6 +291,7 @@ class App:
         self.job = None   # the tool running from the Tools page, if any
         self.anchors: dict = {}   # the events the Event page read last, for the counts of its pivots (see anchor)
         self.checks_cache: tuple[tuple[int, int] | None, dict] | None = None   # evidence_checks, by the log's size and time
+        self.trail_cache: tuple[tuple, tuple[Check, dict | None]] | None = None   # _trail_check, by _trail_key
 
     def after_job(self, job) -> None:
         """When a Tools page job ends, also partway through: if any of its steps committed a load, the
@@ -319,8 +328,7 @@ class App:
             self.inflight -= 1
             last = self.retired and self.inflight == 0
         if last:
-            self.con.close()
-            self.closed.set()
+            self._close()
 
     def retire(self) -> None:
         """Another case is open now. The connection closes at once when no request is running on the App, and otherwise
@@ -329,7 +337,25 @@ class App:
             self.retired = True
             idle = self.inflight == 0
         if idle:
+            self._close()
+
+    def unretire(self) -> bool:
+        """Take back retire() for an App whose connection is still open, which then takes requests again. False once
+        its close has begun: it was retired with no request running, or its last request has left."""
+        with self.counting:
+            if self.retired and self.inflight == 0:
+                return False
+            self.retired = False
+            return True
+
+    def _close(self) -> None:
+        """Close the connection and set `closed`, which a reopen of the case waits on, even when the close raises: an
+        App whose event stayed unset would make every later open of its case wait and then refuse."""
+        try:
             self.con.close()
+        except duckdb.Error as exc:   # for the console `serve` runs in
+            print(f"Closing the events database of {self.case.settings.name} failed: {exc}", file=sys.stderr)
+        finally:
             self.closed.set()
 
     def refresh_identity(self, events_changed: bool = False) -> None:
@@ -464,11 +490,14 @@ class App:
 
 
 class Hub:
-    """The server across cases: the session token, the open case's App, if any, and the start page's job."""
+    """The server across cases: the run's session, the start link's token, the open case's App, if any, and the start
+    page's job."""
 
     def __init__(self, case: Case | None = None, report=None):
         """`report` gets the open's stages, as App's does (the serve command's lines)."""
-        self.token = secrets.token_urlsafe(32)
+        self.session = secrets.token_urlsafe(32)   # what the page sends in SESSION_HEADER; kept across cases
+        self.token: str | None = None              # the start link's token while it is unspent (new_token)
+        self.token_lock = threading.Lock()
         self.app: App | None = None
         self.job = None   # a case being created or copied from the start page
         # Each open's ID (App.case_id) and its case folder, so a page refused for naming an earlier open learns
@@ -480,30 +509,68 @@ class Hub:
         if case is not None:
             self.open(case, report)
 
+    def new_token(self) -> str:
+        """The token for a new start link, which replaces any unspent one: only the newest link works, and it works
+        once."""
+        with self.token_lock:
+            self.token = secrets.token_urlsafe(32)
+            return self.token
+
+    def spend(self, token) -> bool:
+        """Whether `token` is the unspent start link's, which it then spends. A wrong token spends nothing. Compared as
+        bytes: compare_digest refuses text with characters outside ASCII."""
+        sent = token.encode(errors="replace") if isinstance(token, str) else b""
+        with self.token_lock:
+            if self.token is None or not secrets.compare_digest(sent, self.token.encode()):
+                return False
+            self.token = None
+            return True
+
     def open(self, case: Case, report=None) -> App:
         """Make a case the open one, retiring the one before; refused while a tool runs in it. The old App's connection
         stays open until its requests in flight end (App.retire), so each finishes in the case it began in. Closing
         it at once would answer a mark or note in flight with a 500; closing it under the App's lock would still answer
         a request that read the old App before the switch with a 500, and the switch would wait for any request
-        holding that lock, an import's whole length. Opening a case whose earlier App is
-        still closing waits for that App, and refuses after REOPEN_WAIT_SECONDS; a different case never waits."""
-        with self.lock:
-            if self.app and self.app.job and not self.app.job.finished:
-                raise ValueError(f"{self.app.job.tool} is still running in {self.app.case.settings.name}.")
-            # Two Apps of one case never run at once: they would share one DuckDB instance, and their writes collide
-            # (transaction conflicts answered 500), and a reopen while the old connection is closing fails on the
-            # file. A different case never waits. Waits briefly, then refuses, since a request
-            # such as an import can hold the old App for minutes.
-            self.retired = [r for r in self.retired if not r.closed.is_set()]
-            for r in self.retired:
-                if r.case.folder == case.folder and not r.closed.wait(REOPEN_WAIT_SECONDS):
+        holding that lock, an import's whole length. A different case never waits.
+
+        Two Apps of one case never run at once: they would share one DuckDB instance, and their writes collide
+        (transaction conflicts answered 500), and a reopen while the old connection is closing fails on the file. So a
+        case that is open already, or whose earlier App is still closing, is built only once every earlier App of it has
+        closed. The case open is taken out of service first, and requests meanwhile are answered "No case is open."
+        The waits run outside the hub's lock, so an open of another case isn't held up, and together last at most
+        REOPEN_WAIT_SECONDS, since a request such as an import can hold the old App for minutes. When they run out
+        the open is refused and the case that was open is put back, unless its connection has begun to close or another
+        case was opened meanwhile. A reopen whose new App fails to build leaves no case open; an open of a different case
+        builds its App before it retires the old one."""
+        deadline = time.monotonic() + REOPEN_WAIT_SECONDS
+        while True:
+            live = None
+            with self.lock:
+                if self.app and self.app.job and not self.app.job.finished:
+                    raise ValueError(f"{self.app.job.tool} is still running in {self.app.case.settings.name}.")
+                self.retired = [r for r in self.retired if not r.closed.is_set()]
+                if self.app is not None and self.app.case.folder == case.folder:
+                    live, self.app = self.app, None
+                    self.retired.append(live)
+                waiting = [r for r in self.retired if r.case.folder == case.folder]
+                if not waiting:
+                    old, self.app = self.app, App(case, self.session, for_work=True, report=report)
+                    app = self.app
+                    self.opened[app.case_id] = app.case.folder
+                    if old is not None:
+                        self.retired.append(old)
+                    break
+            if live is not None:
+                live.retire()
+            for earlier in waiting:
+                if not earlier.closed.wait(max(0.0, deadline - time.monotonic())):
+                    if live is not None:
+                        with self.lock:
+                            if self.app is None and live.unretire():
+                                self.retired.remove(live)
+                                self.app = live
                     raise ValueError(f"{case.settings.name} is still finishing a request from its earlier open. "
                                      "Try again in a moment.")
-            old, self.app = self.app, App(case, self.token, for_work=True, report=report)
-            app = self.app
-            self.opened[app.case_id] = app.case.folder
-            if old is not None:
-                self.retired.append(old)
         if old is not None:
             old.retire()
         app.remember()
@@ -518,11 +585,6 @@ class BodyError(Exception):
         self.code = code
 
 
-def cookie_name(port: int) -> str:
-    """The session cookie's name for a run on `port`, such as glessner_session_47613."""
-    return f"{COOKIE}_{port}"
-
-
 def make_handler(hub: Hub, port_ref: list[int]):
     class Handler(BaseHTTPRequestHandler):
         """Answers HTTP/1.1, so a page's requests share the few connections the browser keeps open to the server. A new
@@ -530,7 +592,7 @@ def make_handler(hub: Hub, port_ref: list[int]):
         requests, and a run of the browser tests about 5,000, a large share of the dynamic port range the whole machine
         shares. When the range runs out, Windows refuses the browser a local port (net::ERR_NO_BUFFER_SPACE; Tcpip event
         4231). Every answer has a Content-Length, an answer after which the connection can't carry another request closes
-        it, and the Host, cookie, Origin or Sec-Fetch-Site, and case checks run on every request, not once per
+        it, and the Host, session, Origin or Sec-Fetch-Site, and case checks run on every request, not once per
         connection. A request that isn't HTTP/1.1 closes, since its answer can't say it stays open."""
 
         server_version = "glessner"
@@ -554,7 +616,7 @@ def make_handler(hub: Hub, port_ref: list[int]):
         def handle_expect_100(self):
             """Send "100 Continue" only to a request do_POST would take, so the checks come before a body is invited (up to
             MAX_BODY). One that fails them is refused now, without its body, and the connection closes (RFC 9110, 10.1.1)."""
-            if not (self._host_ok() and self._cookie_ok() and self._origin_ok()):
+            if not (self._host_ok() and self._origin_ok() and (self._exchange() or self._session_ok())):
                 self.close_connection = True
                 self._text(403, "Forbidden.")
                 return False
@@ -568,23 +630,14 @@ def make_handler(hub: Hub, port_ref: list[int]):
                 return self._text(403, "Bad Host header.")
             if not self._site_ok():
                 return self._text(403, "Forbidden.")
-            query = parse_qs(url.query)
-            if url.path == "/" and len(sent := query.get("token", [])) == 1 and self._is_token(sent[0]):
-                self.send_response(303)
-                self.send_header("Set-Cookie", f"{cookie_name(port_ref[0])}={hub.token}; HttpOnly; SameSite=Strict; Path=/")
-                self.send_header("Location", "/")
-                self.send_header("Content-Length", "0")   # without it an HTTP/1.1 client reads until the connection closes
-                if self.close_connection:
-                    self.send_header("Connection", "close")
-                self.end_headers()
-                return
-            if not self._cookie_ok():
-                if url.path.startswith("/api/"):
-                    return self._json(403, {"error": STALE_SESSION, "stale_session": True})
-                return self._text(403, "Open the link that `glessner serve` printed.")
-            if url.path in STATIC:
+            if url.path in STATIC:   # the page's own files, whatever the query: the start link's token is read by the page
                 name, ctype = STATIC["/start" if url.path == "/" and hub.app is None else url.path]
                 return self._send(200, ctype, (STATIC_DIR / name).read_bytes())
+            if not url.path.startswith("/api/"):
+                return self._text(404, "Not found.")
+            if not self._session_ok():
+                return self._json(403, {"error": STALE_SESSION, "stale_session": True})
+            query = parse_qs(url.query)
             if url.path in START_GET_ROUTES:
                 return self._api(START_GET_ROUTES[url.path], query, hub)
             route = GET_ROUTES.get(url.path)
@@ -596,12 +649,12 @@ def make_handler(hub: Hub, port_ref: list[int]):
             url = urlparse(self.path)
             if not (self._host_ok() and self._origin_ok()):
                 return self._refuse(403, "Forbidden.")
-            if not self._cookie_ok():
+            if not (self._exchange() or self._session_ok()):
                 return self._refuse(403, "Forbidden.", {"error": STALE_SESSION, "stale_session": True})
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 return self._refuse(415, "Send JSON.")
             route = POST_ROUTES.get(url.path) or START_POST_ROUTES.get(url.path)
-            if route is None:
+            if route is None and not self._exchange():
                 return self._refuse(404, "Not found.")
             try:
                 body = self._read_json()
@@ -609,6 +662,10 @@ def make_handler(hub: Hub, port_ref: list[int]):
                 return self._json(exc.code, {"error": str(exc)})
             except (ConnectionAbortedError, ConnectionResetError):
                 return   # the client went away while sending
+            if self._exchange():
+                if hub.spend(body.get("token")):
+                    return self._json(200, {"session": hub.session})
+                return self._json(403, {"error": LINK_USED, "link_used": True})
             self._api(route, body, hub if url.path in START_POST_ROUTES else None)
 
         def _api(self, route, arg, target=None):
@@ -619,9 +676,11 @@ def make_handler(hub: Hub, port_ref: list[int]):
             sends it on every request once /api/meta has named the open. A page whose case was opened again, from
             another tab, is told so, not that another case is open. A case route counts itself on the App it runs on
             (App.enter), which keeps that App's connection open until the route ends though a switch of case has
-            published another meanwhile; an App already retired is passed over for the hub's current one."""
+            published another meanwhile; an App already retired is passed over for the hub's current one. The
+            answer is sent after the request leaves the App, so a retired App closes when its route ends and not
+            when the client has read the answer."""
             if target is not None:
-                return self._answer(route, arg, target)
+                return self._json(*self._run(route, arg, target))
             while True:
                 app = hub.app   # read once, so the check and the route see the same App
                 if app is None:
@@ -632,26 +691,30 @@ def make_handler(hub: Hub, port_ref: list[int]):
                 sent = self.headers.get(CASE_HEADER)
                 if sent is not None and sent != app.case_id:
                     again = sent in hub.opened and hub.opened[sent] == app.case.folder
-                    return self._json(409, {"error": "This case was opened again in another tab or window. Reload the "
-                                                     "page to go on; this page's request did nothing." if again else
-                                                     f"Another case is open now: {app.case.settings.name}. Reload "
-                                                     "the page to work on it; this page's request did nothing.",
-                                            "case_changed": True})
-                return self._answer(route, arg, app)
+                    code, payload = 409, {"error": "This case was opened again in another tab or window. Reload the "
+                                                   "page to go on; this page's request did nothing." if again else
+                                                   f"Another case is open now: {app.case.settings.name}. Reload "
+                                                   "the page to work on it; this page's request did nothing.",
+                                          "case_changed": True}
+                else:
+                    code, payload = self._run(route, arg, app)
             finally:
                 app.leave()
+            self._json(code, payload)
 
-        def _answer(self, route, arg, target):
+        def _run(self, route, arg, target) -> tuple[int, dict]:
+            """Run a route and return the status and the body to answer with: 200 and its result with the time it took,
+            400 and the error for a refusal the page can show, or 500 and the error for a fault."""
             t0 = time.perf_counter()
             try:
                 result = route(target, arg)
             except (QueryError, JournalError, ValueError, KeyError, CaseError) as exc:
-                return self._json(400, {"error": str(exc)})
+                return 400, {"error": str(exc)}
             except Exception as exc:   # noqa: BLE001  (a fault still gets an answer the page can show)
                 traceback.print_exc()   # for the console `serve` runs in
-                return self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+                return 500, {"error": f"{type(exc).__name__}: {exc}"}
             result["server_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-            self._json(200, result)
+            return 200, result
 
         def _length(self) -> int:
             """_body_length. A length it refuses leaves the body unread, so the connection closes after the answer: kept
@@ -710,20 +773,21 @@ def make_handler(hub: Hub, port_ref: list[int]):
         def _host_ok(self) -> bool:
             return self.headers.get("Host", "") in (f"127.0.0.1:{port_ref[0]}", f"localhost:{port_ref[0]}")
 
-        def _cookie_ok(self) -> bool:
-            cookie = SimpleCookie(self.headers.get("Cookie", ""))
-            name = cookie_name(port_ref[0])
-            return name in cookie and self._is_token(cookie[name].value)
+        def _session_ok(self) -> bool:
+            """Whether the request carries this run's session in SESSION_HEADER. Compared as bytes: compare_digest
+            refuses text with characters outside ASCII."""
+            return secrets.compare_digest(self.headers.get(SESSION_HEADER, "").encode(), hub.session.encode())
 
-        def _is_token(self, value: str) -> bool:
-            # Compared as bytes: compare_digest refuses text with characters outside ASCII
-            return secrets.compare_digest(value.encode(), hub.token.encode())
+        def _exchange(self) -> bool:
+            """Whether the request is the page's trade of the start link's token for the session, the one POST that
+            carries no session."""
+            return urlparse(self.path).path == SESSION_PATH
 
         def _site_ok(self) -> bool:
             """Whether the browser sent the request from this server's own pages, or from a link typed or opened from
-            the command line (Sec-Fetch-Site same-origin or none). A page on another 127.0.0.1 port is same-site, so the
-            cookie goes with its <img> or no-cors fetch, which sends no Origin. A client other than a browser sends no
-            Sec-Fetch-Site and passes."""
+            the command line (Sec-Fetch-Site same-origin or none). A page on another 127.0.0.1 port is same-site and not
+            same-origin, so its requests are refused here, though it can't read this page's session: it sits in storage
+            the other origin has no access to. A client other than a browser sends no Sec-Fetch-Site and passes."""
             return self.headers.get("Sec-Fetch-Site", "none") in ("same-origin", "none")
 
         def _origin_ok(self) -> bool:
@@ -797,7 +861,7 @@ def api_meta(app: App, query: dict) -> dict:
             "hosts": [vars(h) for h in app.identity.hosts.values()], "identity_conflicts": app.identity.conflicts,
             "outside_sources": app.outside, "event_threshold": app.event_threshold, "orphan_marks": app.orphans,
             "time_window_seconds": app.time_window_seconds, "pivot_windows": app.pivot_windows, "build": build_id(),
-            "analyst": app.case.settings.analyst,
+            "analyst": app.case.settings.analyst, "max_mark_targets": MAX_MARK_TARGETS,
             "time_zones": app.journal.state.settings.get("time_zones", []),
             "tactics": [{"id": tid, "name": name} for tid, name, _ in TACTICS],
             "clock_alignment": alignment(list(app.identity.hosts.values())),
@@ -1022,11 +1086,33 @@ def _event_names(app: App, uids: set[str]) -> dict[str, str]:
     return {uid: name for uid, (name, _) in _event_facts(app, uids).items()}
 
 
+def _trail_key(app: App) -> tuple | None:
+    """What a full check of the journal depends on: the journal file's SHA-256, the head record kept outside the case,
+    the lines the state left out, and the breaks already found. The file's hash changes with an edit of a line that
+    leaves its length as it was; the record, when the head moves; the last two, when the check's reading of the file
+    changes. None when the file can't be read."""
+    journal = app.journal
+    try:
+        digest = sha256_file(journal.path)
+    except OSError:
+        return None
+    problems = tuple((p.get("line"), p["kind"]) for p in journal.problems)
+    return digest, heads.read(journal.path.parent), frozenset(journal._skip), problems
+
+
 def _trail_check(app: App) -> tuple[Check, dict | None]:
     """The journal's full check with its entries, for the trail, undo, and the export: each entry the state couldn't
-    apply, or the trail can't read, is marked, so no reader of the trail stops on a changed line."""
+    apply, or the trail can't read, is marked, so no reader of the trail stops on a changed line. The check re-reads
+    and re-hashes every line, so its result is kept until _trail_key changes, and callers read it without changing
+    it. A result is kept only if the file and the head record are the same after the check as before it."""
+    key = _trail_key(app)
+    if key is not None and app.trail_cache is not None and app.trail_cache[0] == key:
+        return app.trail_cache[1]
     found, record = app.journal.full_check(keep=True)
     found.entries = mark_unreadable(found.entries)
+    after = _trail_key(app)   # the breaks the check found are part of it
+    if key is not None and after is not None and after[:2] == key[:2]:
+        app.trail_cache = (after, (found, record))
     return found, record
 
 
@@ -1089,6 +1175,29 @@ def _entry_events(app: App, entry: dict) -> tuple[int, list[dict]]:
     """How many events an audit entry touched, and the first LISTED_EVENTS of them in time order, of its first 2,000."""
     uids = entry_targets(entry)
     return len(uids), _listed_events(app, "audit_targets", uids[:2000])
+
+
+def _entries_events(app: App, entries: list[dict]) -> dict[int, tuple[int, list[dict]]]:
+    """_entry_events of every entry in `entries`, by seq, from one query over the events and not one per entry, for the
+    trail's export: each entry's first 2,000 targets are matched in one table, and the first LISTED_EVENTS of each
+    entry's events in time order are kept."""
+    targets = {e["seq"]: entry_targets(e) for e in entries}
+    pairs = [(seq, uid) for seq, uids in targets.items() for uid in dict.fromkeys(uids[:2000])]
+    listed: dict[int, list[dict]] = {seq: [] for seq in targets}
+    if pairs:
+        con = app.reader()
+        con.execute("CREATE OR REPLACE TEMP TABLE audit_export_targets (seq BIGINT, v VARCHAR)")
+        insert_columns(con, "audit_export_targets", *zip(*pairs))
+        found = con.execute(
+            f"SELECT t.seq, e.event_uid, {TS} AS ts, e.host, e.event_code, left(e.message, 160), {MARK_EXPR}, e.artifact "
+            f"FROM {BASE_FROM} JOIN audit_export_targets t ON t.v = e.event_uid "
+            f"QUALIFY row_number() OVER (PARTITION BY t.seq ORDER BY {TS} NULLS LAST, e.event_uid) <= {LISTED_EVENTS} "
+            "ORDER BY t.seq, ts NULLS LAST, e.event_uid").fetchall()
+        for r in found:
+            listed[r[0]].append({"uid": r[1], "ts": r[2], "host": r[3], "code": r[4], "msg": r[5], "mark": r[6],
+                                 "artifact": r[7], "shown": True})
+    _mark_info(app, [event for shown in listed.values() for event in shown])
+    return {seq: (len(uids), listed[seq]) for seq, uids in targets.items()}
 
 
 def api_selected(app: App, query: dict) -> dict:
@@ -1191,7 +1300,7 @@ def api_audit_export(app: App, body: dict) -> dict:
     _refuse_on_break(app)
     entries = found.entries
     # An entry of several events lists them under it, as the trail's "N events" does
-    listed = {e["seq"]: _entry_events(app, e) for e in entries if len(entry_targets(e)) > 1}
+    listed = _entries_events(app, [e for e in entries if len(entry_targets(e)) > 1])
     row = journal_row(app.journal, _now(), found, record)
     text = markdown(entries, app.case.settings.name, _event_names(app, single_targets(entries)), listed,
                     head=(found.head, found.seq), chain=row["summary"][0])
@@ -1226,6 +1335,21 @@ def _ts(query: dict) -> int | None:
     return int(ts) if ts else None
 
 
+def _unplaced_message(state, seq: int, uid: str) -> str:
+    """Why an event ID names no event: the upgrade at #seq left it unplaced. It counts the events the ID may have meant as
+    the Case overview lists them (journal.unplaced), which the rekeys after #seq rename, merge, or add to."""
+    n = len(next((u["candidates"] for found in unplaced(state).values() for u in found
+                  if (u["seq"], u["id"]) == (seq, uid)), []))
+    start = (f"This event ID named more than one event before the case format upgrade at #{seq}, so the journal's "
+             "entries naming it were left as written. ")
+    if n >= 2:
+        return start + f"It names none now; the {n} events it may have meant each say so, and the Case overview counts it."
+    if n == 1:
+        return start + "It names none now; the event it may have meant says so, and the Case overview counts it."
+    return start + ("It names none now, and none of the events it may have meant is in the case now; the Case overview "
+                    "counts it.")
+
+
 def api_event(app: App, query: dict) -> dict:
     """An event's page. An earlier ID that a case format upgrade changed, such as one pasted from an export made before
     it, opens the event it names now, which says so; it resolves when the journal named it, as only those IDs are in the
@@ -1237,13 +1361,10 @@ def api_event(app: App, query: dict) -> dict:
     if moved:
         details = event_details(app.reader(), moved[0], app.identity, None)
     if details is None:
-        left = [(r["seq"], len(rekey_map(r, "unplaced")[uid])) for r in app.journal.state.rekeys
-                if isinstance(rekey_map(r, "unplaced").get(uid), list)]
-        if left:   # named more than one event before an upgrade, and names none of them now
-            seq, n = left[0]
-            raise QueryError(f"This event ID named more than one event before the case format upgrade at #{seq}, so the "
-                             f"journal's entries naming it were left as written. It names none now; the {n} events it "
-                             "may have meant each say so, and the Case overview counts it.")
+        state = app.journal.state
+        seqs = [r["seq"] for r in state.rekeys if isinstance(rekey_map(r, "unplaced").get(uid), list)]
+        if seqs:   # named more than one event before an upgrade, and names none of them now
+            raise QueryError(_unplaced_message(state, seqs[0], uid))
         raise QueryError("unknown event")
     if moved:
         details["id_changed"] = {"from": uid, "seqs": moved[1]}
@@ -1734,10 +1855,12 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
         targets = list(uids or [])
         if not targets:
             raise QueryError("restore needs uids")
+        _check_decision_size(body, uids, targets, "Restoring", "restore")
         app.journal.append("suggestion_decision", targets=targets, source=source, decision="restored", **consent)
     elif decision == "reject":
         targets = list(uids) if uids or confirmed is not None else [u for group in pending.values() for u in group]
         note = str(body.get("note") or "").strip()   # a Reject's note, which the trail and the Event page show
+        _check_decision_size(body, uids, targets, "Rejecting", "reject")
         if targets:
             app.journal.append("suggestion_decision", targets=targets, source=source, decision="rejected",
                                **({"note": note} if note else {}), **consent)
@@ -1746,11 +1869,8 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
         chosen = {value: [u for u in group if wanted is None or u in wanted] for value, group in pending.items()}
         total = sum(map(len, chosen.values()))
         if total > MAX_MARK_TARGETS:   # as a mark is capped; each accept is a mark
-            fewer = ("Group the suggestions another way, by rule, host, account, or event ID, and accept smaller groups."
-                     if "group" in body else "Accept fewer at a time." if uids else
-                     "Accept them a group at a time from the source's Suggestions page.")
             raise QueryError(f"Accepting these would mark {total:,} events, more than the {MAX_MARK_TARGETS:,} a mark "
-                             f"can hold. {fewer}")
+                             f"can hold. {_fewer(body, uids, 'accept')}")
         # The analyst's own note follows the fixed text. A source is a rule ID,
         # which holds no colon or space, or a built-in source's name, so the first ": " ends it.
         typed = str(body.get("note") or "").strip()
@@ -1765,15 +1885,42 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
     return len(targets), skipped
 
 
+def _fewer(body: dict, uids, verb: str) -> str:
+    """What to do about a decision that names too many events, by how the request named them: as a group, as chosen
+    events, or as every pending suggestion of the source."""
+    if "group" in body:
+        return f"Group the suggestions another way, by rule, host, account, or event ID, and {verb} smaller groups."
+    if uids:
+        return f"{verb.capitalize()} fewer at a time."
+    return f"{verb.capitalize()} them a group at a time from the source's Suggestions page."
+
+
+def _check_decision_size(body: dict, uids, targets: list, doing: str, verb: str) -> None:
+    """Refuse, before anything is written, a rejection or a restore naming more events than one journal entry can hold,
+    as an accept's mark is refused."""
+    if len(targets) > MAX_MARK_TARGETS:
+        raise QueryError(f"{doing} these would name {len(targets):,} events, more than the {MAX_MARK_TARGETS:,} one "
+                         f"decision can name. {_fewer(body, uids, verb)}")
+
+
 def api_investigate(app: App, query: dict) -> dict:
     """The To investigate worklist: each Malicious or Suspicious event with who marked it, its Followed up tick
     (`followup`: the entry's seq, at, and who, and `after_mark` when the mark changed after the tick, which the row says),
     and the pivots the page counts beside it (`rows`, pivots.worklist_rows); and each
     suggestion source with its counts, its description, and for one with pending suggestions the events it would act on
-    (`uids`) and the first few of them, which the confirm shows."""
+    (`uids`) and the first few of them, which the confirm shows.
+
+    The marked events come a page at a time, `limit` of them (1 to WORKLIST_PAGE_MAX, WORKLIST_PAGE by default) from
+    `offset`, with `total`, the number of them all, and `followed`, how many of all of them are ticked. The sources'
+    pending events are read for the first page only, which is the one that draws them."""
+    offset, limit = _worklist_page(query)
     con = app.reader()
     state = app.journal.state
-    items = investigate(con)
+    flagged = flagged_uids(con)
+    total = len(flagged)
+    offset = min(offset, total)
+    items = investigate(con, offset, limit)
+    followed = sum(1 for uid in flagged if uid in state.followed)
     for item in items:
         ev = item.pop("event")
         item["rows"] = worklist_rows(ev, app.identity, app.pivot_windows, app.time_window_seconds)
@@ -1782,10 +1929,28 @@ def api_investigate(app: App, query: dict) -> dict:
         item["followup"] = {**tick, "after_mark": bool(mark and mark.seq > tick["seq"])} if tick else None
     _mark_info(app, items)
     payload = _rules_payload(app)
-    for rule in payload["rules"]:
-        if rule.get("pending"):
-            rule.update(pending_source_events(con, rule["id"]))
-    return {"items": items, **payload}
+    if not offset:
+        for rule in payload["rules"]:
+            if rule.get("pending"):
+                rule.update(pending_source_events(con, rule["id"], cap=MAX_MARK_TARGETS))
+    return {"items": items, "total": total, "offset": offset, "limit": limit, "followed": followed, **payload}
+
+
+WORKLIST_PAGE = 200   # the marked events To investigate lists at first, and each time its button adds more
+WORKLIST_PAGE_MAX = 1_000   # the most a request may ask for at once
+
+
+def _worklist_page(query: dict) -> tuple[int, int]:
+    """The offset and limit of a worklist request, refused outside their ranges."""
+    try:
+        offset, limit = int(_one(query, "offset", "0")), int(_one(query, "limit", str(WORKLIST_PAGE)))
+    except ValueError:
+        raise QueryError("offset and limit must be whole numbers") from None
+    if offset < 0:
+        raise QueryError("offset must be 0 or more")
+    if not 1 <= limit <= WORKLIST_PAGE_MAX:
+        raise QueryError(f"limit must be 1 to {WORKLIST_PAGE_MAX:,}")
+    return offset, limit
 
 
 PENDING_LIMIT_MAX = 5_000   # the most events a group lists when the page asks to show a whole group first
@@ -1933,33 +2098,56 @@ def api_export(app: App, body: dict) -> dict:
     return {"path": str(path), "rows": rows, "filter": note, "scope": scope, **_head_after(entry, head)}
 
 
+def _rehash_evidence(app: App) -> tuple[tuple[int, int] | None, EvidenceCheck | None]:
+    """The evidence re-hash a report states, and the manifest's stamp it was made against; no re-hash without a manifest.
+    It runs on the caller's thread under the App's check lock only, so a marking request doesn't wait for the hashing."""
+    stamp = _stamp(app.case.manifest_path)
+    if stamp is None:
+        return None, None
+    with app.check_lock:
+        return stamp, check_files(app.case, reason=REPORT_CHECK)
+
+
 def api_report(app: App, body: dict) -> dict:
-    """The report and its file entry. Under the lock, so nothing it prints, marks, notes, hosts,
-    findings, or the summary, is newer or older than the head it prints, which comes from the journal whose state it
-    reads, after a full check that refuses on a break."""
+    """The report and its file entry. A full check of the journal comes first, outside the case lock, and refuses on a
+    break before any evidence is hashed or recorded. The evidence is then re-hashed, also outside the lock, which a
+    marking request would otherwise wait behind for as long as the hashing takes. Then, under the lock, so nothing it
+    prints, marks, notes, hosts, findings, or the summary, is newer or older than the head it prints, which comes from the
+    journal whose state it reads, after a second full check that refuses on a break made meanwhile. Evidence added while
+    it hashed changes the manifest, so the re-hash is made again under the lock, which only that case waits behind."""
+    app.journal.full_check()
+    _refuse_on_break(app)
     extra, note, filters = _export_filter(app, body)
+    stamp, checked = _rehash_evidence(app)
     with app.lock:
         found, record = app.journal.full_check()
         _refuse_on_break(app)
+        if _stamp(app.case.manifest_path) != stamp:
+            checked = _rehash_evidence(app)[1]
         journal = app.journal
         head = (journal.chain.head, journal.chain.seq)
         row = {**journal_row(journal, _now(), found, record), "head": head[0], "seq": head[1]}
-        path, count = write_report(app.con, app.case, app.identity, app.manifest, journal.state, extra, note, journal=row)
+        path, count = write_report(app.con, app.case, app.identity, app.manifest, journal.state, extra, note, journal=row,
+                                   checked=checked)
         payload = file_payload(app.case, path, kind="report", fmt="md", rows=count,
                                scope={"marks": "flagged"}, filters=filters, head=head)
         entry, after = record_file(journal, payload, path)
     return {"path": str(path), "events": count, "filter": note, **_head_after(entry, after)}
 
 
+PREVIEW_EVENTS = 1_000   # the marked events the report preview lists; Write report lists them all
+
+
 def api_report_preview(app: App, query: dict) -> dict:
     """The report's text as Write report would write it now, without a file, a journal entry, or the evidence re-hash,
-    which the text says. Under the lock, so its head and its state agree as the written report's do."""
+    which the text says, and with the first PREVIEW_EVENTS events of the timeline, which the text says too. Under the
+    lock, so its head and its state agree as the written report's do."""
     extra, note, _ = _export_filter(app, {"filter": _one(query, "filter", "")})
     with app.lock:
         journal = app.journal
         row = {**_journal_row(app), "head": journal.chain.head, "seq": journal.chain.seq}
         text, count = report_text(app.con, app.case, app.identity, app.manifest, journal.state, extra, note, journal=row,
-                                  rehash=False)
+                                  rehash=False, listed=PREVIEW_EVENTS)
     return {"text": text, "events": count, "filter": note}
 
 
@@ -2220,6 +2408,8 @@ def api_import(app: App, body: dict) -> dict:
         check_mapping_name(name)   # before any file's rows are committed
     runs, errors = [], []
     with app.lock:   # one import at a time; the events table changes under every reader
+        if app.job and not app.job.finished:   # a Tools job's load writes the events table too
+            raise ValueError(f"{app.job.tool} is still running; import once it finishes.")
         for path in paths:
             try:
                 r = run_import(app.case, str(path), mapping, _zones(app))
@@ -2380,7 +2570,7 @@ def serve_hub(hub: Hub, port: int | None) -> tuple[ThreadingHTTPServer, Hub, str
     else:
         server = Server(("127.0.0.1", port), handler)
     port_ref[0] = server.server_address[1]
-    return server, hub, f"http://127.0.0.1:{port_ref[0]}/?token={hub.token}"
+    return server, hub, f"http://127.0.0.1:{port_ref[0]}/?token={hub.new_token()}"
 
 
 # ---------- the start page: routes that take the hub, so they work with no case open ----------

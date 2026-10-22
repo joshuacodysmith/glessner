@@ -53,18 +53,18 @@ def test_search_matches_and_the_view_shows_them(synthetic_case):
 
 def test_search_api_and_errors(running):
     app, port, _ = running
-    cookie = login(port, app)
-    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("user:Administrator"), cookie=cookie)
+    session = login(port, app)
+    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("user:Administrator"), session=session)
     out = json.loads(body)
     assert res.status == 200 and out["total"] == len(out["events"]) >= 3 and out["terms"] == ['user is "Administrator"']
     assert out["first"] <= T0 <= out["last"]
-    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("-only"), cookie=cookie)
+    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("-only"), session=session)
     assert res.status == 400 and "isn't excluded" in json.loads(body)["error"]
     # A search in the View is saved when the filter registers, then shown like any value.
-    res, body = request(port, "POST", "/api/filter", cookie=cookie, body={"view": {"values": [{"search": "code:4648"}]}})
+    res, body = request(port, "POST", "/api/filter", session=session, body={"view": {"values": [{"search": "code:4648"}]}})
     fid = json.loads(body)["id"]
     events = json.loads(request(port, "GET", f"/api/view?start={T0 - 3600 * 10**6}&end={T0 + 3600 * 10**6}"
-                                             f"&groupby=mark,host&filter={fid}", cookie=cookie)[1])["events"]
+                                             f"&groupby=mark,host&filter={fid}", session=session)[1])["events"]
     assert [e["code"] for e in events] == ["4648"]
 
 
@@ -252,25 +252,25 @@ def test_a_search_finds_events_loaded_after_it_was_saved(synthetic_case):
 
     window = f"start={T0 - 3600 * 10**6}&end={T0 + 3600 * 10**6}&groupby=host"
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        get = lambda path: json.loads(request(port, "GET", path, cookie=cookie)[1])   # noqa: B023
+        session = login(port, app)
+        get = lambda path: json.loads(request(port, "GET", path, session=session)[1])   # noqa: B023
         found = lambda: get("/api/search?q=194.61.24.102")["total"]   # noqa: B023
         assert found() == 1
-        fid = json.loads(request(port, "POST", "/api/filter", cookie=cookie,
+        fid = json.loads(request(port, "POST", "/api/filter", session=session,
                                  body={"view": {"values": [{"search": "194.61.24.102"}]}})[1])["id"]
         assert len(get(f"/api/view?{window}&filter={fid}")["events"]) == 1
         load_archive(synthetic_case, 7)
         app.refresh_identity(events_changed=True)   # as a job's after() and an import do
         assert found() == 2 and len(get(f"/api/view?{window}&filter={fid}")["events"]) == 2
         marked = app.con.execute("SELECT event_uid FROM events WHERE source_file = ?", [ARCHIVE]).fetchone()[0]
-        assert request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [marked], "value": "malicious"})[0].status == 200
+        assert request(port, "POST", "/api/mark", session=session, body={"uids": [marked], "value": "malicious"})[0].status == 200
         load_archive(synthetic_case, 8)   # the rerun has no record 7
         app.refresh_identity(events_changed=True)
         assert get("/api/meta")["orphan_marks"] == 1 and found() == 2
     load_archive(synthetic_case, 8, 9)   # the CLI, with the server stopped
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        assert json.loads(request(port, "GET", "/api/search?q=194.61.24.102", cookie=cookie)[1])["total"] == 3
+        session = login(port, app)
+        assert json.loads(request(port, "GET", "/api/search?q=194.61.24.102", session=session)[1])["total"] == 3
 
 
 def test_a_view_keeps_its_search_through_newer_searches(running):
@@ -279,15 +279,15 @@ def test_a_view_keeps_its_search_through_newer_searches(running):
     from glessner.search import KEEP
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     window = f"start={T0 - 3600 * 10**6}&end={T0 + 3600 * 10**6}&groupby=host"
-    fid = json.loads(request(port, "POST", "/api/filter", cookie=cookie,
+    fid = json.loads(request(port, "POST", "/api/filter", session=session,
                              body={"view": {"values": [{"search": "194.61.24.102"}]}})[1])["id"]
     shown = lambda: [e["code"] for e in json.loads(request(port, "GET", f"/api/view?{window}&filter={fid}",
-                                                           cookie=cookie)[1])["events"]]
+                                                           session=session)[1])["events"]]
     assert shown() == ["4624"]
     for n in range(KEEP + 1):
-        assert request(port, "GET", f"/api/search?q=word{n}", cookie=cookie)[0].status == 200
+        assert request(port, "GET", f"/api/search?q=word{n}", session=session)[0].status == 200
     assert app.con.execute("SELECT count(*) FROM search_runs").fetchone()[0] == KEEP
     assert shown() == ["4624"]
 
@@ -298,23 +298,23 @@ def test_a_view_s_searches_are_all_kept_when_one_is_saved_again(running):
     from glessner.search import KEEP
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     span = {"start": T0 - 3600 * 10**6, "end": T0 + 3600 * 10**6}
-    fid = json.loads(request(port, "POST", "/api/filter", cookie=cookie, body={
+    fid = json.loads(request(port, "POST", "/api/filter", session=session, body={
         "view": {"values": [{"search": "194.61.24.102"}, {"search": "mortysmith"}]}})[1])["id"]
     shown = lambda: len(json.loads(request(port, "GET", f"/api/view?start={span['start']}&end={span['end']}"
-                                           f"&groupby=host&filter={fid}", cookie=cookie)[1])["events"])
+                                           f"&groupby=host&filter={fid}", session=session)[1])["events"])
 
     def search_others(word):   # enough to drop the View's older search, but not its newer one
         for n in range(KEEP - 1):
-            assert request(port, "GET", f"/api/search?q={word}{n}", cookie=cookie)[0].status == 200
+            assert request(port, "GET", f"/api/search?q={word}{n}", session=session)[0].status == 200
 
     both = shown()
     assert both == 2
     search_others("word")
     assert shown() == both
     search_others("other")
-    res, body = request(port, "POST", "/api/export", cookie=cookie, body={**span, "filter": fid})
+    res, body = request(port, "POST", "/api/export", session=session, body={**span, "filter": fid})
     assert res.status == 200 and json.loads(body)["rows"] == both
 
 
@@ -691,13 +691,13 @@ def test_whole_word_rewrites_only_free_text():
 
 def test_the_search_api_offers_the_whole_word_rewrite(running):
     app, port, _ = running
-    cookie = login(port, app)
-    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote('logon "4624" code:4624'), cookie=cookie)
+    session = login(port, app)
+    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote('logon "4624" code:4624'), session=session)
     out = json.loads(body)
     assert res.status == 200 and out["whole_word"] == {"state": "some", "on": '"logon" "4624" code:4624',
                                                        "off": 'logon 4624 code:4624'}
     assert out["terms"] == ['"logon" anywhere', 'the whole word "4624"', 'code is "4624"']
-    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:4624"), cookie=cookie)
+    res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:4624"), session=session)
     assert json.loads(body)["whole_word"] is None
 
 
@@ -817,15 +817,15 @@ def test_the_search_api_offers_the_forgiving_line_for_a_search_it_can_serve(runn
     """/api/search says whether the page may ask, so the page has no tokenizer of its own; /api/search_adds answers with the
     server's time, and a plain message with a 400 when the search has no quoted word."""
     app, port, _ = running
-    cookie = login(port, app)
-    res, body = request(port, "GET", "/api/search_adds?q=" + urllib.parse.quote("logon"), cookie=cookie)
+    session = login(port, app)
+    res, body = request(port, "GET", "/api/search_adds?q=" + urllib.parse.quote("logon"), session=session)
     assert res.status == 400 and "word in quotes" in json.loads(body)["error"]
-    res, body = request(port, "GET", "/api/search_adds?q=" + urllib.parse.quote('"logon" code:4624'), cookie=cookie)
+    res, body = request(port, "GET", "/api/search_adds?q=" + urllib.parse.quote('"logon" code:4624'), session=session)
     out = json.loads(body)
     assert res.status == 200 and out["total"] > 0 and out["forgiving_query"] == "logon code:4624" and out["server_ms"] >= 0
     assert (out["inside"], out["groups"]) == (0, [])   # "logon" is a word on its own in every message
     for q, offered in (('"logon"', True), ("logon", False), ('"a b" code:4624', False), ('"logon" -"x"', True)):
-        res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote(q), cookie=cookie)
+        res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote(q), session=session)
         assert json.loads(body)["forgiving"] is offered, q
 
 
@@ -947,8 +947,8 @@ def test_by_name_leaves_out_a_rule_whose_search_would_be_too_long(synthetic_case
     zeta_case(synthetic_case)
     q = "zeta -" + "q" * 489   # 495 characters, 504 with "Zeta C" for the word
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote(q), cookie=cookie)
+        session = login(port, app)
+        res, body = request(port, "GET", "/api/search?q=" + urllib.parse.quote(q), session=session)
         out = json.loads(body)
         assert res.status == 200 and out["total"] and "by_name" not in out
 
@@ -959,16 +959,16 @@ def test_the_search_api_lists_rules_found_by_name_with_their_events_marks(synthe
 
     probe_case(synthetic_case)
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
+        session = login(port, app)
         (rdp,) = [r[0] for r in app.con.execute("SELECT event_uid FROM events WHERE source_record = '101'").fetchall()]
-        res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [rdp], "value": "suspicious", "note": ""})
+        res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": [rdp], "value": "suspicious", "note": ""})
         assert res.status == 200
-        out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("internet"), cookie=cookie)[1])
+        out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("internet"), session=session)[1])
         assert out["total"] == 1 and "hint" not in out
         assert [r["title"] for r in out["by_name"]] == ["Internet Probe Seen", "RDP from internet"]
         (event,) = out["by_name"][1]["events"]
         assert (event["uid"], event["mark"], event["mark_who"]) == (rdp, "Suspicious", app.journal.state.marks[rdp].who)
-        out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:4624"), cookie=cookie)[1])
+        out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:4624"), session=session)[1])
         assert out["total"] and "by_name" not in out   # no free-text word
 
 
@@ -1044,13 +1044,13 @@ def test_the_hints_unreviewed_count_is_the_views_and_leaves_out_pending_suggesti
 
 def test_the_search_api_gives_the_hint_for_a_search_with_no_match(running):
     app, port, _ = running
-    cookie = login(port, app)
-    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("evtxecmd"), cookie=cookie)[1])
+    session = login(port, app)
+    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("evtxecmd"), session=session)[1])
     assert out["total"] == 0 and out["events"] == [] and "by_name" not in out
     assert out["hint"]["found"][0]["query"] == "tool:evtxecmd" and out["hint"]["skips"][0] == "tool"
-    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:9999"), cookie=cookie)[1])
+    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("code:9999"), session=session)[1])
     assert out["total"] == 0 and "hint" not in out   # no free-text word, so no hint
-    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("4624"), cookie=cookie)[1])
+    out = json.loads(request(port, "GET", "/api/search?q=" + urllib.parse.quote("4624"), session=session)[1])
     assert out["total"] and "hint" not in out
 
 

@@ -121,9 +121,9 @@ def test_a_confirmed_group_action_covers_the_counted_events_and_skips_those_deci
     from glessner.server import api_pending_uids
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
-    pending = json.loads(request(port, "GET", "/api/pending?source=logons&group_by=host", cookie=cookie)[1])
+    pending = json.loads(request(port, "GET", "/api/pending?source=logons&group_by=host", session=session)[1])
     counted = [u for g in pending["groups"] for u in g["uids"]]
     assert pending["total"] == len(counted) >= 5 and all(len(g["uids"]) == g["count"] for g in pending["groups"])
     # A group's uids are what /api/pending_uids gives for the group now
@@ -139,7 +139,7 @@ def test_a_confirmed_group_action_covers_the_counted_events_and_skips_those_deci
     now = api_pending_uids(app, {"source": ["logons"]})["uids"]
     assert late in now and elsewhere not in now and set(now) - set(page_counted) == {late}
     confirmed = {"decision": "accept", "source": "logons", "uids": page_counted, "confirmed": {"count": len(page_counted)}}
-    res, body = request(port, "POST", "/api/suggestion", cookie=cookie, body=confirmed)
+    res, body = request(port, "POST", "/api/suggestion", session=session, body=confirmed)
     assert res.status == 200
     answer = json.loads(body)
     assert (answer["changed"], answer["skipped"]) == (len(page_counted) - 1, 1)
@@ -148,7 +148,7 @@ def test_a_confirmed_group_action_covers_the_counted_events_and_skips_those_deci
     assert sorted(entry["targets"]) == sorted(rest)
     assert api_pending_uids(app, {"source": ["logons"]})["uids"] == [late]   # the late one stays pending, untouched
     # A reject of a confirmed set records the same, and a refusal names what is wrong with the request
-    res, body = request(port, "POST", "/api/suggestion", cookie=cookie,
+    res, body = request(port, "POST", "/api/suggestion", session=session,
                         body={"decision": "reject", "source": "logons", "uids": [late, elsewhere], "confirmed": {"count": 2}})
     assert json.loads(body)["skipped"] == 1 and last_entry(app)["confirmed"] == {"count": 2, "skipped": 1}
     for bad in ({"confirmed": {"count": -1}, "uids": [late]}, {"confirmed": 3, "uids": [late]}, {"confirmed": {"count": 1}}):
@@ -166,10 +166,10 @@ def test_show_all_first_lists_a_whole_group_up_to_the_servers_cap(running):
     from glessner import server
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
     def by_host(limit):
-        return json.loads(request(port, "GET", f"/api/pending?source=logons&group_by=host&limit={limit}", cookie=cookie)[1])
+        return json.loads(request(port, "GET", f"/api/pending?source=logons&group_by=host&limit={limit}", session=session)[1])
 
     whole = by_host(50)
     assert [len(g["events"]) for g in by_host(1)["groups"]] == [1, 1]
@@ -236,9 +236,9 @@ def test_a_confirmed_action_whose_counted_events_were_all_decided_meanwhile_acts
     from glessner.server import api_pending_uids
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
-    pending = json.loads(request(port, "GET", "/api/pending?source=logons", cookie=cookie)[1])
+    pending = json.loads(request(port, "GET", "/api/pending?source=logons", session=session)[1])
     counted = [u for g in pending["groups"] for u in g["uids"]]
     page_counted, arrived = counted[:2], counted[2:]
     assert len(arrived) >= 2
@@ -246,7 +246,7 @@ def test_a_confirmed_action_whose_counted_events_were_all_decided_meanwhile_acts
     before = len(app.journal.path.read_text(encoding="utf-8").splitlines())
     for decision in ("accept", "reject"):
         body = {"decision": decision, "source": "logons", "uids": page_counted, "confirmed": {"count": 2}}
-        res, answer = request(port, "POST", "/api/suggestion", cookie=cookie, body=body)
+        res, answer = request(port, "POST", "/api/suggestion", session=session, body=body)
         assert res.status == 200 and (json.loads(answer)["changed"], json.loads(answer)["skipped"]) == (0, 2), decision
         assert len(app.journal.path.read_text(encoding="utf-8").splitlines()) == before, decision   # no entry
         assert sorted(api_pending_uids(app, {"source": ["logons"]})["uids"]) == sorted(arrived), decision
@@ -257,10 +257,10 @@ def test_show_all_first_is_cut_at_the_servers_cap(running, monkeypatch):
     from glessner import server
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
     monkeypatch.setattr(server, "PENDING_LIMIT_MAX", 2)
-    res = json.loads(request(port, "GET", "/api/pending?source=logons&group_by=code&limit=1000000000", cookie=cookie)[1])
+    res = json.loads(request(port, "GET", "/api/pending?source=logons&group_by=code&limit=1000000000", session=session)[1])
     group = res["groups"][0]
     assert group["count"] > 2 and len(group["events"]) == 2
 

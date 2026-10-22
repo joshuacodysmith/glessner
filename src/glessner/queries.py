@@ -442,14 +442,17 @@ def pending_events(con: duckdb.DuckDBPyConnection, source: str, group_by: str, l
     return {"source": source, "group_by": group_by, "total": sum(g["count"] for g in ordered), "groups": ordered}
 
 
-def pending_source_events(con: duckdb.DuckDBPyConnection, source: str, first: int = 3) -> dict:
-    """One source's pending suggestions as To investigate's confirm needs them: every event's ID in time order,
-    and the first few events with their time, host, code, and message."""
+def pending_source_events(con: duckdb.DuckDBPyConnection, source: str, first: int = 3, cap: int | None = None) -> dict:
+    """One source's pending suggestions as To investigate's confirm needs them: the events' IDs in time order, and the
+    first few events with their time, host, code, and message. With `cap` at most that many are read, and `more` is
+    true when the source has more pending than that."""
+    limit = f"LIMIT {cap + 1}" if cap is not None else ""
     rows = con.execute(f"""
         WITH x AS ({_PENDING.format(group="''")})
-        SELECT event_uid, ts, host, event_code, msg FROM x ORDER BY ts NULLS LAST, event_uid""", [source]).fetchall()
-    return {"uids": [r[0] for r in rows],
-            "first": [{"uid": r[0], "ts": r[1], "host": r[2], "code": r[3], "msg": r[4]} for r in rows[:first]]}
+        SELECT event_uid, ts, host, event_code, msg FROM x ORDER BY ts NULLS LAST, event_uid {limit}""", [source]).fetchall()
+    kept = rows[:cap]
+    return {"uids": [r[0] for r in kept], "more": len(kept) < len(rows),
+            "first": [{"uid": r[0], "ts": r[1], "host": r[2], "code": r[3], "msg": r[4]} for r in kept[:first]]}
 
 
 def pending_group_uids(con: duckdb.DuckDBPyConnection, source: str, group_by: str, key: str) -> list[str]:
@@ -460,28 +463,39 @@ def pending_group_uids(con: duckdb.DuckDBPyConnection, source: str, group_by: st
         f"SELECT event_uid FROM ({_PENDING.format(group=PENDING_GROUPS[group_by])}) WHERE g = ?", [source, key]).fetchall()]
 
 
-def investigate(con: duckdb.DuckDBPyConnection) -> list[dict]:
-    """Malicious and suspicious events in time order, for the To investigate worklist: each as the page lists it,
-    with its mark and the mark's note, and under `event` its own columns as anchor_of reads them, with its Hayabusa hits,
-    so pivots.worklist_rows can rank its pivots as the Event page does. The page counts each pivot's unreviewed events
-    itself, after it draws, through the pivot count with unreviewed=1.
+# The flagged events: a mark whose event is no longer loaded (analysis.orphan_marks) lists no row, so it isn't counted
+FLAGGED_FROM = "marks m JOIN events e ON e.event_uid = m.event_uid WHERE m.label IN ('Malicious', 'Suspicious')"
 
-    One query reads every flagged event, and one more every flagged event's hits: a read per event took 50 ms each at
-    11 million events. An event without a time comes last: accepting a rule's suggestions can flag one, since rules match
-    them too. Ties go by ID, so the list keeps one order.
+
+def flagged_uids(con: duckdb.DuckDBPyConnection) -> list[str]:
+    """The IDs of the Malicious and Suspicious events that are loaded."""
+    return [uid for (uid,) in con.execute(f"SELECT m.event_uid FROM {FLAGGED_FROM}").fetchall()]
+
+
+def investigate(con: duckdb.DuckDBPyConnection, offset: int = 0, limit: int | None = None) -> list[dict]:
+    """Malicious and suspicious events in time order, for the To investigate worklist: the `limit` events from `offset`
+    on (all of them with no limit), each as the page lists it, with its mark and the mark's note, and under `event` its
+    own columns as anchor_of reads them, with its Hayabusa hits, so pivots.worklist_rows can rank its pivots as the Event
+    page does. The page counts each pivot's unreviewed events itself, after it draws, through the pivot count with
+    unreviewed=1.
+
+    One query reads the events asked for, and one more their hits: a read per event took 50 ms each at 11 million
+    events. An event without a time comes last: accepting a rule's suggestions can flag one, since rules match them too.
+    Ties go by ID, so the list keeps one order.
     """
+    window = f"LIMIT {limit} OFFSET {offset}" if limit is not None else f"OFFSET {offset}"
     cur = con.execute(f"""
         SELECT {TS} AS adjusted_ts, COALESCE(h.offset_us, 0) AS offset, m.label, m.note, e.*
         FROM events e JOIN marks m ON m.event_uid = e.event_uid LEFT JOIN hosts h ON h.host = e.host
-        WHERE m.label IN ('Malicious', 'Suspicious') ORDER BY adjusted_ts NULLS LAST, e.event_uid""")
+        WHERE m.label IN ('Malicious', 'Suspicious') ORDER BY adjusted_ts NULLS LAST, e.event_uid {window}""")
     names = [d[0] for d in cur.description]
     rows = cur.fetchall()
     hits: dict[str, list[dict]] = {}
     if rows:
+        listed = id_table(con, "investigate_uids", [row[names.index("event_uid")] for row in rows])
         for uid, title, level in con.execute(f"""
                 SELECT e.event_uid, hb.rule_title, hb.rule_level FROM events hb {hit_join("hb", "e")}
-                WHERE hb.tool = 'hayabusa'
-                  AND e.event_uid IN (SELECT event_uid FROM marks WHERE label IN ('Malicious', 'Suspicious'))
+                WHERE hb.tool = 'hayabusa' AND e.event_uid IN (SELECT v FROM {listed})
                 ORDER BY hb.rule_level, hb.rule_title""").fetchall():
             hits.setdefault(uid, []).append({"title": title, "level": level})
     items = []
@@ -568,6 +582,13 @@ def source_parts(artifact: str, channel: str, code: str, logon_type: str) -> lis
     if artifact == "evtx":
         return [artifact, channel, code] + ([logon_type] if code in ("4624", "4625") else [])
     return [artifact, channel] if artifact in CHANNEL_ARTIFACTS else [artifact]
+
+
+def _check_window(seconds: int) -> None:
+    """Raise QueryError for a time window outside WINDOW_RANGE_SECONDS."""
+    lo, hi = WINDOW_RANGE_SECONDS
+    if not lo <= seconds <= hi:
+        raise QueryError(f"the time window must be {lo} to {hi} seconds")
 
 
 def _near(identity: Identity | None, when: int, seconds: int) -> tuple[str, list]:
@@ -787,9 +808,7 @@ def _match_and_event(con: duckdb.DuckDBPyConnection, uid: str, kind: str, second
     if kind == "window":
         if when is None:
             return Match(label, [], anchor, "this event has no time recorded"), when, ev
-        lo, hi = WINDOW_RANGE_SECONDS
-        if not lo <= seconds <= hi:
-            raise QueryError(f"the time window must be {lo} to {hi} seconds")
+        _check_window(seconds)
         near, near_params = _near(identity, when, seconds)
         sql, params = f"{where} AND {near} AND e.event_uid <> ?", [*values, *near_params, uid]
         return Match(f"same host within {seconds} seconds", [(sql, params)], anchor), when, ev
@@ -802,6 +821,7 @@ def _match_and_event(con: duckdb.DuckDBPyConnection, uid: str, kind: str, second
         where, values = f"{where} AND e.host = ?", [*values, ev["host"]]
     only = f", on {ev['host']} only" if own else ""
     if kind == "connection" and scope != "case" and when is not None:
+        _check_window(seconds)
         near, near_params = _near(identity, when, seconds)
         return Match(f"same source IP and port within {seconds} seconds{only}",
                      [(f"{where} AND {near}", [*values, *near_params])], anchor, seconds=seconds, **own), when, ev

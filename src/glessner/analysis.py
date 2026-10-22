@@ -337,10 +337,11 @@ def refresh_tags(con: duckdb.DuckDBPyConnection, state: State, uids: list[str] |
         con.execute("DELETE FROM tag_suggestions")
         targets, where = list(state.tags), ""
     else:
-        changed = id_table(con, "changed_tags", list(uids))
+        unique = list(dict.fromkeys(uids))   # an event named twice would otherwise insert each of its tags twice
+        changed = id_table(con, "changed_tags", unique)
         con.execute(f"DELETE FROM tags WHERE event_uid IN (SELECT v FROM {changed})")
         con.execute(f"DELETE FROM tag_suggestions WHERE event_uid IN (SELECT v FROM {changed})")
-        targets, where = [u for u in uids if u in state.tags], f" AND e.event_uid IN (SELECT v FROM {changed})"
+        targets, where = [u for u in unique if u in state.tags], f" AND e.event_uid IN (SELECT v FROM {changed})"
     rows = [(u, key, info["seq"]) for u in targets for key, info in state.tags[u].items()]
     if rows:
         insert_columns(con, "tags", [r[0] for r in rows], [r[1] for r in rows], [tag_kind(r[1]) for r in rows],
@@ -487,9 +488,10 @@ def replace_marks(con: duckdb.DuckDBPyConnection, state: State, uids: list[str] 
         con.execute("DELETE FROM marks")
         targets = list(state.marks)
     else:
-        changed = id_table(con, "changed_marks", list(uids))
+        unique = list(dict.fromkeys(uids))   # an event named twice would otherwise insert its mark twice
+        changed = id_table(con, "changed_marks", unique)
         con.execute(f"DELETE FROM marks WHERE event_uid IN (SELECT v FROM {changed})")
-        targets = [u for u in uids if u in state.marks]
+        targets = [u for u in unique if u in state.marks]
     if targets:
         insert_columns(con, "marks", targets, [MARK_LABELS[state.marks[u].value] for u in targets],
                        [state.marks[u].note for u in targets], [state.marks[u].seq for u in targets])

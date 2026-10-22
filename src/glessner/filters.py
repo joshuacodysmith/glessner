@@ -70,7 +70,7 @@ def normalize(spec: dict) -> dict:
             raise FilterError("'view' is an object with 'marks' and 'values' lists")
         marks = view.get("marks") or []
         values = view.get("values") or []
-        if not isinstance(marks, list) or any(m not in VIEW_MARKS for m in marks):
+        if not isinstance(marks, list) or any(not isinstance(m, str) or m not in VIEW_MARKS for m in marks):
             raise FilterError(f"view marks must be some of {list(VIEW_MARKS)}")
         if not isinstance(values, list) or len(values) > MAX_VIEW_VALUES:
             raise FilterError(f"view values must be a list of at most {MAX_VIEW_VALUES} preds")

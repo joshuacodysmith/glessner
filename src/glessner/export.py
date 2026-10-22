@@ -268,20 +268,26 @@ FINDING_EVENTS = 25   # supporting events a finding's section lists before "and 
 
 
 def write_report(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, manifest: dict[str, str],
-                 state: State, extra: str = "", filter_note: str = "", journal: dict | None = None) -> tuple[Path, int]:
-    """Write the Markdown report to exports/ and return the file and the number of marked events it lists."""
-    text, count = report_text(con, case, identity, manifest, state, extra, filter_note, journal)
+                 state: State, extra: str = "", filter_note: str = "", journal: dict | None = None,
+                 checked: Check | None = None) -> tuple[Path, int]:
+    """Write the Markdown report to exports/ and return the file and the number of marked events it lists. `checked` is
+    the evidence re-hash the caller already ran (see report_text)."""
+    text, count = report_text(con, case, identity, manifest, state, extra, filter_note, journal, checked=checked)
     path = export_path(case, "report", "md")
     path.write_text(text, encoding="utf-8")
     return path, count
 
 
 def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, manifest: dict[str, str], state: State,
-                extra: str = "", filter_note: str = "", journal: dict | None = None, *, rehash: bool = True) -> tuple[str, int]:
+                extra: str = "", filter_note: str = "", journal: dict | None = None, *, rehash: bool = True,
+                checked: Check | None = None, listed: int | None = None) -> tuple[str, int]:
     """The report's text and the number of marked events it lists. `state` is the journal's: the summary (the
     `report_summary` setting), the findings, and the notes. With a view filter (`extra`, described by `filter_note`),
     the timeline lists only the filtered events and the report says so at the top. `journal` is the journal's row and
-    head for the integrity part (head_lines). A preview (`rehash` false) skips the evidence re-hash and says so."""
+    head for the integrity part (head_lines). A preview (`rehash` false) skips the evidence re-hash and says so. The
+    re-hash is `checked` when the caller already ran it, so it can run outside the locks the caller holds. `listed`
+    limits the timeline to its first events, and says so; the counts, the tactics, the caveats, and the indicators still
+    cover every marked event."""
     # Events without a time come last: accepting a rule's suggestions can flag one, since rules match them too. Ties
     # go by ID, so two reports of a case number its events alike.
     rows = con.execute(f"""
@@ -315,7 +321,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     elif not case.manifest_path.exists():
         check = "No intake manifest exists, so evidence hashes were not checked."
     else:
-        check = _evidence_check(check_files(case, reason=REPORT_CHECK))
+        check = _evidence_check(checked if checked is not None else check_files(case, reason=REPORT_CHECK))
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     malicious = sum(1 for r in rows if r[3] == "Malicious")
     untimed = sum(1 for r in rows if r[1] is None)
@@ -338,9 +344,11 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     ]
     if not rows:
         lines.append("No events are marked malicious or suspicious yet.")
-    for number, row in enumerate(rows, 1):
+    for number, row in enumerate(rows[:listed], 1):
         lines += _event_lines(number, row, identity, state.notes, tagged.get(row[0], []), pairs.get(row[0]), manifest,
                               in_finding.get(row[0], []))
+    if listed is not None and len(rows) > listed:
+        lines += ["", f"The preview lists the first {listed:,} of {len(rows):,} events. Write report lists them all."]
     lines += _tactics_section(rows, tagged)
     lines += _caveats_section(rows, kinds)
     lines += ["", heading[3], "", *_indicators_section(indicators(con, [r[0] for r in rows if r[3] == "Malicious"], identity),

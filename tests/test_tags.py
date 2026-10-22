@@ -151,19 +151,19 @@ def test_suggestions_lanes_filters_and_exports(synthetic_case):
 
 def test_tag_api(running):
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     uid = rdp_uid(app.con)
-    res, body = request(port, "POST", "/api/tag", cookie=cookie,
+    res, body = request(port, "POST", "/api/tag", session=session,
                         body={"uids": [uid], "add": ["Lateral Movement", "T1021.001", "Staging"]})
     out = json.loads(body)
     assert res.status == 200 and [t["label"] for t in out["tags"]] == ["Lateral Movement", "T1021.001", "staging"]
-    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", cookie=cookie)[1])["event"]
+    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", session=session)[1])["event"]
     assert {t["key"] for t in event["tags"]} == {"tactic:TA0008", "technique:T1021.001", "tag:staging"}
-    counts = json.loads(request(port, "GET", "/api/tags", cookie=cookie)[1])
+    counts = json.loads(request(port, "GET", "/api/tags", session=session)[1])
     assert counts["any"] == 1 and counts["tags"][0]["label"] == "Lateral Movement"
-    meta = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+    meta = json.loads(request(port, "GET", "/api/meta", session=session)[1])
     assert len(meta["tactics"]) == 15 and meta["tactics"][6] == {"id": "TA0005", "name": "Stealth"}
-    res, body = request(port, "POST", "/api/tag", cookie=cookie, body={"uids": [uid], "add": ["tactic:TA9999"]})
+    res, body = request(port, "POST", "/api/tag", session=session, body={"uids": [uid], "add": ["tactic:TA9999"]})
     assert res.status == 400 and "isn't an ATT&CK tactic" in json.loads(body)["error"]
 
 
@@ -173,12 +173,12 @@ def test_technique_tags_take_only_listed_ids_and_an_old_one_is_flagged(running):
     Event page and the View panel's counts flag it as a finding's techniques are flagged, the report writes the flag
     beside it, and it can be removed, with or without its prefix."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     uid = rdp_uid(app.con)
     journal_lines = lambda: len((app.case.folder / JOURNAL_FILE).read_text(encoding="utf-8").splitlines())
 
     def tag(body):
-        res, payload = request(port, "POST", "/api/tag", cookie=cookie, body={"uids": [uid], **body})
+        res, payload = request(port, "POST", "/api/tag", session=session, body={"uids": [uid], **body})
         return res.status, json.loads(payload)
 
     before = journal_lines()
@@ -195,20 +195,20 @@ def test_technique_tags_take_only_listed_ids_and_an_old_one_is_flagged(running):
         app.journal.append("tag", targets=[uid], add=["technique:T1086", "technique:T9999"])
         app.rewrite(tags=[uid])
     flagged = {"T1059.001": "", "T1086": "revoked; now T1059.001", "T9999": "not in ATT&CK v20.0"}
-    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", cookie=cookie)[1])["event"]
+    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", session=session)[1])["event"]
     assert {t["label"]: t.get("flag", "") for t in event["tags"]} == flagged
-    counts = json.loads(request(port, "GET", "/api/tags", cookie=cookie)[1])["tags"]
+    counts = json.loads(request(port, "GET", "/api/tags", session=session)[1])["tags"]
     assert {t["label"]: t.get("flag", "") for t in counts} == flagged
-    res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [uid], "value": "malicious"})
+    res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": [uid], "value": "malicious"})
     assert res.status == 200
     report = api_report_preview(app, {})["text"]
     assert "   - ATT&CK: T1059.001, T1086 (revoked; now T1059.001), T9999 (not in ATT&CK v20.0)" in report
     status, answer = tag({"remove": ["technique:T9999", "T1086"]})
     assert status == 200 and [t["label"] for t in answer["tags"]] == ["T1059.001"]
     # Undoing the removal brings the old tags back, flagged: the undo's changes take the journal's form check too
-    res, _ = request(port, "POST", "/api/undo", cookie=cookie, body={"seq": answer["seq"], "note": "slip"})
+    res, _ = request(port, "POST", "/api/undo", session=session, body={"seq": answer["seq"], "note": "slip"})
     assert res.status == 200
-    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", cookie=cookie)[1])["event"]
+    event = json.loads(request(port, "GET", f"/api/event?uid={uid}", session=session)[1])["event"]
     assert {t["label"]: t.get("flag", "") for t in event["tags"]} == flagged
 
 
@@ -221,11 +221,11 @@ def test_accepting_a_revoked_suggestion_tags_its_replacement(synthetic_case):
                                         extra={"MitreTags": "T1086"})],
          host="DC01", tool="hayabusa", tool_version="t", run_id="r6", replaces_sources=[], staging_dir=synthetic_case.folder)
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
+        session = login(port, app)
         uid = rdp_uid(app.con)
-        event = lambda: json.loads(request(port, "GET", f"/api/event?uid={uid}", cookie=cookie)[1])["event"]  # noqa: B023
+        event = lambda: json.loads(request(port, "GET", f"/api/event?uid={uid}", session=session)[1])["event"]  # noqa: B023
         assert [(s["key"], s.get("origin")) for s in event()["tag_suggestions"]] == [("technique:T1059.001", "T1086")]
-        res, body = request(port, "POST", "/api/tag", cookie=cookie,
+        res, body = request(port, "POST", "/api/tag", session=session,
                             body={"uids": [uid], "add": ["technique:T1059.001"], "via": "hayabusa"})
         assert res.status == 200 and [(t["key"], t["via"]) for t in json.loads(body)["tags"]] == [
             ("technique:T1059.001", "hayabusa")]

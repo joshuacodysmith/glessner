@@ -499,7 +499,7 @@ def test_the_state_line_counts_what_is_hidden_and_each_show_clears_it_alone(brow
     window. A show pred alone hides nothing, so it makes no Sources pill."""
     for p in served_page(browser, synthetic_case):
         total = p.evaluate("window.__app.S.meta.rows")
-        lanes = p.evaluate("fetch('/api/lanes?groupby=host').then((r) => r.json())")
+        lanes = p.evaluate("import('/js/core.js').then((m) => m.api('/api/lanes?groupby=host'))")
         desktop = next(lane["count"] for lane in lanes["lanes"] if lane["keys"] == ["DESKTOP"])
         shown = p.locator("#stShown")
         assert shown.inner_text() == f"Showing {total:,} of {total:,} events on the timeline"
@@ -612,7 +612,7 @@ def test_the_legend_shows_by_button_and_by_l_in_the_page_colors(browser, synthet
         # Storage blocked, as in a private window or with site data blocked: closed, and the button still works
         p.add_init_script("Storage.prototype.getItem = () => { throw new Error('blocked'); };"
                           "Storage.prototype.setItem = () => { throw new Error('blocked'); };")
-        p.reload()
+        p.goto(p.new_link())   # a reload would find no session in storage
         p.wait_for_function("() => window.__ready === true && window.__app.S.data !== null")
         to_timeline(p)
         assert panel.is_hidden()

@@ -23,7 +23,7 @@ from glessner.audit import read_entries
 from glessner.case import open_case
 from glessner.events import Event, load
 from glessner.journal import JOURNAL_FILE
-from glessner.server import serve
+from glessner.server import Hub, serve_hub
 
 playwright_api = pytest.importorskip("playwright.sync_api")
 
@@ -106,14 +106,8 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
     they were written for, where the synthetic case's rows all fit; None leaves the default.
     Tests use it as a for loop that runs once, so a closure made in the loop's body runs within that pass, and ruff's
     B023 is silenced on it."""
-    if case is None:
-        from glessner.server import serve_start
-
-        server, hub, url = serve_start(0)
-        app = None
-    else:
-        server, app, url = serve(case, 0)
-        hub = None
+    server, hub, url = serve_hub(Hub(case), 0)   # the start page when case is None
+    app = hub.app
     if setup:
         setup(app)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -128,12 +122,15 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
         context.close()
         server.shutdown()
         server.server_close()
-        current = hub.app if hub else app
-        if current:
-            current.con.close()
+        if hub.app:
+            hub.app.con.close()
 
     p = context.new_page()
     p.errors, p.console = [], []
+    # A start link that has not been used: the one in `url` works once, and a page that loses its session, as when its
+    # storage is blocked and it reloads, takes a new one
+    p.new_link = lambda: f"http://127.0.0.1:{server.server_address[1]}/?token={hub.new_token()}"
+    p.hub = hub
     p.on("pageerror", lambda exc: p.errors.append(f"page error: {exc}"))
     p.on("console", lambda msg: p.console.append(f"{msg.type}: {msg.text}"))
     # Failed loads are checked by URL below; the console's own copy of them names no URL.
@@ -1224,59 +1221,43 @@ def test_a_wildcard_search_highlights_its_match_without_freezing_the_page(browse
         assert page.locator("#details .ev-facts mark").first.inner_text() == "aaaaab"
 
 
-def test_a_tab_whose_case_another_tab_replaced_says_so_and_writes_nothing(browser, synthetic_case, tmp_path,
-                                                                           monkeypatch):
+def test_a_tab_whose_case_another_tab_replaced_says_so_and_writes_nothing(browser, synthetic_case, tmp_path):
     """The server holds one open case, so a request would run against whichever case was open when it came. A tab
     still showing case A, after a second tab opened a copy of it on the same server, could mark the copy's event, which
     has the same ID, and the copy's journal would keep the mark. The page sends the open's ID with every request, the
     server refuses one that names another open, and the page says another case is open, offers a reload, and sends
     nothing more."""
     import shutil
-    import sys
 
     from glessner.case import copy_case
     from glessner.journal import replay
-    from glessner.server import Hub, serve_hub
 
     copy = copy_case(synthetic_case, tmp_path / "copy", "Copy", "cody")
     shutil.copy2(synthetic_case.db_path, copy.db_path)   # the same events and IDs, as a copy's rebuild gives
-    hubs = []
-
-    def serve_keeping_the_hub(case, port):
-        server, hub, url = serve_hub(Hub(case), port)
-        hubs.append(hub)
-        return server, hub.app, url
-
-    monkeypatch.setattr(sys.modules[__name__], "serve", serve_keeping_the_hub)
-    try:
-        for page in served_page(browser, synthetic_case):
-            sent = []
-            page.on("request", lambda req: sent.append((req.url, req.headers.get("x-glessner-case")))   # noqa: B023
-                    if "/api/" in req.url else None)
-            rdp = event_point(page, "4624", hit=True)
-            page.mouse.click(rdp["x"], rdp["y"])
-            page.wait_for_selector("#details[data-page='event'] .ev-verdict")
-            opened = page.evaluate("window.__app.S.meta.case_id")
-            assert sent and {header for _, header in sent} == {opened}, sent   # every request names the open
-            hubs[0].open(copy)   # as a second tab's Cases page does
-            page.locator("#details .ev-verdict").get_by_role("button", name="Malicious", exact=True).click()
-            band = page.locator("#caseChanged")
-            band.wait_for()
-            assert band.inner_text().startswith("Another case is open now: Copy. Reload the page to work on it")
-            page.wait_for_function("() => document.getElementById('status').textContent.startsWith('Mark failed: "
-                                   "Another case is open now')")
-            assert replay(copy.folder / "journal.jsonl").marks == {} == replay(synthetic_case.folder / "journal.jsonl").marks
-            before = len(sent)
-            refused = page.evaluate("() => import('/js/core.js').then((m) => m.api('/api/marks')).catch((e) => e.message)")
-            assert refused.startswith("Another case is open now") and len(sent) == before   # sent nothing
-            band.get_by_role("button", name="Reload").click()
-            page.wait_for_function("() => window.__ready === true && document.getElementById('caseName').textContent "
-                                   "=== 'Copy'")
-            page.errors[:] = [e for e in page.errors if not e.startswith("HTTP 409: ")]   # the refusals were the point
-    finally:
-        for hub in hubs:
-            if hub.app:
-                hub.app.con.close()
+    for page in served_page(browser, synthetic_case):
+        sent = []
+        page.on("request", lambda req: sent.append((req.url, req.headers.get("x-glessner-case")))   # noqa: B023
+                if "/api/" in req.url else None)
+        rdp = event_point(page, "4624", hit=True)
+        page.mouse.click(rdp["x"], rdp["y"])
+        page.wait_for_selector("#details[data-page='event'] .ev-verdict")
+        opened = page.evaluate("window.__app.S.meta.case_id")
+        assert sent and {header for _, header in sent} == {opened}, sent   # every request names the open
+        page.hub.open(copy)   # as a second tab's Cases page does
+        page.locator("#details .ev-verdict").get_by_role("button", name="Malicious", exact=True).click()
+        band = page.locator("#caseChanged")
+        band.wait_for()
+        assert band.inner_text().startswith("Another case is open now: Copy. Reload the page to work on it")
+        page.wait_for_function("() => document.getElementById('status').textContent.startsWith('Mark failed: "
+                               "Another case is open now')")
+        assert replay(copy.folder / "journal.jsonl").marks == {} == replay(synthetic_case.folder / "journal.jsonl").marks
+        before = len(sent)
+        refused = page.evaluate("() => import('/js/core.js').then((m) => m.api('/api/marks')).catch((e) => e.message)")
+        assert refused.startswith("Another case is open now") and len(sent) == before   # sent nothing
+        band.get_by_role("button", name="Reload").click()
+        page.wait_for_function("() => window.__ready === true && document.getElementById('caseName').textContent "
+                               "=== 'Copy'")
+        page.errors[:] = [e for e in page.errors if not e.startswith("HTTP 409: ")]   # the refusals were the point
 
 
 def test_suggested_tags_accept_and_dismiss_at_opposite_ends(browser, synthetic_case):
@@ -1389,12 +1370,12 @@ def test_tools_page_loads_tool_output_found_in_the_evidence(browser, synthetic_c
         assert "Loaded " in page.locator("#details .tools-outputs").inner_text()
 
 
-# Asks the server about the background job until it reports the job finished, for up to `timeout` milliseconds; true
-# when it did
+# Asks the server about the background job, through the page's own request function, which sends the session, until it
+# reports the job finished, for up to `timeout` milliseconds; true when it did
 JOB_FINISHED = """async (timeout) => {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-        if ((await (await fetch('/api/run_status')).json()).job?.finished) return true;
+        if ((await (await import('/js/core.js')).api('/api/run_status')).job?.finished) return true;
         await new Promise((resolve) => setTimeout(resolve, 50));
     }
     return false;

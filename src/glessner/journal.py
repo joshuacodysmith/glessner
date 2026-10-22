@@ -24,6 +24,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -101,8 +102,12 @@ CLIENTS = ("server", "cli")   # the kind of process that wrote a chained line
 ZERO = "0" * 64   # the prev of the chain's first line
 SHA256 = re.compile(r"[0-9a-f]{64}")
 LOCK_FILE = "journal.lock"   # byte 0 is locked by the process writing the journal
+LOCK_GATE = 1   # journal.lock's byte a writer takes on its way to byte 0, and holds while it waits for it
 LOCK_WAIT = 10.0   # seconds an append waits for another writer of the case, in this process or another
-LOCK_RETRY = 0.05
+LOCK_RETRY = 0.01   # seconds between a writer's tries of the gate
+# Seconds between tries of byte 0 by the writer that holds the gate, whose turn is next. The lock stays idle from a
+# release to that writer's next try, so this is short; only the one writer at the gate tries this often.
+LOCK_TURN_RETRY = 0.001
 SIDE_GLOB = "journal_torn_*.bin"   # a torn last line's bytes, kept byte for byte
 SIDE_FILE = re.compile(r"journal_torn_[^\\/]+\.bin")
 BUSY = ("Another Glessner process is writing this case's journal and didn't finish within 10 seconds. Try again; if it "
@@ -553,7 +558,9 @@ def held(path: Path) -> Iterator[None]:
     one re-entrant lock, so code that holds it can append, such as the upgrade's record inside its step, and two Journal
     objects of one case take turns. The first hold of the process also takes the OS lock, byte 0 of
     journal.lock, which keeps another process's writer out: Windows' byte-range locks are mandatory, so a lock on
-    the journal's own bytes would block its readers. Each waits up to LOCK_WAIT seconds, then raises JournalError."""
+    the journal's own bytes would block its readers. A process that lets go of the OS lock and comes back for it can't
+    take it ahead of a process holding the gate (_take_os_lock). Each waits up to LOCK_WAIT seconds, then raises
+    JournalError."""
     hold = _hold_of(path)
     if not hold.lock.acquire(timeout=LOCK_WAIT):
         raise JournalError(BUSY)
@@ -573,40 +580,61 @@ def held(path: Path) -> Iterator[None]:
 
 
 def _take_os_lock(path: Path) -> int:
-    """journal.lock opened, and its byte 0 locked, tried every LOCK_RETRY seconds for up to LOCK_WAIT. msvcrt.locking
-    locks from the file's position, so each try seeks to 0 first. Windows lets go of a killed
-    process's lock."""
+    """journal.lock opened, and its byte 0 locked, through the gate at LOCK_GATE: the writer takes the gate, waits for
+    byte 0 holding it, then lets go of it. A holder that lets go of byte 0 and comes back meets the gate, so the writer
+    waiting there takes byte 0 first, at its next try; writers still waiting for the gate pass it in no set order. The
+    gate is tried every LOCK_RETRY seconds and byte 0 every LOCK_TURN_RETRY, and the wait for both together lasts at
+    most LOCK_WAIT; then JournalError is raised and the file closed, holding nothing. Windows lets go of a killed
+    process's locks, but a process stopped while it waits keeps the gate, so it blocks other writers as a stopped
+    writer does."""
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0))
     deadline = time.monotonic() + LOCK_WAIT
-    while not _try_lock(fd):
-        if time.monotonic() >= deadline:
-            os.close(fd)
-            raise JournalError(BUSY)
-        time.sleep(LOCK_RETRY)
+    try:
+        _wait_for(fd, LOCK_GATE, deadline, LOCK_RETRY)
+        try:
+            _wait_for(fd, 0, deadline, LOCK_TURN_RETRY)
+        finally:
+            _unlock(fd, LOCK_GATE)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
-def _try_lock(fd: int, shared: bool = False) -> bool:
-    os.lseek(fd, 0, os.SEEK_SET)
+def _wait_for(fd: int, byte: int, deadline: float, retry: float) -> None:
+    """The byte locked, tried every `retry` seconds until the deadline, then JournalError."""
+    while not _try_lock(fd, byte):
+        if time.monotonic() >= deadline:
+            raise JournalError(BUSY)
+        time.sleep(retry)
+
+
+def _try_lock(fd: int, byte: int = 0, shared: bool = False) -> bool:
+    """Whether one try locked the byte. msvcrt.locking locks from the file's position, so the try seeks to it first."""
+    os.lseek(fd, byte, os.SEEK_SET)
     try:
         if msvcrt is not None:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:   # a shared lock for check's read-only handle, which can't take an exclusive one there
-            fcntl.lockf(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB, 1, 0)
+            fcntl.lockf(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB, 1, byte)
     except OSError:
         return False
     return True
 
 
-def _release_os_lock(fd: int | None) -> None:
-    if fd is None:
-        return
+def _unlock(fd: int, byte: int) -> None:
     with suppress(OSError):
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, byte, os.SEEK_SET)
         if msvcrt is not None:
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
-            fcntl.lockf(fd, fcntl.LOCK_UN, 1, 0)
+            fcntl.lockf(fd, fcntl.LOCK_UN, 1, byte)
+
+
+def _release_os_lock(fd: int | None) -> None:
+    if fd is None:
+        return
+    _unlock(fd, 0)
     os.close(fd)
 
 
@@ -617,18 +645,16 @@ def _writing(path: Path) -> bool:
     hold = _HOLDS.get(os.path.normcase(str(path.resolve())))
     if hold is not None and hold.depth:
         return True
+    # Off Windows, closing any descriptor of journal.lock lets go of every lock this process holds on it, so a check
+    # from another thread while this process takes the lock drops what it took: the gate, or byte 0 before held()
+    # counts the hold.
     try:
         fd = os.open(path.parent / LOCK_FILE, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except OSError:
         return False
     try:
         if _try_lock(fd, shared=True):
-            with suppress(OSError):
-                os.lseek(fd, 0, os.SEEK_SET)
-                if msvcrt is not None:
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.lockf(fd, fcntl.LOCK_UN, 1, 0)
+            _unlock(fd, 0)
             return False
         return True
     finally:
@@ -1532,8 +1558,9 @@ def replay(path: Path) -> State:
 
 
 def rekey_map(rekey: dict, name: str) -> dict:
-    """A rekey's `pairs` or `unplaced`, or an empty map when a changed line holds something else there, so a reader of
-    a rekey never fails on one the checks accept. The writer's _validate_rekey keeps the maps maps."""
+    """A rekey's `pairs`, `unplaced`, or `candidates_unplaced`, or an empty map when a changed line holds something else
+    there, so a reader of a rekey never fails on one the checks accept. The writer's _validate_rekey keeps the maps
+    maps."""
     found = rekey.get(name)
     return found if isinstance(found, dict) else {}
 
@@ -1609,15 +1636,22 @@ def event_ids(entry: dict) -> Iterator[str]:
             yield value
 
 
-def referenced_ids(path: Path) -> set[str]:
-    """Every event ID the journal names, for a case format upgrade's map (rekey.py): each entry's, read through the rekeys
-    that follow it, and each event an earlier rekey's unplaced ID may have meant (unplaced), by the ID the event has now,
-    since the Event page looks those events up by it, and the map has to place them."""
+class References(NamedTuple):
+    """The event IDs a case format upgrade's map places (referenced_ids). An ID can be in both."""
+    named: set[str]        # the IDs the journal's entries name, the analyst's references
+    candidates: set[str]   # the events earlier rekeys' unplaced IDs may have meant, by the IDs they have now
+
+
+def referenced_ids(path: Path) -> References:
+    """The event IDs a case format upgrade's map places (rekey.py), apart: each ID the journal's entries name, read
+    through the rekeys that follow it; and each event an earlier rekey's unplaced ID may have meant (unplaced), by the ID
+    the event has now, which the map places too, since the Event page looks those events up by it. Only the first are
+    references the analyst made."""
     if not path.exists():
-        return set()
+        return References(set(), set())
     read = entries(path)
     rekeys = [{**entry["rekey"], "seq": entry.get("seq")} for entry in read if is_rekey(entry)]   # as State.rekeys
-    return {uid for entry in read for uid in event_ids(entry)} | set(unplaced(State(rekeys=rekeys)))
+    return References({uid for entry in read for uid in event_ids(entry)}, set(unplaced(State(rekeys=rekeys))))
 
 
 def upgrade_recorder(journal: Journal):
@@ -1637,8 +1671,8 @@ def upgrade_recorder(journal: Journal):
 
 def renamed(state: State, uid: str) -> tuple[str, list[int]] | None:
     """The ID an earlier event ID names now, read through every rekey from the first, and the rekeys' entry numbers
-    that changed it, for an old ID pasted from an export or a findings summary. Only the IDs the
-    journal named are in a rekey; None for any other."""
+    that changed it, for an old ID pasted from an export or a findings summary. Only the IDs the journal named, and the
+    events an earlier rekey's unplaced ID may have meant, are in a rekey; None for any other."""
     seqs = []
     for rekey in state.rekeys:
         new = rekey_map(rekey, "pairs").get(uid)
@@ -1649,14 +1683,15 @@ def renamed(state: State, uid: str) -> tuple[str, list[int]] | None:
 
 
 def _successors(uid: str, rekey: dict) -> list[str]:
-    """The IDs the event ID `uid` has after one rekey: the one its pairs give, the several its unplaced map lists, or
-    `uid` itself when the rekey names it in neither."""
+    """The IDs the event ID `uid` has after one rekey: the one its pairs give, the several its unplaced map or its
+    candidates_unplaced lists, or `uid` itself when the rekey names it in none."""
     new = rekey_map(rekey, "pairs").get(uid)
     if isinstance(new, str):
         return [new]
-    several = rekey_map(rekey, "unplaced").get(uid)
-    if isinstance(several, list) and (ids := [each for each in several if isinstance(each, str)]):
-        return ids
+    for name in ("unplaced", "candidates_unplaced"):
+        several = rekey_map(rekey, name).get(uid)
+        if isinstance(several, list) and (ids := [each for each in several if isinstance(each, str)]):
+            return ids
     return [uid]
 
 
@@ -1674,8 +1709,10 @@ def unplaced(state: State) -> dict[str, list[dict]]:
     runs stays as written, with its candidates listed. Each is {seq, id, candidates}. A rekey lists its candidates by the
     IDs of its own format, so each is read through the rekeys after that one, as translate reads an entry's IDs, and an
     event is keyed by the ID it has now. A candidate a later rekey leaves unplaced becomes that rekey's candidates, and
-    candidates that read as one ID are listed once. `id`, the ID the entries named, stays as written. A rekey names a
-    candidate in its own map only if it places it (referenced_ids). A rekey's `merged` and `dropped_runs` need no
+    candidates that read as one ID are listed once. `id`, the ID the entries named, stays as written. A later rekey
+    places the candidates as it places the IDs the entries name (referenced_ids). One it leaves unplaced that no entry
+    names is in its `candidates_unplaced`, which is read through as `unplaced` is, but gets no listing of its own, since
+    no entry was made under it: the earlier listing names its events. A rekey's `merged` and `dropped_runs` need no
     translation, since nothing looks them up by event ID."""
     out: dict[str, list[dict]] = {}
     for i, rekey in enumerate(state.rekeys):
@@ -1954,7 +1991,7 @@ def _validate_rekey(rekey) -> None:
     is_id = lambda v: isinstance(v, str) and EVENT_ID.fullmatch(v) is not None
     if not all(is_id(old) and is_id(new) for old, new in rekey["pairs"].items()):
         raise JournalError("a rekey's 'pairs' maps event IDs of 32 lowercase hex characters to event IDs")
-    for name in ("unplaced", "merged"):
+    for name in ("unplaced", "candidates_unplaced", "merged"):
         found = rekey.get(name, {})
         if not isinstance(found, dict) or not all(
                 is_id(k) and isinstance(v, list) and v and all(is_id(x) for x in v) for k, v in found.items()):

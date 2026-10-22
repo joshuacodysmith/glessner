@@ -680,10 +680,10 @@ def test_the_report_takes_a_marked_event_from_before_1970(synthetic_case):
     load(synthetic_case.db_path, [entry], host="DESKTOP", tool="autoruns", tool_version="t", run_id="r9",
          replaces_sources=["DESKTOP/autoruns.csv"], staging_dir=synthetic_case.folder)
     for a, port, _ in serving(synthetic_case):
-        cookie = login(port, a)
+        session = login(port, a)
         old = uid_at(a, BEFORE_1970, "autoruns")
         api_mark(a, {"uids": [old], "value": "suspicious"})
-        res, body = request(port, "POST", "/api/report", cookie=cookie, body={})
+        res, body = request(port, "POST", "/api/report", session=session, body={})
         assert res.status == 200, body
         text = Path(json.loads(body)["path"]).read_text(encoding="utf-8")
         assert "**1960-01-01 00:00:00.000000 UTC, DESKTOP, Suspicious.**" in text

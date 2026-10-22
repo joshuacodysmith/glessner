@@ -157,8 +157,8 @@ def test_the_report_summary_is_a_case_setting_that_replays_and_reads_in_the_trai
     with the text cut at a boundary (cut_name) and quoted, an empty value clears it and reads so, and a value that is not
     text, or is too long, is refused with 400."""
     app, port, _ = running
-    cookie = login(port, app)
-    post = lambda body: request(port, "POST", "/api/setting", cookie=cookie, body={"name": "report_summary", **body})
+    session = login(port, app)
+    post = lambda body: request(port, "POST", "/api/setting", session=session, body={"name": "report_summary", **body})
     text = ("The attacker logged on to DC01 over RDP from 194.61.24.102 at 03:21:48 UTC, " * 3).strip()
     res, body = post({"value": f"  {text}\r\n"})
     assert res.status == 200 and json.loads(body)["value"] == text

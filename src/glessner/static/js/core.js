@@ -238,15 +238,57 @@ export function syncPanelButtons() {
   setPanelButton('viewButton', !$('viewPanel').hidden);
 }
 
-// Every request names the case open the page shows, once /api/meta has given its ID, and the server refuses one that
-// names another: a tab still showing one case had journaled marks, notes, and settings into a case a second tab opened
-// on the same server. The page then says so, offers a reload, and sends nothing more. A tab left
-// from an earlier run of `serve` reaches the new run's server on the same port and is refused the same
-// way, without the reload: its session cookie is the old run's, and the new link is the way in.
+// The run's session. The start link carries a token that works once: the page trades it for the session (POST
+// /api/session), drops the token from the address, and keeps the session in this origin's storage, so a reload or another
+// tab of this browser still has it. A load without the token reads the session from storage once and holds it: the tab
+// keeps the session it started with, so a tab left from an earlier run is refused rather than handed the new run's. Where
+// the browser blocks storage, the session lasts until the page reloads. A link that was used already, and no session in
+// storage, leaves the page with the server's words and nothing drawn.
+const SESSION_KEY = 'glessner.session';
+let session = null;
+
+function storedSession() {
+  try { return localStorage.getItem(SESSION_KEY); } catch (_) { return null; }
+}
+
+// The address without the start link's token, and with its other parameters (?page=tools) and its hash
+function dropToken(params) {
+  params.delete('token');
+  const rest = params.toString();
+  window.history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash);
+}
+
+async function startSession() {
+  const params = new URLSearchParams(location.search);
+  const token = params.get('token');
+  if (token === null) return storedSession();
+  let body = {};
+  try {
+    const res = await fetch('/api/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
+    body = await res.json();
+  } catch (_) { /* the server is gone, or answered something else: the stored session, if any, is the way on */ }
+  dropToken(params);
+  if (body.session) {
+    try { localStorage.setItem(SESSION_KEY, body.session); } catch (_) { /* storage blocked: the session lasts until the page reloads */ }
+    return body.session;
+  }
+  const kept = storedSession();
+  if (!kept && body.link_used) caseChanged(body.error, false);
+  return kept;
+}
+const sessionReady = startSession().then((found) => { session = found; });
+
+// Every request carries the session, and names the case open the page shows, once /api/meta has given its ID. The
+// server refuses a request that names an open other than its current one, so a tab still showing one case can't
+// journal marks, notes, or settings into a case a second tab opened on the same server. The page then says so, offers a
+// reload, and sends nothing more. A tab left from an earlier run of `serve` reaches the new run's server on the same
+// port and is refused the same way, without the reload: its session is the old run's, and the new link is the way in.
 export async function api(path, opts = {}) {
+  await sessionReady;
   if (S.caseChanged) throw new Error(S.caseChanged);
   const caseId = S.meta && S.meta.case_id;
-  const res = await fetch(path, caseId ? { ...opts, headers: { ...opts.headers, 'X-Glessner-Case': caseId } } : opts);
+  const headers = { ...opts.headers, ...(session ? { 'X-Glessner-Session': session } : {}), ...(caseId ? { 'X-Glessner-Case': caseId } : {}) };
+  const res = await fetch(path, { ...opts, headers });
   // An answer that isn't JSON, such as a 404's text, is its text, not a JSON parse error
   const body = (res.headers.get('Content-Type') || '').startsWith('application/json') ? await res.json()
     : { error: (await res.text()).trim() || `HTTP ${res.status}` };

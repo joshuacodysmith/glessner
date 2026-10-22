@@ -1,4 +1,4 @@
-import { $, api, codePrefix, el, fmtUs, plural } from './core.js';
+import { $, api, codePrefix, el, fmtUs, plural, S } from './core.js';
 
 // ---------- Ask first: the confirm block before a group action ----------
 // A confirm dialog as a block in the page, with the filled lead confirm and Cancel that the Hosts split's undo and the
@@ -58,13 +58,44 @@ const MARK_WORD = { malicious: 'Malicious', suspicious: 'Suspicious', authorized
 export const markWord = (value) => MARK_WORD[String(value).toLowerCase()] || value;
 const clock = (date) => `${date.toISOString().slice(11, 19)} UTC`;
 
+// What the server answers to a decision naming more events than one journal entry can hold (server._decide), and what
+// to do instead: a group's decision regroups, and any other goes a group at a time.
+function tooManyWords(decision, total, limit, grouped) {
+  const accept = decision === 'accept';
+  const head = accept
+    ? `Accepting these would mark ${total.toLocaleString()} events, more than the ${limit.toLocaleString()} a mark can hold.`
+    : `Rejecting these would name ${total.toLocaleString()} events, more than the ${limit.toLocaleString()} one decision can name.`;
+  const fewer = grouped
+    ? `Group the suggestions another way, by rule, host, account, or event ID, and ${accept ? 'accept' : 'reject'} smaller groups.`
+    : `${accept ? 'Accept' : 'Reject'} them a group at a time from the source's Suggestions page.`;
+  return `${head} ${fewer}`;
+}
+
+// A refusal in the place the confirm block would go, with Close
+function showRefusal(text, host) {
+  const where = host || $('detailsBody').querySelector('.confirm-slot') || $('detailsBody');
+  where.querySelector(':scope > .confirm-block')?.remove();
+  const block = el('div', { class: 'confirm-block', role: 'alert', tabindex: '-1' },
+    el('div', { class: 'confirm-line' }, text),
+    el('div', { class: 'actions' }, el('button', { type: 'button', onclick: () => block.remove() }, 'Close')));
+  if (where === $('detailsBody')) where.prepend(block); else where.append(block);
+}
+
 // The question before Accept all, Reject all, or a group's Accept N or Reject N, on the Suggestions page or To investigate.
 // `uids` is the set the page counted when it loaded (`loadedAt`), `listed` how many of them the page lists, `first` the
 // first few events, `group` and `groupBy` the group when the action is one group's, `value` what the source suggests. The
 // events pending now are read first, so the block can say how many arrived after the page loaded (not included) and how
 // many of the counted were decided elsewhere meanwhile (skipped by the server). Resolves to the confirmed uids, or null.
-export async function askGroupDecision({ decision, source, value, group = null, groupBy = '', uids, listed, first, loadedAt,
-                                         showAll = null, host = null }) {
+// `total` is how many events the action covers when the page holds the IDs of fewer, as To investigate does for a source
+// with more pending than one decision can name; above that limit the action is refused here, in the server's words and
+// before anything is fetched or sent.
+export async function askGroupDecision({ decision, source, value, group = null, groupBy = '', uids, total = uids.length, listed,
+                                         first, loadedAt, showAll = null, host = null }) {
+  const limit = S.meta?.max_mark_targets;
+  if (limit && total > limit) {
+    showRefusal(tooManyWords(decision, total, limit, group != null), host);
+    return null;
+  }
   const n = uids.length;
   let now = null;
   try {

@@ -37,8 +37,9 @@ def stop(server, hub):
 def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(browser, synthetic_case, monkeypatch):  # noqa: F811
     """The page's next request after the new run starts is answered 403 with STALE_SESSION: the page shows the band
     without a Reload button, puts the message on the status line, draws nothing, and sends nothing more. A reload of the
-    tab gets the launch hint, not the page. The keep-alive is cut to a second, so the first run's handler threads close
-    the tab's old connections as an exited process would have; both runs live in this one process."""
+    tab gets the page's shell and then the same message, and draws nothing. The keep-alive is cut to a second, so the
+    first run's handler threads close the tab's old connections as an exited process would have; both runs live in this
+    one process."""
     monkeypatch.setattr(mod, "KEEP_ALIVE_SECONDS", 1)
     port = free_port()
     first, hub1, url = run(synthetic_case, port)
@@ -56,7 +57,7 @@ def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(
         p.wait_for_timeout(2_000)   # the old handler threads time out and close their sockets
         second, hub2, _ = run(synthetic_case, port)
         try:
-            assert second.server_address[1] == port and hub2.token != hub1.token and hub2.app.case_id != old_id
+            assert second.server_address[1] == port and hub2.session != hub1.session and hub2.app.case_id != old_id
             del answered[:]
             p.locator("#investigateButton").click()
             band = p.locator("#caseChanged")
@@ -69,8 +70,10 @@ def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(
             refused = p.evaluate("() => import('/js/core.js').then((m) => m.api('/api/marks')).catch((e) => e.message)")
             assert refused == STALE_SESSION and len(answered) == before   # nothing more was sent
             p.reload()
-            assert "Open the link that `glessner serve` printed." in p.content()
-            assert p.locator("#labels").count() == 0 and synthetic_case.settings.name not in p.content()
+            p.locator("#caseChanged").wait_for()
+            assert p.locator("#caseChanged").inner_text() == STALE_SESSION
+            assert synthetic_case.settings.name not in p.content()
+            assert p.locator("#labels > *").count() == 0
         finally:
             stop(second, hub2)
     finally:

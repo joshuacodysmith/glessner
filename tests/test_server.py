@@ -11,14 +11,14 @@ from pathlib import Path
 import pytest
 from conftest import DOTTED_QUAD, METASPLOIT, T0, serving
 
-from glessner.server import CASE_HEADER, MAX_BODY, START_GET_ROUTES, cookie_name
+from glessner.server import CASE_HEADER, MAX_BODY, SESSION_HEADER, START_GET_ROUTES
 
 
-def request(port, method, path, *, cookie=None, host=None, body=None, headers=None):
+def request(port, method, path, *, session=None, host=None, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     h = {"Host": host or f"127.0.0.1:{port}"}
-    if cookie:
-        h["Cookie"] = cookie
+    if session:
+        h[SESSION_HEADER] = session
     if headers:
         h.update(headers)
     data = json.dumps(body).encode() if body is not None else None
@@ -34,10 +34,10 @@ def request(port, method, path, *, cookie=None, host=None, body=None, headers=No
 JSON_TYPE = "Content-Type: application/json"
 
 
-def raw_post(port, cookie, path, headers, data=b"", pause=0.0):
+def raw_post(port, session, path, headers, data=b"", pause=0.0):
     """POST over a raw socket, for requests http.client won't send. headers are "Name: value" lines, sent as given,
     and pause is waited after the headers and again after the body. Returns the status line and the answer's body."""
-    lines = [f"POST {path} HTTP/1.1", f"Host: 127.0.0.1:{port}", f"Cookie: {cookie}", *headers]
+    lines = [f"POST {path} HTTP/1.1", f"Host: 127.0.0.1:{port}", f"{SESSION_HEADER}: {session}", *headers]
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
         sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         time.sleep(pause)
@@ -67,91 +67,100 @@ def journaled(app):
 
 
 def login(port, app):
-    res, _ = request(port, "GET", f"/?token={app.token}")
-    assert res.status == 303
-    set_cookie = res.getheader("Set-Cookie")
-    assert "HttpOnly" in set_cookie and "SameSite=Strict" in set_cookie
-    return set_cookie.split(";")[0]
+    """The session the page holds once it has traded the start link's token: the run's, which the requests send in
+    SESSION_HEADER."""
+    return app.session
 
 
 def test_launch_link_binds_to_loopback_and_carries_token(running):
+    """The start link names the loopback address and the port served, and its token is not the session the page gets for
+    it."""
     app, port, url = running
-    assert url == f"http://127.0.0.1:{port}/?token={app.token}" and len(app.token) >= 40
+    prefix = f"http://127.0.0.1:{port}/?token="
+    assert url.startswith(prefix)
+    token = url.removeprefix(prefix)
+    assert len(token) >= 40 and len(app.session) >= 40 and token != app.session
 
 
-def test_requests_without_cookie_or_with_foreign_host_are_refused(running):
+def test_api_requests_without_the_session_or_with_a_foreign_host_are_refused(running):
+    """An API request needs the run's session and a Host naming this server. The page's own files need no session: they
+    hold no case data, and the page trades the start link's token for the session after it loads."""
     app, port, _ = running
     assert request(port, "GET", "/api/meta")[0].status == 403
-    assert request(port, "GET", "/")[0].status == 403
-    assert request(port, "GET", "/?token=wrong")[0].status == 403
-    cookie = login(port, app)
-    assert request(port, "GET", "/api/meta", cookie=cookie, host="attacker.example:80")[0].status == 403
-    assert request(port, "GET", "/api/meta", cookie="glessner_session=wrong")[0].status == 403
+    assert request(port, "GET", "/")[0].status == 200
+    assert request(port, "GET", "/?token=wrong")[0].status == 200
+    assert request(port, "GET", "/nothing")[0].status == 404
+    session = login(port, app)
+    assert request(port, "GET", "/api/meta", session=session, host="attacker.example:80")[0].status == 403
+    assert request(port, "GET", "/", host="attacker.example:80")[0].status == 403
+    assert request(port, "GET", "/api/meta", session="wrong")[0].status == 403
+    assert request(port, "GET", "/api/meta", session=session)[0].status == 200
 
 
 def test_a_get_sent_from_another_site_or_port_is_refused(running, monkeypatch):
-    """A page on another 127.0.0.1 port is same-site, so its <img> or no-cors fetch carries the cookie and no Origin.
-    The browser's Sec-Fetch-Site says where a request came from, and a GET runs only for same-origin, none (a link
-    typed or opened from the command line), or no header, as a client other than a browser sends. A refused browse
-    lists nothing: a UNC path there would make Windows offer the analyst's credentials to that share."""
+    """A page on another 127.0.0.1 port is same-site, so a request it makes reaches this server. The browser's
+    Sec-Fetch-Site says where a request came from, and a GET runs only for same-origin, none (a link typed or opened from
+    the command line), or no header, as a client other than a browser sends. A refused browse lists nothing: a UNC path
+    there would make Windows offer the analyst's credentials to that share."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     browsed = []
     monkeypatch.setitem(START_GET_ROUTES, "/api/start/browse", lambda hub, query: browsed.append(query) or {})
     browse = "/api/start/browse?path=%5C%5Cshare.invalid%5Cx"
     for site in ("same-site", "cross-site"):
         sent = {"Sec-Fetch-Site": site}
-        assert request(port, "GET", browse, cookie=cookie, headers=sent)[0].status == 403
-        assert request(port, "GET", "/api/meta", cookie=cookie, headers=sent)[0].status == 403
-        assert request(port, "GET", "/js/main.js", cookie=cookie, headers=sent)[0].status == 403
-        res, _ = request(port, "GET", f"/?token={app.token}", headers=sent)
-        assert res.status == 403 and res.getheader("Set-Cookie") is None
+        assert request(port, "GET", browse, session=session, headers=sent)[0].status == 403
+        assert request(port, "GET", "/api/meta", session=session, headers=sent)[0].status == 403
+        assert request(port, "GET", "/js/main.js", headers=sent)[0].status == 403
+        assert request(port, "GET", "/?token=x", headers=sent)[0].status == 403
     assert browsed == []
     for sent in ({"Sec-Fetch-Site": "same-origin"}, {"Sec-Fetch-Site": "none"}, None):
-        assert request(port, "GET", browse, cookie=cookie, headers=sent)[0].status == 200
-        assert request(port, "GET", "/", cookie=cookie, headers=sent)[0].status == 200
+        assert request(port, "GET", browse, session=session, headers=sent)[0].status == 200
+        assert request(port, "GET", "/", headers=sent)[0].status == 200
     assert len(browsed) == 3
-    assert request(port, "GET", f"/?token={app.token}", headers={"Sec-Fetch-Site": "none"})[0].status == 303
+    assert request(port, "GET", "/?token=x", headers={"Sec-Fetch-Site": "none"})[0].status == 200
 
 
-def test_the_launch_token_and_the_cookie_are_compared_with_compare_digest(running, monkeypatch):
-    """The launch link's token and the cookie both go through secrets.compare_digest. Either one with characters outside
-    ASCII is answered 403, not with a dropped connection."""
+def test_the_launch_token_and_the_session_are_compared_with_compare_digest(running, monkeypatch):
+    """The start link's token and the session both go through secrets.compare_digest. Either one with characters
+    outside ASCII is answered 403, not with a dropped connection."""
     app, port, _ = running
     compared, real = [], secrets.compare_digest
     monkeypatch.setattr(secrets, "compare_digest", lambda a, b: compared.append(a) or real(a, b))
-    login(port, app)   # sends no cookie, so only the token is compared
-    assert compared
-    assert request(port, "GET", f"/?token=%C3%A9{app.token[2:]}")[0].status == 403
-    for path in ("/", "/api/meta"):
-        assert request(port, "GET", path, cookie=f'{cookie_name(port)}="é{app.token[1:]}"')[0].status == 403
+    res, _ = request(port, "GET", "/api/meta", session=f"\u00e9{app.session[1:]}")
+    assert res.status == 403 and compared
+    compared.clear()
+    for token in (f"\u00e9{app.session[1:]}", "\u0100", "\ud800"):
+        res, payload = request(port, "POST", "/api/session", body={"token": token})
+        assert res.status == 403 and json.loads(payload)["link_used"] is True
+    assert len(compared) == 3
 
 
 def test_page_has_csp_and_api_works(running):
     app, port, _ = running
-    cookie = login(port, app)
-    res, body = request(port, "GET", "/", cookie=cookie)
+    session = login(port, app)
+    res, body = request(port, "GET", "/", session=session)
     assert res.status == 200 and "default-src 'none'" in res.getheader("Content-Security-Policy")
-    res, body = request(port, "GET", "/api/meta", cookie=cookie)
+    res, body = request(port, "GET", "/api/meta", session=session)
     meta = json.loads(body)
     assert meta["case"] == "Synthetic" and meta["outside_sources"] == ["194.61.24.102"]
     res, body = request(port, "GET", f"/api/view?start={T0 - 10**6}&end={T0 + 3600 * 10**6}&groupby=mark,role,host",
-                        cookie=cookie)
+                        session=session)
     assert json.loads(body)["mode"] == "events"
-    assert request(port, "GET", "/api/view?start=1&end=2&groupby=mark,nonsense", cookie=cookie)[0].status == 400
+    assert request(port, "GET", "/api/view?start=1&end=2&groupby=mark,nonsense", session=session)[0].status == 400
 
 
 def test_mark_writes_journal_and_changes_lanes(running):
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     uid = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [T0]).fetchone()[0]
-    res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [uid], "value": "malicious", "note": "RDP"})
+    res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": [uid], "value": "malicious", "note": "RDP"})
     assert res.status == 200
     line = json.loads((app.case.folder / "journal.jsonl").read_text().splitlines()[-1])
     assert (line["action"], line["value"], line["targets"], line["note"]) == ("mark", "malicious", [uid], "RDP")
-    lanes = json.loads(request(port, "GET", "/api/lanes?groupby=mark,host", cookie=cookie)[1])["lanes"]
+    lanes = json.loads(request(port, "GET", "/api/lanes?groupby=mark,host", session=session)[1])["lanes"]
     assert {"keys": ["Malicious", "DC01"], "count": 1} in lanes
-    details = json.loads(request(port, "GET", f"/api/event?uid={uid}", cookie=cookie)[1])["event"]
+    details = json.loads(request(port, "GET", f"/api/event?uid={uid}", session=session)[1])["event"]
     assert details["mark"]["label"] == "Malicious" and details["hits"] == [{"title": "RDP from internet", "level": "high"}]
     # The Event page shows who set the mark and when, from the journal entry.
     assert details["mark"]["who"] == line["who"] and details["mark"]["at"] == line["at"]
@@ -161,15 +170,15 @@ def test_selected_lists_events_in_time_order_with_their_marks(running):
     """The verdict zone lists the selected events with their current marks, a pending suggestion
     among them, in time order whatever order the page sends them in."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     uid = lambda ts: app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [ts]).fetchone()[0]
     rdp, morty, desktop = uid(T0), uid(T0 + 60 * 1_000_000), uid(T0 + 874 * 1_000_000)
     # DC01's two registry values share a time, so they come in ID order
     hive = [u for (u,) in app.con.execute("SELECT event_uid FROM events WHERE tool = 'recmd' AND host = 'DC01' "
                                           "ORDER BY event_uid").fetchall()]
-    request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [morty], "value": "malicious"})
+    request(port, "POST", "/api/mark", session=session, body={"uids": [morty], "value": "malicious"})
     query = "&".join(f"uid={u}" for u in [desktop, morty, rdp, *reversed(hive)])
-    res, body = request(port, "GET", f"/api/selected?{query}", cookie=cookie)
+    res, body = request(port, "GET", f"/api/selected?{query}", session=session)
     assert res.status == 200
     listed = json.loads(body)
     assert listed["total"] == 5
@@ -181,21 +190,21 @@ def test_selected_lists_events_in_time_order_with_their_marks(running):
 
 def test_counts_and_role_confirm(running):
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     def counts():
-        body = json.loads(request(port, "GET", "/api/counts", cookie=cookie)[1])
+        body = json.loads(request(port, "GET", "/api/counts", session=session)[1])
         body.pop("server_ms")   # every API response carries its timing
         return body
     before = counts()
     assert (before["flagged"], before["hosts_review"], before["rule_errors"]) == (0, 2, 0) and before["pending"] >= 1
-    res, body = request(port, "POST", "/api/host", cookie=cookie, body={"confirm_hosts": ["DC01"]})
+    res, body = request(port, "POST", "/api/host", session=session, body={"confirm_hosts": ["DC01"]})
     assert res.status == 200
     line = json.loads((app.case.folder / "journal.jsonl").read_text().splitlines()[-1])
     assert (line["action"], line["role"], line["confirmed"]) == ("host_role", "Domain controllers", True)
     dc = next(h for h in json.loads(body)["hosts"] if h["host"] == "DC01")
     assert dc["role_source"] == "analyst" and dc["review"] == [] and dc["role_by"] == line["who"]
     uid = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [T0]).fetchone()[0]
-    request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [uid], "value": "malicious"})
+    request(port, "POST", "/api/mark", session=session, body={"uids": [uid], "value": "malicious"})
     after = counts()   # the marked event had Hayabusa's pending suggestion
     assert after == {"flagged": 1, "pending": before["pending"] - 1, "hosts_review": 1, "hosts_mixed": [],
                      "rule_errors": 0}
@@ -203,8 +212,8 @@ def test_counts_and_role_confirm(running):
 
 def test_pending_suggestions_grouped_and_decided_by_group(running):
     app, port, _ = running
-    cookie = login(port, app)
-    pending = lambda q: json.loads(request(port, "GET", f"/api/pending?{q}", cookie=cookie)[1])
+    session = login(port, app)
+    pending = lambda q: json.loads(request(port, "GET", f"/api/pending?{q}", session=session)[1])
     uid = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [T0]).fetchone()[0]
     hay = pending("source=hayabusa")   # Hayabusa's suggestions group by the rule behind them
     assert (hay["group_by"], hay["total"]) == ("rule", 1)
@@ -212,8 +221,8 @@ def test_pending_suggestions_grouped_and_decided_by_group(running):
     assert hay["groups"][0]["events"][0]["uid"] == uid
     machine = pending("source=machine-accounts-authorized")   # rules group by account
     assert machine["group_by"] == "account" and [g["key"] for g in machine["groups"]] == ["C137\\DESKTOP-SDN1RPT$"]
-    assert request(port, "GET", "/api/pending?source=hayabusa&group_by=nonsense", cookie=cookie)[0].status == 400
-    res, body = request(port, "POST", "/api/suggestion", cookie=cookie,
+    assert request(port, "GET", "/api/pending?source=hayabusa&group_by=nonsense", session=session)[0].status == 400
+    res, body = request(port, "POST", "/api/suggestion", session=session,
                         body={"decision": "reject", "source": "hayabusa", "group_by": "rule", "group": "RDP from internet"})
     assert res.status == 200
     line = json.loads((app.case.folder / "journal.jsonl").read_text().splitlines()[-1])
@@ -225,9 +234,9 @@ def test_suricata_pending_groups_by_signature_most_severe_first(running_alerts):
     """Suricata's suggestions group by signature, severity 1 ahead of the larger severity 2 group, and each
     group names the alerts' own severity."""
     app, port, _ = running_alerts
-    cookie = login(port, app)
-    pending = lambda q: json.loads(request(port, "GET", f"/api/pending?{q}", cookie=cookie)[1])
-    count = lambda: json.loads(request(port, "GET", "/api/counts", cookie=cookie)[1])["pending"]
+    session = login(port, app)
+    pending = lambda q: json.loads(request(port, "GET", f"/api/pending?{q}", session=session)[1])
+    count = lambda: json.loads(request(port, "GET", "/api/counts", session=session)[1])["pending"]
     alerts = pending("source=suricata")
     assert (alerts["group_by"], alerts["total"]) == ("rule", 3)
     assert [(g["key"], g["level"], g["level_label"], g["count"]) for g in alerts["groups"]] == [
@@ -237,7 +246,7 @@ def test_suricata_pending_groups_by_signature_most_severe_first(running_alerts):
     assert pending("source=suricata&group_by=host")["groups"][0]["level_label"] is None
     before = count()
     uids = sorted(e["uid"] for e in alerts["groups"][1]["events"])
-    res, body = request(port, "POST", "/api/suggestion", cookie=cookie,
+    res, body = request(port, "POST", "/api/suggestion", session=session,
                         body={"decision": "reject", "source": "suricata", "group_by": "rule", "group": DOTTED_QUAD})
     assert res.status == 200
     line = json.loads((app.case.folder / "journal.jsonl").read_text().splitlines()[-1])
@@ -249,14 +258,14 @@ def test_suricata_pending_groups_by_signature_most_severe_first(running_alerts):
 
 def test_post_needs_json_and_same_origin(running):
     app, port, _ = running
-    cookie = login(port, app)
-    res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": ["x"], "value": "malicious"},
+    session = login(port, app)
+    res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": ["x"], "value": "malicious"},
                      headers={"Content-Type": "text/plain"})
     assert res.status == 415
-    res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": ["x"], "value": "malicious"},
+    res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": ["x"], "value": "malicious"},
                      headers={"Origin": "http://evil.example"})
     assert res.status == 403
-    res, _ = request(port, "POST", "/api/mark", cookie=cookie, body={"uids": ["x"], "value": "evil"})
+    res, _ = request(port, "POST", "/api/mark", session=session, body={"uids": ["x"], "value": "evil"})
     assert res.status == 400 and "mark" not in journaled(app)   # only the built-in rule was journaled
 
 
@@ -266,14 +275,14 @@ def test_a_refused_post_is_answered_after_its_body_is_read(running):
     test_post_needs_json_and_same_origin). Sending the body after a pause, and reading after another, would lose the
     refusal every time otherwise."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     body = json.dumps({"uids": ["x"], "value": "malicious"}).encode()
     length = f"Content-Length: {len(body)}"
 
     def post(path, *headers, data=body):
         # The first pause lets a refusal sent at once go out and the server close; the second lets the reset for the
         # unread body come back.
-        return raw_post(port, cookie, path, headers, data, pause=0.1)[0]
+        return raw_post(port, session, path, headers, data, pause=0.1)[0]
 
     assert post("/api/mark", JSON_TYPE, "Origin: http://evil.example", length) == b"HTTP/1.1 403 Forbidden"
     assert post("/api/mark", "Content-Type: text/plain", length) == b"HTTP/1.1 415 Unsupported Media Type"
@@ -287,13 +296,13 @@ def test_a_post_length_must_be_one_number(running):
     for a body that isn't coming; "many" raises ValueError, which would print a traceback and send no answer. A second
     Content-Length is refused too, not ignored."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     for lengths in (["many"], ["1_000"], ["-5"], ["+12"], ["12", "13"]):
-        status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, *(f"Content-Length: {n}" for n in lengths)])
+        status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, *(f"Content-Length: {n}" for n in lengths)])
         assert (status, json.loads(body)) == (b"HTTP/1.1 400 Bad Request",
                                               {"error": "Content-Length must be a single number."}), lengths
     # Spaces around the number belong to the header, not the number. The body reaches the route, which refuses it.
-    status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, "Content-Length:  2  "], b"{}")
+    status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, "Content-Length:  2  "], b"{}")
     assert status == b"HTTP/1.1 400 Bad Request" and json.loads(body)["error"].startswith("Mark value must be")
     assert "mark" not in journaled(app)
 
@@ -303,16 +312,16 @@ def test_a_post_with_transfer_encoding_is_refused(running):
     on {} with the body left unread. Chunked gets 411, and codings that don't end with chunked get 400, since the body's
     end can't be found (RFC 9112, 6.3). A request with neither header has no body, and the route still runs."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     for headers in (["Transfer-Encoding: chunked"], ["transfer-encoding: gzip, Chunked", "Content-Length: 2"]):
-        status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, *headers])
+        status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, *headers])
         assert (status, json.loads(body)) == (b"HTTP/1.1 411 Length Required",
                                               {"error": "Send the body with a Content-Length."}), headers
     for headers in (["Transfer-Encoding: gzip"], ["Transfer-Encoding: chunked", "Transfer-Encoding: gzip"]):
-        status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, *headers])
+        status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, *headers])
         assert (status, json.loads(body)) == (b"HTTP/1.1 400 Bad Request",
                                               {"error": "Transfer-Encoding must end with chunked."}), headers
-    status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE])
+    status, body = raw_post(port, session, "/api/mark", [JSON_TYPE])
     assert status == b"HTTP/1.1 400 Bad Request" and json.loads(body)["error"].startswith("Mark value must be")
     assert "mark" not in journaled(app)
 
@@ -322,9 +331,9 @@ def test_a_post_over_the_cap_is_refused_with_413(running):
     that sends one may get a reset in place of the 413. A length of 5,000 digits is over it too, though int() refuses
     a number that long."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     for length in (str(MAX_BODY + 1), "9" * 5000):
-        status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, f"Content-Length: {length}"])
+        status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, f"Content-Length: {length}"])
         assert (status, json.loads(body)) == (b"HTTP/1.1 413 Content Too Large",
                                               {"error": f"The body is over {MAX_BODY:,} bytes."}), length[:20]
 
@@ -334,10 +343,10 @@ def test_a_post_body_must_be_a_json_object(running):
     bytes that don't decode, such as a lone 0xff, raise UnicodeDecodeError, and deep nesting RecursionError. None of the
     three is a JSONDecodeError, so each would print a traceback and send no answer."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     for data, error in ((b"[1, 2]", "Send a JSON object."), (b'"x"', "Send a JSON object."),
                         (b'{"a": "\xff"}', "invalid JSON"), (b"[" * 100_000, "invalid JSON"), (b"{", "invalid JSON")):
-        status, body = raw_post(port, cookie, "/api/mark", [JSON_TYPE, f"Content-Length: {len(data)}"], data)
+        status, body = raw_post(port, session, "/api/mark", [JSON_TYPE, f"Content-Length: {len(data)}"], data)
         assert (status, json.loads(body)) == (b"HTTP/1.1 400 Bad Request", {"error": error}), data[:20]
     assert "mark" not in journaled(app)
 
@@ -377,13 +386,11 @@ def test_the_server_queues_more_connections_than_a_browser_opens_at_once():
         server.server_close()
 
 
-def kept(port, token):
-    """An http.client connection that has followed the launch link, and the headers its requests carry."""
+def kept(port, session):
+    """An open http.client connection, and the headers its requests carry."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    conn.request("GET", f"/?token={token}", headers={"Host": f"127.0.0.1:{port}"})
-    res = conn.getresponse()
-    assert (res.status, res.read(), res.getheader("Content-Length")) == (303, b"", "0")
-    return conn, {"Host": f"127.0.0.1:{port}", "Cookie": res.getheader("Set-Cookie").split(";")[0]}
+    conn.connect()
+    return conn, {"Host": f"127.0.0.1:{port}", SESSION_HEADER: session}
 
 
 def ask(conn, method, path, headers, body=None):
@@ -397,16 +404,18 @@ def ask(conn, method, path, headers, body=None):
 
 
 def test_a_page_s_requests_share_one_connection(running):
-    """The server answers HTTP/1.1, and every answer has a Content-Length, so the launch link's 303, a page, a module,
-    an API answer, and each refusal leave the connection open for the next one. With HTTP/1.0 and a close after each
-    answer, a page load opened 37 connections, an Event page 6, and a run of the browser tests about 5,000; in two of
-    four such runs Windows refused Edge a local port for one request (net::ERR_NO_BUFFER_SPACE)."""
+    """The server answers HTTP/1.1, and every answer has a Content-Length, so a page, a module, an API answer, and each
+    refusal leave the connection open for the next one. A close after each answer makes each request open a new
+    connection, which takes a local port that stays in TIME_WAIT after it closes. A page load makes about 37 requests
+    and a run of the browser tests about 5,000, a large share of the dynamic port range the machine shares. When the
+    range runs out, Windows refuses the browser a local port (net::ERR_NO_BUFFER_SPACE)."""
     app, port, _ = running
-    conn, h = kept(port, app.token)
+    conn, h = kept(port, app.session)
     json_h = {**h, "Content-Type": "application/json"}
     try:
         for method, path, headers, body, status in (
                 ("GET", "/", h, None, 200), ("GET", "/js/main.js", h, None, 200), ("GET", "/api/meta", h, None, 200),
+                ("GET", "/api/meta", {"Host": h["Host"]}, None, 403),
                 ("GET", "/api/none", h, None, 404), ("POST", "/api/mark", json_h, b"{}", 400),
                 ("POST", "/api/mark", json_h, b"[", 400), ("POST", "/api/none", json_h, b"{}", 404),
                 ("GET", "/api/meta", {**h, CASE_HEADER: "an earlier open"}, None, 409),
@@ -417,19 +426,20 @@ def test_a_page_s_requests_share_one_connection(running):
 
 
 def test_every_request_on_a_kept_connection_is_checked(running):
-    """The Host, the cookie, and the Origin are checked on each request, not once per connection: a connection whose
-    requests passed them is refused one without the cookie, naming another host, or from another origin."""
+    """The Host, the session, and the Origin are checked on each request, not once per connection: a connection whose
+    requests passed them is refused one without the session, naming another host, or from another origin."""
     app, port, _ = running
-    conn, h = kept(port, app.token)
+    conn, h = kept(port, app.session)
     uid = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [T0]).fetchone()[0]
     mark = json.dumps({"uids": [uid], "value": "malicious"}).encode()
     json_h = {**h, "Content-Type": "application/json"}
     try:
         assert ask(conn, "GET", "/api/meta", h) == (200, None, True)
-        for headers in ({"Host": h["Host"]}, {**h, "Host": "attacker.example:80"}, {**h, "Cookie": "glessner_session=x"}):
+        for headers in ({"Host": h["Host"]}, {**h, "Host": "attacker.example:80"}, {**h, SESSION_HEADER: "x"}):
             assert ask(conn, "GET", "/api/meta", headers) == (403, None, True), headers
-        assert ask(conn, "GET", "/", {"Host": h["Host"]}) == (403, None, True)
-        for headers in ({**json_h, "Origin": "http://evil.example"}, {**json_h, "Cookie": "glessner_session=x"}):
+        assert ask(conn, "GET", "/", {"Host": h["Host"]}) == (200, None, True)   # the page needs no session
+        assert ask(conn, "GET", "/", {"Host": "attacker.example:80"}) == (403, None, True)
+        for headers in ({**json_h, "Origin": "http://evil.example"}, {**json_h, SESSION_HEADER: "x"}):
             assert ask(conn, "POST", "/api/mark", headers, mark) == (403, None, True), headers
         assert "mark" not in journaled(app)
         assert ask(conn, "POST", "/api/mark", json_h, mark) == (200, None, True)
@@ -458,8 +468,8 @@ def test_a_body_left_unread_closes_the_connection(running):
     request on a kept connection. Its answer says Connection: close, and the server closes the connection. A refused
     POST whose body was read keeps the connection."""
     app, port, _ = running
-    cookie = login(port, app)
-    head = f"Host: 127.0.0.1:{port}\r\nCookie: {cookie}\r\n"
+    session = login(port, app)
+    head = f"Host: 127.0.0.1:{port}\r\n{SESSION_HEADER}: {session}\r\n"
     post = f"POST /api/mark HTTP/1.1\r\n{head}Content-Type: application/json\r\n"
     for sent, status in ((f"{post}Content-Length: {MAX_BODY + 1}\r\n\r\n", b"413"),
                          (f"{post}Transfer-Encoding: chunked\r\n\r\n2\r\n{{}}\r\n0\r\n\r\n", b"411"),
@@ -483,9 +493,9 @@ def test_a_request_that_is_not_http_1_1_closes_even_when_it_asks_to_stay(running
     """An HTTP/1.0 answer can't say it stays open without Connection: keep-alive, so a client that asked for it would
     wait for the end of a connection the server held. Such a request is answered and closed."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-        sock.sendall(f"GET /api/meta HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nCookie: {cookie}\r\n"
+        sock.sendall(f"GET /api/meta HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n{SESSION_HEADER}: {session}\r\n"
                      "Connection: keep-alive\r\n\r\n".encode())
         answer, headers, body = read_answer(sock)
         assert answer.split(b" ")[1] == b"200" and headers.get("connection") == "close"
@@ -493,29 +503,23 @@ def test_a_request_that_is_not_http_1_1_closes_even_when_it_asks_to_stay(running
         assert sock.recv(65_536) == b""
 
 
-def test_the_launch_redirect_says_when_it_closes_the_connection(running):
-    """The 303 that sets the cookie is written apart from the other answers. A GET that carries a body ends the
-    connection, and the redirect says so as every other answer does."""
-    app, port, _ = running
-    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-        sock.sendall(f"GET /?token={app.token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 2\r\n\r\n{{}}".encode())
-        answer, headers, _ = read_answer(sock)
-        assert answer.split(b" ")[1] == b"303" and headers.get("connection") == "close"
-        assert sock.recv(65_536) == b""
-
-
 def test_100_continue_waits_for_the_checks(running):
-    """A request that expects 100 Continue is invited to send its body only after the Host, cookie, and Origin checks, so
-    a client the server will refuse isn't asked for a body of up to MAX_BODY bytes first."""
+    """A request that expects 100 Continue is invited to send its body only after the Host, session, and Origin checks, so
+    a client the server will refuse isn't asked for a body of up to MAX_BODY bytes first. The trade of the start link's
+    token for the session carries no session, and is invited."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     head = f"POST /api/mark HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n"
     expect = "Expect: 100-continue\r\nContent-Length: 2\r\n\r\n"
-    for extra, first in ((f"Cookie: {cookie}\r\n", b"HTTP/1.1 100 Continue"),
-                         (f"Cookie: {cookie}\r\nOrigin: http://evil.example\r\n", b"HTTP/1.1 403 Forbidden"),
-                         ("", b"HTTP/1.1 403 Forbidden")):
+    trade = head.replace("/api/mark", "/api/session")
+    for first_lines, extra, first in ((head, f"{SESSION_HEADER}: {session}\r\n", b"HTTP/1.1 100 Continue"),
+                                      (head, f"{SESSION_HEADER}: {session}\r\nOrigin: http://evil.example\r\n",
+                                       b"HTTP/1.1 403 Forbidden"),
+                                      (head, "", b"HTTP/1.1 403 Forbidden"),
+                                      (trade, "", b"HTTP/1.1 100 Continue"),
+                                      (trade, "Origin: http://evil.example\r\n", b"HTTP/1.1 403 Forbidden")):
         with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
-            sock.sendall((head + extra + expect).encode())
+            sock.sendall((first_lines + extra + expect).encode())
             assert read_answer(sock)[0] == first, extra
             if first.endswith(b"Continue"):
                 sock.sendall(b"{}")   # the invited body
@@ -532,7 +536,7 @@ def test_an_idle_connection_closes_and_ends_its_thread(synthetic_case, monkeypat
     monkeypatch.setattr(server, "KEEP_ALIVE_SECONDS", 0.5)
     for app, port, _ in serving(synthetic_case):
         before = set(threading.enumerate())
-        conn, h = kept(port, app.token)
+        conn, h = kept(port, app.session)
         try:
             assert ask(conn, "GET", "/api/meta", h) == (200, None, True)
             handlers = [t for t in threading.enumerate() if t not in before and "process_request_thread" in t.name]
@@ -551,7 +555,7 @@ def test_a_reset_while_a_connection_idles_ends_it_quietly(running, capsys):
 
     app, port, _ = running
     before = set(threading.enumerate())
-    conn, h = kept(port, app.token)
+    conn, h = kept(port, app.session)
     assert ask(conn, "GET", "/api/meta", h) == (200, None, True)
     handler = next(t for t in threading.enumerate() if t not in before and "process_request_thread" in t.name)
     conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("hh", 1, 0))   # close with a reset
@@ -570,7 +574,7 @@ def test_a_kept_connection_follows_a_switch_of_case(synthetic_case):
 
     server, hub, _ = serve_hub(Hub(synthetic_case), 0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    conn, h = kept(server.server_address[1], hub.token)
+    conn, h = kept(server.server_address[1], hub.session)
     try:
         conn.request("GET", "/api/meta", headers=h)
         first = json.loads(conn.getresponse().read())["case_id"]
@@ -689,6 +693,29 @@ def test_the_serve_command_says_what_its_open_is_doing_before_the_link(synthetic
     assert lines[3].startswith("Serving ") and not any("upgrade" in line for line in lines)
 
 
+@pytest.mark.parametrize(("flags", "how"), [
+    ([], "to open it in another browser, run serve with --no-browser"),
+    (["--no-browser"], "open it in the browser you choose"),
+], ids=["browser", "no browser"])
+def test_the_serve_command_says_the_start_link_works_once(synthetic_case, monkeypatch, capsys, flags, how):
+    """The line before the link says the link works once. A run that opens the browser names --no-browser as the way to
+    open the link in another browser, and a run with --no-browser says to open it in the browser you choose. The link is
+    on the next line, and only a run without --no-browser opens it. The browser and the server's loop are stubbed, so the
+    command opens nothing and returns at once."""
+    from glessner import server as mod
+    from glessner.cli import main
+
+    opened = []
+    monkeypatch.setattr("webbrowser.open", opened.append)
+    monkeypatch.setattr(mod.Server, "serve_forever", lambda self: None)
+    assert main(["serve", str(synthetic_case.folder), *flags, "--port", "0"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("Serving "))
+    assert lines[at] == f"Serving {synthetic_case.settings.name!r} on 127.0.0.1 only. Start link (it works once; {how}):"
+    assert lines[at + 1].startswith("  http://127.0.0.1:")
+    assert opened == ([] if flags else [lines[at + 1].strip()])
+
+
 def test_the_open_s_lines_name_each_stage_as_it_starts_and_say_when_it_is_still_working(capsys):
     """A line per stage when it starts, after the seconds since the open began, with its count where it has
     one. A stage quiet for QUIET seconds gets a still-working line, with how far it has got when its count moved since
@@ -747,48 +774,42 @@ def test_the_open_s_thread_writes_the_still_working_lines_and_stops_with_the_ope
     assert capsys.readouterr().out == ""   # no line once the open is over
 
 
-def test_each_run_keeps_its_own_session_cookie(running):
-    """A browser keeps cookies by host and not by port, so two runs at once, one on the preferred port and one fallen back
-    to a free port, would share one cookie name, and the second's link would make the first refuse its own tab as an
-    earlier run. The cookie is named with the port: each run reads its own, whichever others the browser sends along."""
+def test_each_run_has_a_session_of_its_own(running):
+    """Two runs at once have sessions of their own, and each refuses the other's, as a tab left from an earlier run is
+    refused by the run that took its port."""
     import threading
 
-    from glessner.server import cookie_name, serve_start
+    from glessner.server import serve_start
 
     app, port, _ = running
-    mine = login(port, app)
-    assert mine.startswith(f"{cookie_name(port)}=") and cookie_name(port) == f"glessner_session_{port}"
-    other, hub, _ = serve_start(0)   # a second run at once, on the start page, with a token of its own
+    other, hub, _ = serve_start(0)   # a second run at once, on the start page
     threading.Thread(target=other.serve_forever, daemon=True).start()
     try:
         port2 = other.server_address[1]
-        res, _ = request(port2, "GET", f"/?token={hub.token}")
-        theirs = res.getheader("Set-Cookie").split(";")[0]
-        assert theirs.startswith(f"{cookie_name(port2)}=") and port2 != port
-        assert request(port, "GET", "/api/meta", cookie=theirs)[0].status == 403   # another run's cookie alone
-        assert request(port, "GET", "/api/meta", cookie=f"{theirs}; {mine}")[0].status == 200   # both, as a browser sends
-        assert request(port2, "GET", "/api/start", cookie=mine)[0].status == 403
-        assert request(port2, "GET", "/api/start", cookie=f"{mine}; {theirs}")[0].status == 200
+        assert hub.session != app.session and port2 != port
+        assert request(port, "GET", "/api/meta", session=hub.session)[0].status == 403
+        assert request(port2, "GET", "/api/start", session=app.session)[0].status == 403
+        assert request(port2, "GET", "/api/start", session=hub.session)[0].status == 200
     finally:
         other.shutdown()
         other.server_close()
 
 
-def test_an_api_request_without_this_run_s_cookie_is_refused_as_json(running):
-    """A tab left from an earlier run reaches the new run's server on the same port with the old run's cookie.
-    Its API requests are answered 403 as JSON the page can show, saying to open the new link; the page itself keeps
-    the text that says to open the printed link. Nothing of the case is in either."""
+def test_an_api_request_without_this_run_s_session_is_refused_as_json(running):
+    """A tab left from an earlier run reaches the new run's server on the same port with the old run's session. Its API
+    requests are answered 403 as JSON the page can show, saying to open the new link. Nothing of the case is in them, or
+    in the page, which needs no session."""
     from glessner.server import STALE_SESSION
 
     app, port, _ = running
-    old = "glessner_session=the-earlier-run-s-token"
+    old = "the-earlier-run-s-session"
     for method, path, body in (("GET", "/api/meta", None), ("POST", "/api/mark", {"uids": ["x"], "value": "malicious"})):
-        res, payload = request(port, method, path, cookie=old, body=body)
-        assert res.status == 403 and res.getheader("Content-Type") == "application/json", (method, path)
-        assert json.loads(payload) == {"error": STALE_SESSION, "stale_session": True}
-    res, payload = request(port, "GET", "/", cookie=old)
-    assert (res.status, payload) == (403, b"Open the link that `glessner serve` printed.")
-    assert app.case.settings.name.encode() not in payload
+        for session in (old, None):
+            res, payload = request(port, method, path, session=session, body=body)
+            assert res.status == 403 and res.getheader("Content-Type") == "application/json", (method, path)
+            assert json.loads(payload) == {"error": STALE_SESSION, "stale_session": True}
+    res, payload = request(port, "GET", "/", session=old)
+    assert res.status == 200 and app.case.settings.name.encode() not in payload
 
 
 def test_two_requests_cannot_both_start_a_start_page_job():
@@ -829,18 +850,18 @@ def test_view_api_marks_counts_and_pivot_fields(running):
     """Mark counts for the View flyout, a View registered as a filter, and pivot results
     that carry what the page needs to tell which ones the View hides."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     rdp = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?", [T0]).fetchone()[0]
-    request(port, "POST", "/api/mark", cookie=cookie, body={"uids": [rdp], "value": "malicious"})
-    counts = json.loads(request(port, "GET", "/api/marks", cookie=cookie)[1])["counts"]
+    request(port, "POST", "/api/mark", session=session, body={"uids": [rdp], "value": "malicious"})
+    counts = json.loads(request(port, "GET", "/api/marks", session=session)[1])["counts"]
     assert counts["Malicious"] == 1 and counts["Suggested"] >= 1 and counts["Unreviewed"] > 0
-    res, body = request(port, "POST", "/api/filter", cookie=cookie, body={"view": {"marks": ["Malicious"]}})
+    res, body = request(port, "POST", "/api/filter", session=session, body={"view": {"marks": ["Malicious"]}})
     assert res.status == 200
     fid = json.loads(body)["id"]
     events = json.loads(request(port, "GET", f"/api/view?start={T0 - 3600 * 10**6}&end={T0 + 3600 * 10**6}"
-                                             f"&groupby=mark,host&filter={fid}", cookie=cookie)[1])["events"]
+                                             f"&groupby=mark,host&filter={fid}", session=session)[1])["events"]
     assert [e["uid"] for e in events] == [rdp]
-    rel = json.loads(request(port, "GET", f"/api/related?uid={rdp}&kind=account&filter={fid}", cookie=cookie)[1])
+    rel = json.loads(request(port, "GET", f"/api/related?uid={rdp}&kind=account&filter={fid}", session=session)[1])
     assert rel["anchor"] == {"user_domain": "C137", "user_name": "Administrator"} and rel["total"] == len(rel["events"])
     # The server says which results the View shows: only the Malicious one here.
     assert {e["uid"] for e in rel["events"] if e["shown"]} == {rdp} and len(rel["events"]) > 1
@@ -853,8 +874,8 @@ def test_related_api_takes_only_an_address_the_event_has(synthetic_case, tmp_pat
 
     uids = load_inbound(synthetic_case, tmp_path)
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        get = lambda path: request(port, "GET", path, cookie=cookie)   # noqa: B023
+        session = login(port, app)
+        get = lambda path: request(port, "GET", path, session=session)   # noqa: B023
         res, body = get(f"/api/related?uid={uids['inbound']}&kind=addr&ip={ATTACKER}")
         rel = json.loads(body)
         assert res.status == 200 and rel["address"] == ATTACKER
@@ -866,7 +887,7 @@ def test_related_api_takes_only_an_address_the_event_has(synthetic_case, tmp_pat
         res, body = get(f"/api/related?uid={uids['inbound']}&kind=addr")   # no ip at all
         assert res.status == 400
         view = {"view": {"values": [{"addr": ATTACKER}]}}
-        fid = json.loads(request(port, "POST", "/api/filter", cookie=cookie, body=view)[1])["id"]
+        fid = json.loads(request(port, "POST", "/api/filter", session=session, body=view)[1])["id"]
         window = f"start={T0 - 3600 * 10**6}&end={T0 + 3600 * 10**6}"
         events = json.loads(get(f"/api/view?{window}&groupby=host&filter={fid}")[1])["events"]
         assert {e["uid"] for e in events} == {e["uid"] for e in rel["events"]}
@@ -877,15 +898,15 @@ def test_import_page_adds_previews_and_imports(running, synthetic_case):
     from glessner.intake import intake
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     intake(synthetic_case)
     (synthetic_case.evidence / "DC01" / "pfirewall.log").write_bytes(
         b"#Version: 1.5\r\n#Software: Microsoft Windows Firewall\r\n#Time Format: Local\r\n"
         b"#Fields: date time action protocol src-ip dst-ip src-port dst-port size tcpflags tcpsyn tcpack tcpwin "
         b"icmptype icmpcode info path pid\r\n"
         b"2020-09-19 03:21:48 ALLOW TCP 194.61.24.102 10.42.85.10 51544 3389 0 - 0 0 0 - - - RECEIVE 1234\r\n")
-    post = lambda path, body: json.loads(request(port, "POST", path, cookie=cookie, body=body)[1])
-    get = lambda path: json.loads(request(port, "GET", path, cookie=cookie)[1])
+    post = lambda path, body: json.loads(request(port, "POST", path, session=session, body=body)[1])
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
     added = post("/api/evidence_add", {})
     assert (added["by_artifact"], added["links"]) == ({"w3c_log": 1}, [])   # links skipped
     files = get("/api/imports")["files"]
@@ -900,7 +921,7 @@ def test_import_page_adds_previews_and_imports(running, synthetic_case):
     sources = get("/api/sources")
     assert "import" in json.dumps(sources) and "windows_firewall" in json.dumps(sources)
     assert get("/api/imports")["files"][0]["imported"]["rows"] == 1
-    res, payload = request(port, "POST", "/api/import_preview", cookie=cookie, body={"path": "../case.yaml"})
+    res, payload = request(port, "POST", "/api/import_preview", session=session, body={"path": "../case.yaml"})
     assert res.status == 400 and "Not an evidence file" in json.loads(payload)["error"]
 
 
@@ -912,18 +933,18 @@ def test_an_import_whose_save_as_name_is_refused_imports_nothing(running, synthe
     from glessner.runner import read_runs
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     (synthetic_case.evidence / "DC01" / "fw.csv").write_text("time,src\n2020-09-19T03:21:48Z,194.61.24.102\n",
                                                              encoding="utf-8")
     intake(synthetic_case)
-    post = lambda path, body: request(port, "POST", path, cookie=cookie, body=body)
+    post = lambda path, body: request(port, "POST", path, session=session, body=body)
     mapping = json.loads(post("/api/import_preview", {"path": "DC01/fw.csv"})[1])["mapping"]
     with pytest.raises(MappingError) as refused:
         save_mapping(synthetic_case, "Palo Alto traffic", mapping)
     res, body = post("/api/import", {"paths": ["DC01/fw.csv"], "mapping": mapping, "save_as": "Palo Alto traffic"})
     assert res.status == 400 and json.loads(body)["error"] == str(refused.value)
     assert read_runs(synthetic_case) == []
-    files = json.loads(request(port, "GET", "/api/imports", cookie=cookie)[1])["files"]
+    files = json.loads(request(port, "GET", "/api/imports", session=session)[1])["files"]
     assert [(f["path"], f["imported"]) for f in files] == [("DC01/fw.csv", None)]
 
 
@@ -947,13 +968,13 @@ def test_tools_page_lists_and_runs_a_tool(running, synthetic_case, tmp_path):
     import time
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     app.tool_cache = fake_tool_case(synthetic_case, tmp_path)
-    get = lambda path: json.loads(request(port, "GET", path, cookie=cookie)[1])
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
     tools = get("/api/tools")
     (fake,) = tools["tools"]
     assert (fake["status"], fake["reads"], fake["hosts"]) == ("ready", "1 event log", ["DC01"])
-    res, body = request(port, "POST", "/api/run_tool", cookie=cookie, body={"tool": "fake"})
+    res, body = request(port, "POST", "/api/run_tool", session=session, body={"tool": "fake"})
     assert res.status == 200 and json.loads(body)["job"]["total"] == 1
     for _ in range(100):
         job = get("/api/run_status")["job"]
@@ -962,7 +983,7 @@ def test_tools_page_lists_and_runs_a_tool(running, synthetic_case, tmp_path):
         time.sleep(0.1)
     assert job["finished"] and job["results"][0]["status"] == "ok" and not job["error"]
     assert get("/api/tools")["tools"][0]["status"] == "ran"
-    res, body = request(port, "POST", "/api/run_tool", cookie=cookie, body={"tool": "nope"})
+    res, body = request(port, "POST", "/api/run_tool", session=session, body={"tool": "nope"})
     assert res.status == 400 and "No tool" in json.loads(body)["error"]
 
 
@@ -1056,12 +1077,12 @@ def test_host_split_routes(running):
     """The preview is a GET, and a host whose event logs record one computer has nothing to split; the meta
     and every Hosts panel answer carry the mixed hosts and the splits."""
     app, port, _ = running
-    cookie = login(port, app)
-    res, body = request(port, "GET", "/api/host_split?host=DC01", cookie=cookie)
+    session = login(port, app)
+    res, body = request(port, "GET", "/api/host_split?host=DC01", session=session)
     assert res.status == 400 and "nothing to split" in json.loads(body)["error"]
-    meta = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+    meta = json.loads(request(port, "GET", "/api/meta", session=session)[1])
     assert (meta["mixed"], meta["splits"]) == ([], [])
-    res, body = request(port, "POST", "/api/host", cookie=cookie, body={"keep_host": "DC01"})
+    res, body = request(port, "POST", "/api/host", session=session, body={"keep_host": "DC01"})
     assert res.status == 400 and "don't record several computers" in json.loads(body)["error"]
 
 
@@ -1074,11 +1095,11 @@ def test_a_fault_in_a_route_is_answered_500_with_its_message(running, monkeypatc
         raise OSError(22, "Invalid argument")
 
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     monkeypatch.setitem(server.GET_ROUTES, "/api/marks", broken)
-    res, body = request(port, "GET", "/api/marks", cookie=cookie)
+    res, body = request(port, "GET", "/api/marks", session=session)
     assert res.status == 500 and json.loads(body) == {"error": "OSError: [Errno 22] Invalid argument"}
-    assert request(port, "GET", "/api/counts", cookie=cookie)[0].status == 200   # the server still answers
+    assert request(port, "GET", "/api/counts", session=session)[0].status == 200   # the server still answers
 
 
 def test_the_meta_names_every_tool_and_every_artifact_the_parsers_write():
@@ -1106,21 +1127,21 @@ def test_a_number_field_that_isnt_one_is_answered_400(running):
     in the console, where bad text is answered 400. Each such field is a 400 naming the field, and nothing is
     journaled."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     before = journaled(app)
     fields = [("/api/undo", {}, "seq"), ("/api/setting", {"name": "event_threshold"}, "value"),
               ("/api/host", {"host": "DC01"}, "offset_seconds"), ("/api/export", {"end": T0}, "start"),
               ("/api/export", {"start": T0}, "end")]
     for path, body, name in fields:
         for value in (None, [1], {"n": 1}, "many"):
-            res, answer = request(port, "POST", path, cookie=cookie, body={**body, name: value})
+            res, answer = request(port, "POST", path, session=session, body={**body, name: value})
             assert (res.status, json.loads(answer)) == (400, {"error": f"{name} must be a number"}), (path, value)
     # Infinity, which Python's JSON reader takes, isn't a whole number: int() raises OverflowError.
-    res, answer = request(port, "POST", "/api/setting", cookie=cookie,
+    res, answer = request(port, "POST", "/api/setting", session=session,
                           body={"name": "event_threshold", "value": float("inf")})
     assert (res.status, json.loads(answer)) == (400, {"error": "value must be a number"})
     assert journaled(app) == before
-    res, answer = request(port, "POST", "/api/setting", cookie=cookie, body={"name": "event_threshold", "value": 20000})
+    res, answer = request(port, "POST", "/api/setting", session=session, body={"name": "event_threshold", "value": 20000})
     assert res.status == 200 and json.loads(answer)["value"] == 20000
 
 

@@ -25,8 +25,8 @@ SETTINGS = ("SELECT current_setting('autoinstall_known_extensions'), "
 DEFAULT_CONNECTION = re.compile(r"\bduckdb\.(?!connect\()[a-z_]+\(")   # duckdb.sql(...), duckdb.read_csv(...)
 
 
-def call(port, cookie, method, path, body=None):
-    res, payload = request(port, method, path, cookie=cookie, body=body)
+def call(port, session, method, path, body=None):
+    res, payload = request(port, method, path, session=session, body=body)
     assert res.status == 200, (path, res.status, payload[:300])
     return json.loads(payload)
 
@@ -49,28 +49,28 @@ def test_a_load_a_search_and_every_export_stay_on_this_machine(tmp_path, network
     case = create_case(tmp_path / "case", "No network", evidence, "cody")
     intake(case)
     for app, port, _ in serving(case):
-        cookie = login(port, app)
+        session = login(port, app)
         # A case load: found tool output, as a background job, and an imported text log
-        job = call(port, cookie, "POST", "/api/load_output", {"key": "evtxecmd_csv"})["job"]
+        job = call(port, session, "POST", "/api/load_output", {"key": "evtxecmd_csv"})["job"]
         deadline = time.monotonic() + 60
         while not job["finished"] and time.monotonic() < deadline:
             time.sleep(0.05)
-            job = call(port, cookie, "GET", "/api/run_status")["job"]
+            job = call(port, session, "GET", "/api/run_status")["job"]
         assert job["finished"] and not job["error"] and [r["rows"] for r in job["results"]] == [2], job
-        mapping = call(port, cookie, "POST", "/api/import_preview", {"path": "IDS/fast.log"})["mapping"]
+        mapping = call(port, session, "POST", "/api/import_preview", {"path": "IDS/fast.log"})["mapping"]
         mapping = {**mapping, "time": {**mapping["time"], "zone": "UTC"}}
-        imported = call(port, cookie, "POST", "/api/import", {"paths": ["IDS/fast.log"], "mapping": mapping})
+        imported = call(port, session, "POST", "/api/import", {"paths": ["IDS/fast.log"], "mapping": mapping})
         assert [r["rows"] for r in imported["runs"]] == [5], imported
         # A search, then a mark for the marked exports and the indicators
-        found = call(port, cookie, "GET", f"/api/search?q={quote('alice')}")
+        found = call(port, session, "GET", f"/api/search?q={quote('alice')}")
         assert found["total"] == 2, found["total"]
-        call(port, cookie, "POST", "/api/mark", {"uids": [found["events"][0]["uid"]], "value": "malicious"})
+        call(port, session, "POST", "/api/mark", {"uids": [found["events"][0]["uid"]], "value": "malicious"})
         # Each export: the timeline in both formats and every scope, the indicators, the report, and the audit trail
         first, last = app.con.execute("SELECT min(ts_us), max(ts_us) + 1 FROM events").fetchone()
         scopes = ({"marks": "all", "start": first, "end": last}, {"marks": "marked"}, {"marks": "flagged"})
-        written = [call(port, cookie, "POST", "/api/export", {"format": fmt, **scope})
+        written = [call(port, session, "POST", "/api/export", {"format": fmt, **scope})
                    for fmt in ("csv", "jsonl") for scope in scopes]
-        written +=[call(port, cookie, "POST", path, {}) for path in ("/api/indicators", "/api/report", "/api/audit_export")]
+        written +=[call(port, session, "POST", path, {}) for path in ("/api/indicators", "/api/report", "/api/audit_export")]
         assert [w["rows"] for w in written[:6]] == [7, 1, 1] * 2 and all(w.get("path") for w in written), written
     assert network_guard == []
     assert opened and set(opened) == {(False, False)}, opened

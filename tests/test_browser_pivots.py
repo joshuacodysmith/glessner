@@ -537,7 +537,7 @@ def test_show_reasons_folds_and_remembers(browser, pcase, monkeypatch):  # noqa:
     # Where storage is blocked the tick still works for the page
     for page in served_page(browser, pcase):
         page.add_init_script("Object.defineProperty(window, 'localStorage', { get() { throw new Error('blocked'); } });")
-        page.reload()
+        page.goto(page.new_link())   # a reload would find no session in storage
         page.wait_for_function("() => window.__ready === true && window.__app.S.data !== null")
         to_timeline(page)
         select(page, special)

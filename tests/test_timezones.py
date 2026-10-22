@@ -84,15 +84,15 @@ def test_validate_axes():
 
 def test_zone_axes_saved_with_the_case(running):
     app, port, _ = running
-    cookie = login(port, app)
-    res, _ = request(port, "POST", "/api/setting", cookie=cookie,
+    session = login(port, app)
+    res, _ = request(port, "POST", "/api/setting", session=session,
                      body={"name": "time_zones", "value": [{"host": "DC01"}, {"zone": "Europe/London"}]})
     assert res.status == 200
     line = json.loads((app.case.folder / "journal.jsonl").read_text().splitlines()[-1])
     assert (line["action"], line["name"], line["value"]) == (
         "case_setting", "time_zones", [{"host": "DC01"}, {"zone": "Europe/London"}])
-    meta = json.loads(request(port, "GET", "/api/meta", cookie=cookie)[1])
+    meta = json.loads(request(port, "GET", "/api/meta", session=session)[1])
     assert meta["time_zones"] == [{"host": "DC01"}, {"zone": "Europe/London"}]
     assert all("timezone" in h for h in meta["hosts"])
-    assert request(port, "POST", "/api/setting", cookie=cookie,
+    assert request(port, "POST", "/api/setting", session=session,
                    body={"name": "time_zones", "value": [{"host": "NOPE"}]})[0].status == 400

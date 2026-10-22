@@ -314,9 +314,9 @@ def _remap(case: Case, con: duckdb.DuckDBPyConnection | None, runs: list[RunReco
     unrecorded = _unrecorded(con, runs, groups) if con is not None else []
     for run_id in unrecorded:
         strays.setdefault(run_id, set()).update(_rows_of(con, run_id))
-    referenced = referenced_ids(case.folder / JOURNAL_FILE)
-    pairs, unplaced, merged = _place(referenced, parsed)   # step 7
-    dropped = _dropped(case, con, members, reloaded, parsed, strays, referenced)
+    named, candidates = referenced_ids(case.folder / JOURNAL_FILE)
+    placed = _place(named, parsed, candidates)   # step 7
+    dropped = _dropped(case, con, members, reloaded, parsed, strays, named)
     if con is not None:
         _reload(case, con, groups, reloads)   # step 8
         for run_id in unrecorded:
@@ -327,14 +327,13 @@ def _remap(case: Case, con: duckdb.DuckDBPyConnection | None, runs: list[RunReco
     _reached(9)
     lines = sorted({f"{old} {new}" for p in parsed.values() for old, new in p.ids.items() if old != new})
     text = "\n".join(lines)
-    rekey = {"reasons": REASONS, "pairs": pairs, "unplaced": unplaced, "merged": merged, "skipped_runs": skipped,
-             "dropped_runs": dropped, "unpinned_runs": unpinned,
+    rekey = {"reasons": REASONS, **placed, "skipped_runs": skipped, "dropped_runs": dropped, "unpinned_runs": unpinned,
              "runs": {run_id: {"parser": p.record.parser, "events": len(p.ids),
                                "changed": sum(old != new for old, new in p.ids.items())}
                       for run_id, p in sorted(parsed.items())},
              "map_size": len(lines), "map_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     loads = {run_id: p for run_id, p in parsed.items() if run_id in reloaded}   # the case's events
-    return {"text": _sentence(loads, pairs, unplaced), "rekey": rekey}   # step 10
+    return {"text": _sentence(loads, placed["pairs"], placed["unplaced"], named), "rekey": rekey}   # step 10
 
 
 def _check(case: Case, con: duckdb.DuckDBPyConnection, groups: dict, parsed: dict[str, Parsed],
@@ -397,22 +396,31 @@ def _dropped(case: Case, con: duckdb.DuckDBPyConnection | None, members: list[Ru
     return dict(sorted({**dropped, **from_db}.items()))
 
 
-def _place(referenced: set[str], parsed: dict[str, Parsed]) -> tuple[dict, dict, dict]:
-    """Step 7: each ID the journal names that a run gives under format 1's rule, with its successor in every run that
-    gives it, itself when a run left it unchanged. One successor other than itself is a pair; two or more leave it
-    unplaced, with all of them as candidates. An ID no run gives is outside the map and stays as written. The IDs
-    two or more references reach, an unchanged one reaching itself, are merged."""
+def _place(named: set[str], parsed: dict[str, Parsed], candidates: set[str]) -> dict:
+    """Step 7, the rekey map's pairs, unplaced, merged, and candidates_unplaced: each ID the journal names (`named`) and
+    each event an earlier rekey's unplaced ID may have meant (`candidates`, journal.referenced_ids) that a run gives
+    under format 1's rule, with its successor in every run that gives it, itself when a run left it unchanged. One
+    successor other than itself is a pair; two or more leave it unplaced, with all of them as candidates. An ID no run
+    gives is outside the map and stays as written. The IDs two or more of the journal's references reach, an unchanged
+    one reaching itself, are merged. A candidate no entry names is no reference: it is placed so the earlier rekey's
+    list reads through this map (journal.unplaced), and merges nothing. When it is left unplaced it goes in
+    candidates_unplaced, apart from the IDs the journal names, and that map is left out when it holds none."""
+    placing = named | candidates
     successors: dict[str, set[str]] = {}
     for p in parsed.values():
-        for uid in referenced & p.ids.keys():
+        for uid in placing & p.ids.keys():
             successors.setdefault(uid, set()).add(p.ids[uid])
     pairs = {uid: next(iter(s)) for uid, s in sorted(successors.items()) if len(s) == 1 and uid not in s}
-    unplaced = {uid: sorted(s) for uid, s in sorted(successors.items()) if len(s) > 1}
+    several = {uid: sorted(s) for uid, s in sorted(successors.items()) if len(s) > 1}
+    unplaced = {uid: s for uid, s in several.items() if uid in named}
     reach: dict[str, list[str]] = {}
-    for uid in sorted(referenced - unplaced.keys()):
+    for uid in sorted(named - unplaced.keys()):
         reach.setdefault(pairs.get(uid, uid), []).append(uid)
     merged = {final: uids for final, uids in sorted(reach.items()) if len(uids) > 1}
-    return pairs, unplaced, merged
+    fields = {"pairs": pairs, "unplaced": unplaced, "merged": merged}
+    if left := {uid: s for uid, s in several.items() if uid not in named}:
+        fields["candidates_unplaced"] = left
+    return fields
 
 
 def _rows_of(con: duckdb.DuckDBPyConnection | None, run_id: str) -> set[str]:
@@ -510,10 +518,12 @@ def _pin_one(case: Case, r: RunRecord, outside: int) -> str:
     return ""
 
 
-def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict) -> str:
+def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict, named: set[str]) -> str:
     """The entry's text: the events of the runs a rebuild loads whose IDs the new rules change, by tool, and the
-    journal references the map moved. Counted from the runs' output, so a run of the step after a crash says the same.
-    A moved case's SQLECmd rows loaded before the move already have their new IDs, and are counted too."""
+    journal references the map moved: the IDs the journal names (`named`) among its pairs, and its unplaced IDs. The
+    pairs also hold the earlier rekeys' candidates it placed, which are no reference. Counted from the runs' output, so a
+    run of the step after a crash says the same. A moved case's SQLECmd rows loaded before the move already have their
+    new IDs, and are counted too."""
     changed: dict[str, set[str]] = {}
     for p in parsed.values():
         changed.setdefault(p.record.parser, set()).update(new for old, new in p.ids.items() if old != new)
@@ -521,13 +531,12 @@ def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict) -> str:
               for name, label in LABELS.items() if changed.get(name)]
     what = "Event IDs no longer depend on where or in which time zone a tool ran"
     text = f"{what}: {_listed(counts)} took new IDs." if counts else f"{what}; no event here took a new ID."
-    n = len(pairs)
-    if not n and not unplaced:
+    n, u = len(pairs.keys() & named), len(unplaced)
+    if not n and not u:
         return f"{text} No journal reference changed."
     text += (" No journal reference was placed on a new ID." if n == 0
              else " 1 journal reference now names its event's new ID." if n == 1
              else f" {n:,} journal references now name their events' new IDs.")
-    u = len(unplaced)
     if not u:
         return f"{text} None was left unplaced."
     return (f"{text} {u:,} {'was' if u == 1 else 'were'} left unplaced, each naming more than one event; the Case overview "

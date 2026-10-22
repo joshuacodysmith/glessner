@@ -132,14 +132,14 @@ def test_the_refusals_the_page_relies_on_and_the_consent_a_large_link_records(ru
     confirmed over its events is written as its add and a link carrying the consent, since format 3 carries `confirmed`
     on a link and not on an add; a confirmed request naming no events is refused."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
     many = [logon(T0 + (1000 + n) * SEC, 9900 + n, DC_LOG, user="bulk", ltype="3", ip="10.42.85.50") for n in range(30)]
     load(app.case.db_path, many, host="DC01", tool="evtxecmd", tool_version="t", run_id="bulk", replaces_sources=[],
          staging_dir=app.case.folder)
     uids = [r[0] for r in app.con.execute("SELECT event_uid FROM events WHERE run_id = 'bulk' ORDER BY ts_us").fetchall()]
 
     def finding(body):
-        res, payload = request(port, "POST", "/api/finding", cookie=cookie, body=body)
+        res, payload = request(port, "POST", "/api/finding", session=session, body=body)
         return res.status, json.loads(payload)
 
     status, made = finding({"op": "add", "title": "Bulk logons", "severity": "Medium", "targets": uids[:2]})

@@ -49,8 +49,12 @@ def node(p, keys):
     return p.locator(f"#labels .row[data-row='{row}']")
 
 
-def reload(p):
-    p.reload()
+def reload(p, url=None):
+    """The page again: reloaded, or opened at `url` when it can't keep its session across a reload."""
+    if url is None:
+        p.reload()
+    else:
+        p.goto(url)
     p.wait_for_function(READY)
     to_timeline(p)
 
@@ -170,7 +174,7 @@ def test_the_key_keeps_the_20_cases_used_last_and_works_without_storage(browser,
         assert stored(p)["cases"][0]["key"] == key
         # Storage blocked: every read and write is in try and catch
         p.add_init_script("Object.defineProperty(window, 'localStorage', { get() { throw new Error('storage blocked'); } });")
-        reload(p)
+        reload(p, p.new_link())
         assert all(twisty == "▸" for twisty, _ in rows(p))
         group(p, "Unreviewed").click()
         assert ["", "DC01"] in rows(p) and p.locator("#foldAll").inner_text() == "Fold all"

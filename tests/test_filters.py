@@ -73,14 +73,14 @@ def test_hidden_logons_lose_their_arrows(synthetic_case):
 
 def test_filter_api_sources_categories_and_export(running):
     app, port, _ = running
-    cookie = login(port, app)
-    get = lambda path: json.loads(request(port, "GET", path, cookie=cookie)[1])
-    res, body = request(port, "POST", "/api/filter", cookie=cookie, body={"hide": [{"host": "DC01", "channel": "Security"}]})
+    session = login(port, app)
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
+    res, body = request(port, "POST", "/api/filter", session=session, body={"hide": [{"host": "DC01", "channel": "Security"}]})
     assert res.status == 200
     fid = json.loads(body)["id"]
     hosts = {lane["keys"][0]: lane["count"] for lane in get(f"/api/lanes?groupby=host&filter={fid}")["lanes"]}
     assert hosts == {"DC01": 2, "DESKTOP": 5}
-    assert request(port, "GET", "/api/lanes?groupby=host&filter=0000000000000000", cookie=cookie)[0].status == 400
+    assert request(port, "GET", "/api/lanes?groupby=host&filter=0000000000000000", session=session)[0].status == 400
     src = get("/api/sources")
     assert {(t["tool"], t["artifact"], t["count"]) for t in src["types"]} == {("evtxecmd", "evtx", 8), ("recmd", "registry", 4)}
     dc = next(h for h in src["hosts"] if h["host"] == "DC01")
@@ -97,9 +97,9 @@ def test_filter_api_sources_categories_and_export(running):
     assert shown[("DESKTOP", "DESKTOP/Windows/System32/winevt/Logs/Security.evtx")] == 3 and (
         "DC01", "DC01/Windows/System32/winevt/Logs/Security.evtx") not in shown
     # Exports ignore filters unless asked; asked, the file name and the response say so.
-    full = json.loads(request(port, "POST", "/api/export", cookie=cookie,
+    full = json.loads(request(port, "POST", "/api/export", session=session,
                               body={"start": T0 - 7200 * SEC, "end": T0 + 7200 * SEC})[1])
-    part = json.loads(request(port, "POST", "/api/export", cookie=cookie,
+    part = json.loads(request(port, "POST", "/api/export", session=session,
                               body={"start": T0 - 7200 * SEC, "end": T0 + 7200 * SEC, "filter": fid})[1])
     assert (full["rows"], part["rows"]) == (12, 7) and "_filtered" in part["path"] and "_filtered" not in full["path"]
     assert part["filter"] == "Hidden: events with channel Security and host DC01."
@@ -127,14 +127,14 @@ def test_sources_list_the_record_types_in_a_capture_s_file_and_hide_one(syntheti
 
     load_capture_records(synthetic_case)
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        get = lambda path: json.loads(request(port, "GET", path, cookie=cookie)[1])   # noqa: B023
+        session = login(port, app)
+        get = lambda path: json.loads(request(port, "GET", path, session=session)[1])   # noqa: B023
         hosts = {h["host"]: h for h in get("/api/sources")["hosts"]}
         assert hosts["network"]["artifacts"][0]["files"] == [{"file": NETWORK_CAPTURE, "count": 6, "channels": [
             {"channel": "flow", "count": 3}, {"channel": "dns", "count": 2}, {"channel": "alert", "count": 1}]}]
         assert all("channels" not in f for a in hosts["DC01"]["artifacts"] for f in a["files"])
         flow = {"host": "network", "tool": "suricata", "artifact": "suricata", "file": NETWORK_CAPTURE, "channel": "flow"}
-        fid = json.loads(request(port, "POST", "/api/filter", cookie=cookie, body={"hide": [flow]})[1])["id"]
+        fid = json.loads(request(port, "POST", "/api/filter", session=session, body={"hide": [flow]})[1])["id"]
         shown = sorted(r[4:] for r in get(f"/api/shown?filter={fid}")["counts"] if r[0] == "network")
         assert shown == [["alert", 1], ["dns", 2]]
         lanes_now = {lane["keys"][0]: lane["count"] for lane in get(f"/api/lanes?groupby=host&filter={fid}")["lanes"]}
@@ -232,8 +232,8 @@ def test_filtered_findings_say_when_suggested_tags_are_included(synthetic_case):
     load(synthetic_case.db_path, [ATTACK_HIT], host="DC01", tool="hayabusa", tool_version="t", run_id="r6",
          replaces_sources=[], staging_dir=synthetic_case.folder)
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        post = lambda path, body: json.loads(request(port, "POST", path, cookie=cookie, body=body)[1])   # noqa: B023
+        session = login(port, app)
+        post = lambda path, body: json.loads(request(port, "POST", path, session=session, body=body)[1])   # noqa: B023
         post("/api/mark", {"uids": [rdp_uid(app.con)], "value": "suspicious"})   # findings list marked events only
         span = {"start": T0 - 7200 * SEC, "end": T0 + 7200 * SEC}
         results = {}

@@ -638,17 +638,17 @@ def test_the_header_says_journal_changed_only_on_a_break(synthetic_case):
     app = worked(synthetic_case)
     app.con.close()
     for app, port, _ in __import__("conftest").serving(synthetic_case):
-        cookie = login(port, app)
-        state = json.loads(request(port, "GET", "/api/case_state", cookie=cookie)[1])
+        session = login(port, app)
+        state = json.loads(request(port, "GET", "/api/case_state", session=session)[1])
         assert state["journal"]["broken"] is False and state["journal"]["seq"] == app.journal.chain.seq
         path = journal_path(synthetic_case)
         data = lines(path.read_bytes())
         data[1] = data[1].replace(b'"seq": 2', b'"seq":  2')
         path.write_bytes(b"".join(line + b"\n" for line in data))
-        assert request(port, "POST", "/api/journal_check", cookie=cookie, body={})[0].status == 200
-        state = json.loads(request(port, "GET", "/api/case_state", cookie=cookie)[1])
+        assert request(port, "POST", "/api/journal_check", session=session, body={})[0].status == 200
+        state = json.loads(request(port, "GET", "/api/case_state", session=session)[1])
         assert state["journal"]["broken"] is True and state["journal"]["read_only"].startswith(WRITES)
-        res, body = request(port, "POST", "/api/followup", cookie=cookie, body={"uids": ["a" * 32], "done": True})
+        res, body = request(port, "POST", "/api/followup", session=session, body={"uids": ["a" * 32], "done": True})
         assert res.status == 400 and json.loads(body)["error"].startswith(WRITES)
 
 
@@ -675,28 +675,29 @@ def test_a_followup_and_a_finding_link_read_through_a_chained_rekey(synthetic_ca
 
 # ---------- Concurrency: the report under app.lock ----------
 
-def test_a_mark_made_during_the_summary_s_re_hash_follows_its_head(synthetic_case, monkeypatch):
-    """Report and marks: a mark sent during the report's evidence re-hash waits for it; the summary's head, its listed
-    events, and its notes agree, and the mark's entry follows the head."""
-    from glessner import export as export_module
-
+def test_a_mark_made_while_the_report_is_written_follows_its_head(synthetic_case, monkeypatch):
+    """Report and marks: a mark sent while the report is written, under the case lock, waits for it; the report's head,
+    its listed events, and its notes agree, and the mark's entry follows the head."""
     with_evidence(synthetic_case)
     a, b, _ = evtx_uids(synthetic_case)
     app = worked(synthetic_case)
-    real, answers = export_module.check_files, {}
+    real, answers, checks = app.journal.full_check, {}, []
 
-    def slow(case, **kw):
-        thread = threading.Thread(target=lambda: answers.update(mark=api_mark(app, {"uids": [b], "value": "malicious"})))
-        thread.start()
-        thread.join(0.5)
-        answers["waited"] = thread.is_alive()
-        answers["thread"] = thread
-        return real(case, **kw)
+    def slow(*args, **kwargs):
+        checks.append(1)
+        if len(checks) == 2:   # the report's first check comes before it takes the case lock; its second is made under it
+            thread = threading.Thread(target=lambda: answers.update(mark=api_mark(app, {"uids": [b], "value": "malicious"})))
+            thread.start()
+            thread.join(0.5)
+            answers["waited"] = thread.is_alive()
+            answers["thread"] = thread
+        return real(*args, **kwargs)
 
     try:
         api_mark(app, {"uids": [a], "value": "malicious"})
-        monkeypatch.setattr(export_module, "check_files", slow)
+        monkeypatch.setattr(app.journal, "full_check", slow)
         res = api_report(app, {})
+        assert len(checks) == 2
         answers["thread"].join(10)
         _, seq = printed_head(Path(res["path"]))
         text = Path(res["path"]).read_text(encoding="utf-8")
@@ -704,6 +705,37 @@ def test_a_mark_made_during_the_summary_s_re_hash_follows_its_head(synthetic_cas
         at_head = replay_to(journal_path(synthetic_case), seq)
         flagged = {u for u, m in at_head.marks.items() if m.value == "malicious"}
         assert flagged == {a} and b not in text and a in text
+    finally:
+        app.con.close()
+
+
+def test_a_mark_made_during_the_reports_re_hash_does_not_wait_and_the_report_lists_it(synthetic_case, monkeypatch):
+    """The report hashes the evidence before it takes the case lock, so a mark sent meanwhile is made at once, and the
+    report that follows prints a head that names the mark's entry and lists the marked event."""
+    from glessner import server as server_module
+
+    with_evidence(synthetic_case)
+    a, b, _ = evtx_uids(synthetic_case)
+    app = worked(synthetic_case)
+    real, answers = server_module.check_files, {}
+
+    def slow(case, **kw):
+        thread = threading.Thread(target=lambda: answers.update(mark=api_mark(app, {"uids": [b], "value": "malicious"})))
+        thread.start()
+        thread.join(5)
+        answers["waited"] = thread.is_alive()
+        return real(case, **kw)
+
+    try:
+        api_mark(app, {"uids": [a], "value": "malicious"})
+        monkeypatch.setattr(server_module, "check_files", slow)
+        res = api_report(app, {})
+        _, seq = printed_head(Path(res["path"]))
+        text = Path(res["path"]).read_text(encoding="utf-8")
+        assert not answers["waited"] and answers["mark"]["seq"] == seq and res["head_seq"] == seq + 1
+        at_head = replay_to(journal_path(synthetic_case), seq)
+        flagged = {u for u, m in at_head.marks.items() if m.value == "malicious"}
+        assert flagged == {a, b} and a in text and b in text
     finally:
         app.con.close()
 

@@ -17,6 +17,7 @@ Example:
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -230,6 +231,8 @@ def parse_time(value) -> int:
 
 def _number(value, field_name: str) -> int:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise RuleError(f"{field_name} needs a finite number: {value!r}")
         return int(value)
     if field_name == "ts_us":
         try:

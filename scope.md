@@ -74,6 +74,7 @@ The import and the event XML reader are the app's own readers. Binary artifacts 
 | Offsets on the host's own times | A clock offset moves only times its host's clock wrote, so a PE file's link time keeps its value. |
 | A closed case kept read-only | A closed case stays read-only until the analyst reopens it with a reason, which is journaled and re-hashes the evidence. Viewing, search, and exports still work. |
 | Logs from outside the evidence folder | Logs copied into the case folder and hashed into the manifest as added evidence, never into the evidence folder. |
+| Disk images recognized at intake | Intake recognizes a disk image or container, such as an E01 or a VHDX, and tells the analyst to mount or extract it first. The app still reads no image's file system. |
 | More IDS formats | Sguil's event text and Snort's full alert format. |
 
 ## Not in scope
@@ -82,6 +83,7 @@ The import and the event XML reader are the app's own readers. Binary artifacts 
 |---|---|
 | More than one analyst working a case at once | The journal format keeps this possible later. |
 | Downloading or installing tools | The app shows URLs only. Downloading would need network access, publisher checksum checks, and update handling. |
+| Reading disk images' file systems, recovering deleted files, and carving | The app reads collected files, so this work comes before the case. Tools such as [The Sleuth Kit](https://www.sleuthkit.org/sleuthkit/) read an image's file system and recover deleted files, and [PhotoRec](https://www.cgsecurity.org/wiki/PhotoRec) carves files from unallocated space. Recognizing a disk image at intake, and saying what to do with it, is planned for a later build. |
 | Memory images | The app reads a Windows triage collection. |
 | Mobile devices | Outside the Windows triage set. |
 | macOS and Linux hosts' own artifacts | No parser reads their file systems or system records. Their text logs, such as syslog or a web server's access log, can be imported. |

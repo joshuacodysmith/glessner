@@ -60,7 +60,7 @@ Run every installed tool that has evidence, and load the tool output found in th
 uv run glessner run C:\Cases\CASE01 --all
 ```
 
-Open the case. The server listens on 127.0.0.1 only, and opens your browser with a link that carries the session token and works until you stop the server. It prints the link too, and `--no-browser` skips opening the browser:
+Open the case. The server listens on 127.0.0.1 only, and opens your browser with a start link that works once: the page trades the link's token for a session the browser keeps for this server's address and port. It prints the link too, for when the browser doesn't open. A used link opens nothing in a second browser, so `--no-browser`, which skips opening the browser, lets you open the link in the browser you choose:
 
 ```bash
 uv run glessner serve C:\Cases\CASE01
@@ -107,7 +107,7 @@ Each command takes the case folder first. `new-case` makes that folder, `copy-ca
 ## Limits
 
 - Pre-alpha. Expect changes to the page and the case format. A newer build upgrades a case when it opens it, and an older build then refuses that case, so work on copies.
-- No blind round yet. The app has been checked against public practice cases whose answers are published, and no analyst has yet worked a case with it without knowing the answer.
+- No blind round yet. The app has been checked against three public practice sets whose answers are published, and [checks/](checks/) holds a write-up of each. No analyst has yet worked a case with it without knowing the answer.
 - About 10 hosts per case. The performance figures come from synthetic cases built from copies of two hosts: 5.2 million events on 10 hosts, and 10.5 million. A real collection of that size hasn't been tried.
 - No network calls is a tested claim for the app itself: a test checks it across a case load, a search, and every export. The tools it runs are separate programs, outside that test.
 - Windows only, for the analyst's machine and for the hosts' own artifacts. Text logs from other systems, such as syslog, can be imported.
@@ -176,7 +176,7 @@ Datasets:
 - [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES), by sbousseaden, under the GPL-3.0 license.
 - The [Malware-Traffic-Analysis.net](https://www.malware-traffic-analysis.net/) [exercise of 2016-01-07](https://www.malware-traffic-analysis.net/2016/01/07/index.html).
 
-The app was checked against all three. This repository holds none of their files.
+The app was checked against all three, and [checks/](checks/) holds a write-up of each check. This repository holds none of their files.
 
 Glessner is named for Frances Glessner Lee, whose models trained investigators to observe before they conclude. [about_the_name.md](about_the_name.md) says what the app takes from her work.
 
@@ -193,6 +193,7 @@ Joshua Cody Smith designed Glessner and directed its build. AI coding agents wro
 | [known_limitations.md](known_limitations.md) | What the app doesn't do yet, or doesn't do well |
 | [scope.md](scope.md) | What the app does, what is planned, and what it leaves out |
 | [glossary.md](glossary.md) | The names for every part of the page and the data, including the search syntax |
+| [checks/](checks/) | Write-ups of the open-answer checks on three public practice sets, with each check's score under one rubric, each item's state, and the gaps found |
 | [coverage_reference.md](coverage_reference.md) | What the app reads, what reaches the timeline, the rule sets that flag events, and the Windows sources it doesn't cover yet |
 | [about_the_name.md](about_the_name.md) | The namesake, Frances Glessner Lee, and what the app takes from her work |
 | [SECURITY.md](SECURITY.md) | How to report a security problem |

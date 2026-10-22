@@ -120,12 +120,12 @@ def test_a_copy_of_a_case_from_before_the_rename_opens_rebuilds_and_exports(tmp_
 
     case = open_case(folder)
     for app, port, _ in serving(case):
-        cookie = login(port, app)
-        overview = json.loads(request(port, "GET", "/api/overview", cookie=cookie)[1])
+        session = login(port, app)
+        overview = json.loads(request(port, "GET", "/api/overview", session=session)[1])
         people = [e for e in old_entries if e.get("who") not in APP_NAMES]
         assert people   # the case has analyst entries, so the filter is tested
         assert overview["progress"]["last"]["seq"] == people[-1]["seq"]
-        trail = json.loads(request(port, "GET", "/api/audit?kind=Builds", cookie=cookie)[1])
+        trail = json.loads(request(port, "GET", "/api/audit?kind=Builds", session=session)[1])
         texts = [r["text"] for r in trail["rows"]]   # newest first
         assert texts[0] == f"Opened with glessner {FAKE}"
         # The open upgrades the format 1 case first, where no event of this case changes its ID, and then seals its
@@ -165,7 +165,7 @@ def test_browser_preferences_from_before_the_rename_are_copied_once(page):  # no
         localStorage.setItem('{OLD}.legendOpen', 'open');
         localStorage.setItem('glessner.legendOpen', 'closed');
     }}""")
-    page.reload()
+    page.goto(page.new_link())   # the clear took the session, so a reload would find none
     page.wait_for_function("() => window.__ready === true")
     got = page.evaluate(f"""() => ['fadePivotResults', 'quickActionsHidden', 'legendOpen', 'rawFieldsOpen'].map(
         (k) => [localStorage.getItem('glessner.' + k), localStorage.getItem('{OLD}.' + k)])""")

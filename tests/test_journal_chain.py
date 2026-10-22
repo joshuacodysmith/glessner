@@ -643,22 +643,111 @@ def test_two_processes_number_their_entries_once_each(chained_case):
     assert agree(journal_of(chained_case))
 
 
-def _holder(case, then: str = "sleep") -> subprocess.Popen:
+# Each told "hold", holds the lock through held() until the next line, then lets go and appends at once
+HOLDER = textwrap.dedent("""
+    import sys
+    from pathlib import Path
+    from glessner.case import open_case
+    from glessner.journal import Journal
+    j = Journal(open_case(Path(sys.argv[1])))
+    print("ready", flush=True)
+    while sys.stdin.readline().strip() == "hold":
+        with j.held():
+            print("held", flush=True)
+            sys.stdin.readline()
+        print(j.append("note", target=sys.argv[2], text="holder")["seq"], flush=True)
+    """)
+# Each told "append", appends, and says "waiting" at the append's first sleep, which follows its first failed try of
+# the lock
+WAITER = textwrap.dedent("""
+    import sys, time
+    from pathlib import Path
+    from glessner.case import open_case
+    from glessner.journal import Journal
+    j = Journal(open_case(Path(sys.argv[1])))
+    sleep, told = time.sleep, False
+
+    def waiting(seconds):
+        global told
+        if not told:
+            told = True
+            print("waiting", flush=True)
+        sleep(seconds)
+
+    time.sleep = waiting
+    print("ready", flush=True)
+    while sys.stdin.readline().strip() == "append":
+        told = False
+        print(j.append("note", target=sys.argv[2], text="waiter")["seq"], flush=True)
+    """)
+
+
+def test_a_waiting_process_goes_before_the_holder_takes_the_lock_again(chained_case):
+    """One process holds the lock through held() while another's append waits for it; the holder lets go and appends at
+    once, and the waiting append goes first, every round. Without a fair hand-off the holder, back within a fraction of
+    a millisecond, takes the lock again before the waiter's next try."""
+    procs = holder, waiter = [subprocess.Popen([sys.executable, "-c", script, str(chained_case.folder), uid],
+                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                              for script, uid in ((HOLDER, UID), (WAITER, OTHER))]
+
+    def say(proc, line=""):
+        proc.stdin.write(f"{line}\n")
+        proc.stdin.flush()
+
+    def heard(proc) -> str:
+        return proc.stdout.readline().strip()
+
+    try:
+        assert heard(holder) == heard(waiter) == "ready"
+        for _ in range(5):
+            say(holder, "hold")
+            assert heard(holder) == "held"
+            say(waiter, "append")
+            assert heard(waiter) == "waiting"
+            say(holder)   # the holder lets go, then appends at once
+            assert int(heard(waiter)) < int(heard(holder))
+        for proc in procs:
+            proc.stdin.close()
+        assert [p.wait(60) for p in procs] == [0, 0]
+    finally:
+        for proc in procs:
+            proc.kill()
+            proc.wait()
+    seqs = [json.loads(line)["seq"] for line in lines(journal_of(chained_case).read_bytes())]
+    assert seqs == list(range(1, 12))
+    assert agree(journal_of(chained_case))
+
+
+# The bytes of journal.lock: a writer holds byte 0, and a writer waiting for it holds the gate
+WRITER, GATE = 0, 1
+HELD_BY = pytest.mark.parametrize("byte", [WRITER, GATE], ids=["writer", "gate"])
+
+
+def _holder(case, *taken: int) -> subprocess.Popen:
+    """A process that locks these bytes of journal.lock, then lets go of each byte named on a line of its stdin, and
+    exits when its stdin closes."""
     script = textwrap.dedent(f"""
-        import msvcrt, os, time
+        import msvcrt, os, sys
         fd = os.open({str(case.folder / "journal.lock")!r}, os.O_RDWR | os.O_CREAT | os.O_BINARY)
-        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        for byte in {taken!r}:
+            os.lseek(fd, byte, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         print("held", flush=True)
-        time.sleep(120)
+        for line in sys.stdin:
+            os.lseek(fd, int(line), os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            print("let go", flush=True)
         """)
-    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     assert proc.stdout.readline().strip() == "held"
     return proc
 
 
 @WINDOWS
-def test_a_killed_holder_s_lock_is_taken_within_the_wait(chained_case):
-    holder = _holder(chained_case)
+@HELD_BY
+def test_a_killed_holder_s_lock_is_taken_within_the_wait(chained_case, byte):
+    """Windows lets go of a killed process's locks: a writer's byte 0, or the gate a waiting writer holds."""
+    holder = _holder(chained_case, byte)
     started = time.monotonic()
     killer = threading.Timer(0.5, holder.kill)
     killer.start()
@@ -672,21 +761,79 @@ def test_a_killed_holder_s_lock_is_taken_within_the_wait(chained_case):
 
 
 @WINDOWS
-def test_a_lock_held_past_the_wait_refuses_and_writes_nothing(chained_case, monkeypatch):
+@HELD_BY
+def test_a_lock_held_past_the_wait_refuses_and_writes_nothing(chained_case, monkeypatch, byte):
+    """Another process holds byte 0, as a writer does, or the gate, as a waiting writer does, past the wait: the append
+    refuses within it and writes nothing. It tries the gate every LOCK_RETRY seconds and, once it holds the gate, byte 0
+    every LOCK_TURN_RETRY. The refusal leaves journal.lock closed, and once the holder is gone the next append goes
+    through, so it kept no lock. Only byte 0 is a write in progress to the check."""
     assert jm.LOCK_WAIT == 10
     monkeypatch.setattr(jm, "LOCK_WAIT", 1.0)   # the wait, shortened for the test
+    waits, wait_for = [], jm._wait_for
+
+    def recorded(fd, at, deadline, retry):
+        waits.append((at, retry))
+        wait_for(fd, at, deadline, retry)
+
+    monkeypatch.setattr(jm, "_wait_for", recorded)
     path = journal_of(chained_case)
     before = path.read_bytes()
-    holder = _holder(chained_case)
+    holder = _holder(chained_case, byte)
+    killer = threading.Timer(10, holder.kill)   # ends an append that waits on past the wait
+    killer.start()
     try:
+        assert jm._writing(path) is (byte == WRITER)
         started = time.monotonic()
         with pytest.raises(JournalError, match="Another Glessner process is writing"):
             Journal(chained_case).append("note", target=UID, text="refused")
         assert 0.9 < time.monotonic() - started < 5
+        assert path.read_bytes() == before
+        if byte == WRITER:
+            assert waits == [(GATE, jm.LOCK_RETRY), (WRITER, jm.LOCK_TURN_RETRY)]
+        else:
+            assert waits == [(GATE, jm.LOCK_RETRY)]
+        holder.stdin.close()   # the holder exits and closes its handle
+        assert holder.wait(30) == 0
     finally:
+        killer.cancel()
         holder.kill()
         holder.wait()
-    assert path.read_bytes() == before
+    (chained_case.folder / jm.LOCK_FILE).unlink()   # Windows refuses to delete a file that a handle holds open
+    monkeypatch.undo()   # the whole wait again
+    assert Journal(chained_case).append("note", target=UID, text="after the holder")["seq"] == 2
+
+
+@WINDOWS
+def test_the_wait_at_the_gate_and_at_byte_0_is_one_wait(chained_case, monkeypatch):
+    """Another process holds byte 0 and the gate, and lets go of the gate partway through the wait: the append takes the
+    gate, then refuses at byte 0 when the one wait for both runs out, not a wait later, and keeps no lock."""
+    monkeypatch.setattr(jm, "LOCK_WAIT", 2.0)   # the wait, shortened for the test
+    holder = _holder(chained_case, WRITER, GATE)
+    journal = Journal(chained_case)
+    opened = []
+
+    def open_gate():
+        opened.append(time.monotonic() - started)
+        holder.stdin.write(f"{GATE}\n")
+        holder.stdin.flush()
+
+    timers = [threading.Timer(1.2, open_gate), threading.Timer(10, holder.kill)]   # the kill ends a wait past the wait
+    started = time.monotonic()
+    for timer in timers:
+        timer.start()
+    try:
+        with pytest.raises(JournalError, match="Another Glessner process is writing"):
+            journal.append("note", target=UID, text="refused")
+        assert 1.9 < time.monotonic() - started < 3.0
+        assert opened and opened[0] < 1.8   # the gate opened well inside the wait, so the refusal came at byte 0
+        assert holder.stdout.readline().strip() == "let go"
+    finally:
+        for timer in timers:
+            timer.cancel()
+        holder.kill()
+        holder.wait()
+    monkeypatch.undo()   # the whole wait again
+    assert journal.append("note", target=UID, text="after the holder")["seq"] == 2
 
 
 def test_the_held_context_is_re_entrant_in_its_thread_only(chained_case):

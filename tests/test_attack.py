@@ -161,13 +161,13 @@ def test_a_finding_takes_only_listed_ids_and_an_old_one_is_flagged(running):
     it) keeps its IDs: the Findings page flags each unlisted one, the report writes the flag beside it, an edit that leaves the
     techniques alone is taken, and an edit of the techniques is refused until the unlisted IDs are gone."""
     app, port, _ = running
-    cookie = login(port, app)
+    session = login(port, app)
 
     def finding(body):
-        res, payload = request(port, "POST", "/api/finding", cookie=cookie, body=body)
+        res, payload = request(port, "POST", "/api/finding", session=session, body=body)
         return res.status, json.loads(payload)
 
-    res, payload = request(port, "GET", "/api/attack", cookie=cookie)
+    res, payload = request(port, "GET", "/api/attack", session=session)
     listed = json.loads(payload)
     assert res.status == 200 and listed["version"] == "20.0" and len(listed["techniques"]) == 706
     before = len(entries(app.case))

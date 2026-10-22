@@ -339,10 +339,10 @@ def test_replay_ignores_the_build_entries_and_the_trail_shows_them(synthetic_cas
 
 def test_the_audit_trail_page_shows_the_build_that_opened_the_case(synthetic_case, fake_build):
     for app, port, _ in serving(synthetic_case):
-        cookie = login(port, app)
-        trail = json.loads(request(port, "GET", "/api/audit?kind=Builds", cookie=cookie)[1])
+        session = login(port, app)
+        trail = json.loads(request(port, "GET", "/api/audit?kind=Builds", session=session)[1])
         assert [r["text"] for r in trail["rows"]] == [f"Opened with glessner {FAKE}", 'Created the case "Synthetic" for cody']
-        body = request(port, "POST", "/api/audit_export", cookie=cookie, body={})[1]
+        body = request(port, "POST", "/api/audit_export", session=session, body={})[1]
         # then the head of the journal it lists
         assert f"by glessner {FAKE}, from the journal whose head is " in Path(json.loads(body)["path"]).read_text(
             encoding="utf-8")
@@ -389,10 +389,10 @@ def test_a_newer_format_is_refused_by_the_command_line_and_the_start_page(synthe
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
     try:
-        cookie = login(port, hub)
-        res, body = request(port, "POST", "/api/start/open", cookie=cookie, body={"folder": str(synthetic_case.folder)})
+        session = login(port, hub)
+        res, body = request(port, "POST", "/api/start/open", session=session, body={"folder": str(synthetic_case.folder)})
         assert res.status == 400 and said in json.loads(body)["error"] and hub.app is None
-        assert json.loads(request(port, "GET", "/api/start", cookie=cookie)[1])["build"] == FAKE
+        assert json.loads(request(port, "GET", "/api/start", session=session)[1])["build"] == FAKE
     finally:
         server.shutdown()
         server.server_close()

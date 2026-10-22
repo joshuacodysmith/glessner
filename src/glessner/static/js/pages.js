@@ -19,38 +19,84 @@ import { describeValue, setFaded, viewToggle } from './view.js';
 // countable pivots of its kind's ranking (pivots.worklist_rows) counted as unreviewed events once the page has drawn, each
 // count a link that opens the event's page with that pivot kept to unreviewed events, so the list's total is the count;
 // and the pending suggestions by rule, each with why it fired, its progress, Review one by
-// one, and Accept all and Reject all, which ask first. Evidence text reaches the page through el() only.
+// one, and Accept all and Reject all, which ask first. The marked events come a page at a time, with a button for the
+// next page under the list. Evidence text reaches the page through el() only.
 
 let counting = null;              // the counts of the page drawn last; the next page ends them
 const countCache = new Map();     // uid and row key to count, kept while the page redraws after a tick
 const COUNT_POOL = 4;             // counts in flight at once, so the timeline's own requests still get through
 
-export async function showInvestigate({ keepCounts = false } = {}) {
+// The worklist's first page, and after it as many more as `rows` asks for, as when a tick draws the page again with the
+// rows that were on it
+async function readWorklist(rows) {
+  const res = await api('/api/investigate');
+  while (res.items.length < Math.min(rows, res.total)) {
+    const more = await api(`/api/investigate?offset=${res.items.length}`);
+    if (!more.items.length) break;
+    res.items.push(...more.items);
+  }
+  return res;
+}
+
+export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
   const latest = claimDetails();   // a page asked for after it keeps the panel
   let res;
-  try { res = await api('/api/investigate'); } catch (err) { setStatus(err.message); return; }
+  try { res = await readWorklist(rows); } catch (err) { setStatus(err.message); return; }
   if (!latest()) return;
   if (!keepCounts) countCache.clear();
   if (counting) counting.abort();
   counting = new AbortController();
+  const { signal } = counting;
   const loadedAt = new Date();   // what the confirm names as when the page counted
   const items = res.items;
-  const followed = items.filter((i) => i.followup).length;
-  const refresh = (opts) => { if (showingPage('investigate')) showInvestigate(opts); };
+  const total = res.total;
+  const refresh = (opts) => { if (showingPage('investigate')) showInvestigate({ ...opts, rows: items.length }); };
   const pending = res.rules.filter((r) => r.pending > 0 && !r.error);
   const matched = res.rules.filter((r) => !r.error).reduce((n, r) => n + (r.matched || 0), 0);
   const decided = matched - res.rules.filter((r) => !r.error).reduce((n, r) => n + (r.pending || 0), 0);
-  const head = el('div', { class: 'inv-head sticky-head' }, el('h2', {}, 'Marked events to follow up'),
-                  meter(followed, items.length, 'followed up', 'nothing marked yet'));
+  let followedMeter = meter(res.followed, total, 'followed up', 'nothing marked yet');
+  const head = el('div', { class: 'inv-head sticky-head' }, el('h2', {}, 'Marked events to follow up'), followedMeter);
   const list = items.length ? worklist(items, refresh) : null;
-  // The find box narrows the rows shown; the list holds every marked event, so it reaches them all
-  const find = list ? listFind(list, { page: 'investigate', name: 'worklist', covers: 'The meter and the counts still cover' }) : null;
+  // The find box narrows the rows shown, and says when the list holds fewer than the marked events there are
+  const findOf = () => listFind(list, { page: 'investigate', name: 'worklist', covers: 'The meter and the counts still cover',
+                                        listed: items.length, total, more: 'marked events' });
+  let find = list ? findOf() : null;
   if (find) head.append(find.box);
+  const next = el('div', { class: 'actions inv-more' });
+  const offerNext = () => {
+    const left = total - items.length;
+    next.hidden = left <= 0;
+    next.replaceChildren(...(left > 0 ? [button(`Show the next ${Math.min(left, res.limit).toLocaleString()}`, showNext)] : []));
+  };
+  const showNext = async () => {
+    let more;
+    try { more = await api(`/api/investigate?offset=${items.length}`); } catch (err) { setStatus(err.message); return; }
+    if (signal.aborted || !showingPage('investigate')) return;   // the page was drawn again, or left, while the rows came
+    if (more.total !== total || !more.items.length) {
+      // The offset counts from the first marked event, so a mark added or removed since the rows shown were read moves the
+      // rows that follow them: the next page could repeat one shown or skip one, so the page reads the list again
+      setStatus('The marked events changed since this list was read, so it is listed again.');
+      refresh();
+      return;
+    }
+    items.push(...more.items);
+    list.append(...worklistRows(more.items, refresh));
+    const redrawn = findOf();
+    find.box.replaceWith(redrawn.box);
+    find.foot.replaceWith(redrawn.foot);
+    find = redrawn;
+    const newMeter = meter(more.followed, total, 'followed up', 'nothing marked yet');
+    followedMeter.replaceWith(newMeter);
+    followedMeter = newMeter;
+    offerNext();
+    askCounts(more.items, signal, onPage);
+  };
+  offerNext();
   const nodes = [
     ...readOnlyHint(),
     el('section', { class: 'inv-section' }, head,
        list || el('p', { class: 'muted' }, 'Nothing is marked Malicious or Suspicious yet. Mark events from the timeline, a list, or a suggestion.'),
-       ...(find ? [find.foot] : [])),
+       ...(list ? [next] : []), ...(find ? [find.foot] : [])),
     el('section', { class: 'inv-section' },
        el('div', { class: 'inv-head' }, el('h2', {}, 'Pending suggestions, by rule'), meter(decided, matched, 'decided', 'nothing suggested yet')),
        ...(pending.length ? pending.map((r) => ruleRow(r, loadedAt, refresh))
@@ -59,9 +105,10 @@ export async function showInvestigate({ keepCounts = false } = {}) {
           'A accepts, R rejects, N goes to the next. Accept all and Reject all ask first.')),
   ];
   setPage('investigate', nodes, { title: 'To investigate', reopen: showInvestigate });
+  const onPage = claimDetails();   // setPage claims the panel for a page it draws; the counts go on while this page is on it
   if (list) {
     stickUnder(list, head);
-    askCounts(items, counting.signal);
+    askCounts(items, signal, onPage);
   }
 }
 
@@ -83,7 +130,13 @@ function worklist(items, refresh) {
   head.querySelector('.inv-done').title = 'Followed up: your own tick, journaled with who and when';
   head.querySelector('.rel-mark').title = 'Review state: S suspicious, M malicious';
   head.querySelector('.inv-counts').title = 'Unreviewed events the event\'s top pivots reach. A count opens that list.';
-  const rows = items.map((item) => {
+  return el('ul', { class: 'rows no-off worklist' }, head, ...worklistRows(items, refresh));
+}
+
+// The rows of the worklist for these items
+function worklistRows(items, refresh) {
+  const cell = (cls, ...nodes) => el('span', { class: cls }, ...nodes);
+  return items.map((item) => {
     const tick = el('input', { type: 'checkbox', class: 'inv-tick', 'aria-label': `Followed up: the ${item.host} event at ${item.ts == null ? 'no time' : fmtUs(item.ts).slice(11, 19)}` });
     tick.checked = !!item.followup;
     tick.addEventListener('change', () => followUp(item, tick.checked, refresh));
@@ -98,7 +151,6 @@ function worklist(items, refresh) {
       tick, markBadge(item), cell('rel-time', fmtUs(item.ts)), el('span', { class: 'rel-host', title: item.host }, item.host),
       el('span', { class: 'rel-event' }, ...lines), counts);
   });
-  return el('ul', { class: 'rows no-off worklist' }, head, ...rows);
 }
 
 // "Followed up 22:40 by cody" under the event, the full time and the entry in its hover; when the mark changed after the
@@ -141,9 +193,10 @@ function countResult(item, row, count) {
                         onclick: () => openCount(item, row) }, count.toLocaleString());
 }
 
-// Count each row as unreviewed events, a few at a time, after the page has drawn. The page records when the last count
-// drew and the slowest count in window.__timings, for timing measurements.
-async function askCounts(items, signal) {
+// Count each row as unreviewed events, a few at a time, after the page has drawn, until the page is drawn again or another
+// is asked for (`onPage`, a claim on the panel). The page records when the last count drew and the slowest count in
+// window.__timings, for timing measurements.
+async function askCounts(items, signal, onPage) {
   const jobs = items.flatMap((item) => item.rows.filter((row) => !countCache.has(`${item.uid}\n${row.key}`)).map((row) => [item, row]));
   const started = performance.now();
   let slowest = 0;
@@ -159,9 +212,10 @@ async function askCounts(items, signal) {
     node.replaceWith(count != null ? countResult(item, row, count) : el('span', { class: 'muted inv-n', title: why }, 'could not count'));
   };
   let next = 0;
-  const worker = async () => { while (next < jobs.length && !signal.aborted) await one(jobs[next++]); };
+  const going = () => !signal.aborted && onPage();
+  const worker = async () => { while (next < jobs.length && going()) await one(jobs[next++]); };
   await Promise.all(Array.from({ length: Math.min(COUNT_POOL, jobs.length) }, worker));
-  if (!signal.aborted) window.__timings.push({ page: 'investigate', counts: jobs.length, ms: performance.now() - started, slowest_ms: slowest });
+  if (going()) window.__timings.push({ page: 'investigate', counts: jobs.length, ms: performance.now() - started, slowest_ms: slowest });
 }
 
 // A count's click: the event's page, then its pivot kept to unreviewed events, whose total is the count
@@ -176,8 +230,8 @@ async function openCount(item, row) {
 function ruleRow(r, loadedAt, refresh) {
   const row = el('div', { class: 'rule', 'data-source': r.id });
   const act = async (decision) => {
-    const uids = await askGroupDecision({ decision, source: r.id, value: r.suggest, uids: r.uids || [], listed: 0, first: r.first || [],
-                                          loadedAt, showAll: () => showSuggestions(r.id, '', r.pending), host: row });
+    const uids = await askGroupDecision({ decision, source: r.id, value: r.suggest, uids: r.uids || [], total: r.pending, listed: 0,
+                                          first: r.first || [], loadedAt, showAll: () => showSuggestions(r.id, '', r.pending), host: row });
     if (!uids) return;
     await decide(decision, r.id, uids, { confirmed: { count: uids.length }, fromEvent: false });
     refresh();   // the page then lists what is left, unless another page was asked for meanwhile
@@ -192,8 +246,10 @@ function ruleRow(r, loadedAt, refresh) {
     el('div', { class: 'rule-meter' }, meter(done, r.matched || 0, 'decided', ''),
        el('span', { class: 'muted rule-pending' }, `${plural(r.pending, 'event')} pending, would be ${markWord(r.suggest)}`)),
     el('div', { class: 'actions rule-acts' },
-       button('Review one by one', () => startReview(r.id, r.suggest, r.uids || []),
-              { class: 'primary', title: `Open each of the ${plural(r.pending, 'pending event')} on its Event page in turn` }),
+       button('Review one by one', () => {
+         if (r.more) setStatus(`Reviewing the first ${(r.uids || []).length.toLocaleString()} of ${r.pending.toLocaleString()} pending ${r.id} suggestions.`);
+         startReview(r.id, r.suggest, r.uids || []);
+       }, { class: 'primary', title: `Open each of the ${plural(r.pending, 'pending event')} on its Event page in turn` }),
        button('Accept all', () => act('accept'), { title: `Asks first: accept the ${plural(r.pending, 'event')} counted when the page loaded` }),
        button('Reject all', () => act('reject'), { title: 'Asks first: reject them, which leaves them unreviewed' })));
   return row;

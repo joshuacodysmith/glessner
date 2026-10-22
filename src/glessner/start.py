@@ -9,6 +9,7 @@ which the page follows.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import re
@@ -33,6 +34,9 @@ from .tools import _executables_under, _match, load_registry
 MAX_RECENT = 20
 CHECK_SECONDS = 5      # an evidence folder check stops counting after this long and says so
 MAX_FOLDERS = 500      # folders listed at once by the folder browser
+# GetDriveTypeW's answers for a drive letter with no root folder and for a mapped network drive
+DRIVE_NO_ROOT_DIR = 1
+DRIVE_REMOTE = 4
 # Several copies of one collection in the evidence folder. A dataset folder whose collection, triage, and triage_more
 # folders each hold WIN-L0ZZQ76PMUF's folder brings the one host in three times, once per top-level folder. A subfolder
 # is a host's when it holds a volume's Windows
@@ -138,16 +142,77 @@ def forget_missing(folder: str = "") -> tuple[int, list[dict]]:
     return len(items) - len(keep), keep
 
 
+def _drive_letters() -> list[str]:
+    """The letters of the drives Windows has set, read from the bitmask GetLogicalDrives returns (bit 0 is A:)."""
+    mask = ctypes.windll.kernel32.GetLogicalDrives()
+    return [letter for bit, letter in enumerate(string.ascii_uppercase) if (mask >> bit) & 1]
+
+
+def _drive_type(root: str) -> int:
+    """GetDriveTypeW's answer for a drive root such as "C:\\". It reads the drive's type and opens no folder on it."""
+    return ctypes.windll.kernel32.GetDriveTypeW(root)
+
+
+def local_drives() -> list[str]:
+    """The roots of the drives in this computer, such as "C:\\", each one a folder that opens. A mapped network drive and
+    a letter with no root folder are skipped by their drive type before any folder is opened, so no share is touched."""
+    roots = [f"{letter}:\\" for letter in _drive_letters()]
+    local = [root for root in roots if _drive_type(root) not in (DRIVE_NO_ROOT_DIR, DRIVE_REMOTE)]
+    return [root for root in local if os.path.isdir(root)]
+
+
+def _network_path(text: str) -> bool:
+    r"""Whether a path, on Windows, is on a network share. It reads the text and the drive's type and opens nothing.
+
+    Forward slashes are read as backslashes. A path that starts with two backslashes is on a share: a UNC path
+    (\\server\share), or a \\?\UNC\ or \\.\ device path. So is a path that starts with \??\, the NT object-namespace
+    prefix, which Windows passes through as it is (\??\UNC\server\share, \??\GLOBALROOT\Device\Mup\server\share). The
+    \\?\C:\ and \??\C:\ forms of a local drive are refused along with them, since Browse never produces them. A path
+    with a drive letter is on a share when that drive is a mapped network drive, and a path with none is on the
+    working directory's drive. On other platforms no path is."""
+    if sys.platform != "win32":
+        return False
+    text = text.replace("/", "\\")
+    if text.startswith(("\\\\", "\\??\\")):
+        return True
+    drive = os.path.splitdrive(text)[0] or os.path.splitdrive(os.getcwd())[0]
+    if drive.startswith("\\\\"):  # a working directory on a share
+        return True
+    return len(drive) == 2 and drive[1] == ":" and _drive_type(f"{drive[0].upper()}:\\") == DRIVE_REMOTE
+
+
+def _through_link(path: Path) -> bool:
+    """Whether a folder on the way to `path`, from its drive's root down, is a symbolic link. Windows follows a link on
+    a local drive to a share, so a link can lead off this computer. Each folder is asked about in turn and the walk
+    stops at the first link, so nothing past a link is touched; asking about a link reads the link itself, on its own
+    volume. `path` must already be known to be on a local drive, since asking about a folder on a share would reach it.
+    On other platforms no path is."""
+    if sys.platform != "win32":
+        return False
+    absolute = Path(os.path.abspath(path))
+    return any(os.path.islink(folder) for folder in (*reversed(absolute.parents), absolute))
+
+
+def _unlisted(path: Path, message: str) -> dict:
+    return {"path": str(path), "parent": None, "folders": [], "message": message}
+
+
 def browse(path: str) -> dict:
-    """The folders inside a folder, for picking one; with no path, the drives."""
+    """The folders inside a folder, for picking one; with no path, the drives in this computer. Browse opens only
+    folders on this computer. A UNC or device path, a path on a mapped drive, and a path that passes through a symbolic
+    link, which can point at a share, list nothing and say so. check() still opens the paths typed into the start
+    page's folder fields, a share included."""
     if not path:
         if sys.platform == "win32":
-            drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.isdir(f"{d}:\\")]
-            return {"path": "", "parent": None, "folders": drives, "message": ""}
+            return {"path": "", "parent": None, "folders": local_drives(), "message": ""}
         path = "/"
-    p = Path(path).expanduser()
+    p = Path(path).expanduser()  # the checks below run on the expanded path, since a home folder can sit on a share
+    if _network_path(str(p)):
+        return _unlisted(p, "Browse doesn't open network folders. Type the folder's path instead.")
+    if _through_link(p):
+        return _unlisted(p, "Browse doesn't open folders through a link. Type the folder's path instead.")
     if not p.is_dir():
-        return {"path": str(p), "parent": None, "folders": [], "message": "Folder not found."}
+        return _unlisted(p, "Folder not found.")
     try:
         folders = sorted((e.name for e in os.scandir(p) if e.is_dir(follow_symlinks=False)), key=str.lower)
         message = ""

@@ -10,7 +10,7 @@ import pytest
 
 from glessner.case import JOURNAL_FILE, create_case
 from glessner.journal import SYSTEM, Journal, State, referenced_ids, renamed, unplaced, unplaced_count
-from glessner.rekey import _place
+from glessner.rekey import _place, _sentence
 
 
 def new_id(name: str) -> str:
@@ -123,12 +123,23 @@ def test_the_journal_s_state_reads_the_candidates_through_a_later_rekey(tmp_path
 
 def test_a_candidate_a_later_rekey_leaves_unplaced_reads_as_that_rekeys_candidates():
     """The events the first rekey's ID may have meant are, after the second, those the second's ID may mean, and the other
-    candidate. The second rekey's own unplaced ID is listed as well: it was an event's ID between the two."""
+    candidate. No entry named the second rekey's unplaced ID, an event's ID between the two, so the second lists it among
+    its candidates left unplaced: it gets no note of its own, and the count leaves it out."""
+    state = state_of(rekey(5, unplaced={"old1": ["b1", "b2"]}), rekey(9, candidates_unplaced={"b1": ["c1", "c2"]}))
+    first = {"seq": 5, "id": "old1", "candidates": ["c1", "c2", "b2"]}
+    assert unplaced(state) == {"c1": [first], "c2": [first], "b2": [first]}
+    assert unplaced_count(state) == 1
+
+
+def test_a_candidate_an_entry_named_too_gets_its_own_note_when_a_later_rekey_leaves_it_unplaced():
+    """An entry named the candidate between the two rekeys, so it is the analyst's reference: its own note is listed
+    beside the first rekey's, and it counts."""
     state = state_of(rekey(5, unplaced={"old1": ["b1", "b2"]}), rekey(9, unplaced={"b1": ["c1", "c2"]}))
     found = unplaced(state)
     first = {"seq": 5, "id": "old1", "candidates": ["c1", "c2", "b2"]}
     second = {"seq": 9, "id": "b1", "candidates": ["c1", "c2"]}
     assert found == {"c1": [first, second], "c2": [first, second], "b2": [first]}
+    assert unplaced_count(state) == 2
 
 
 def test_a_later_rekey_whose_unplaced_list_holds_no_id_leaves_the_candidate_as_it_is():
@@ -149,13 +160,14 @@ def first_rekey(journal, old, candidates):
 
 
 def next_rekey(journal, case, formats, *runs):
-    """The next ID-changing upgrade as the upgrade writes it: step 7 places every ID the journal names (referenced_ids)
-    on what each run in `runs`, a map of old IDs to new ones, gives it, and the entry holds the result."""
-    referenced = referenced_ids(case.folder / JOURNAL_FILE)
-    pairs, left, merged = _place(referenced, {f"run{i}": SimpleNamespace(ids=ids) for i, ids in enumerate(runs)})
+    """The next ID-changing upgrade as the upgrade writes it: step 7 places every ID the journal names and every event an
+    earlier rekey's unplaced ID may have meant (referenced_ids) on what each run in `runs`, a map of old IDs to new ones,
+    gives it. The entry holds the result as its rekey, and its text counts the IDs the journal names."""
+    named, candidates = referenced_ids(case.folder / JOURNAL_FILE)
+    placed = _place(named, {f"run{i}": SimpleNamespace(ids=ids) for i, ids in enumerate(runs)}, candidates)
     from_format, to_format = formats
     return journal.append("case_upgrade", who=SYSTEM, from_format=from_format, to_format=to_format,
-                          text="Event IDs changed.", rekey={"pairs": pairs, "unplaced": left, "merged": merged})
+                          text=_sentence({}, placed["pairs"], placed["unplaced"], named), rekey=placed)
 
 
 def test_the_upgrade_places_the_candidates_an_earlier_rekey_listed(tmp_path):
@@ -165,9 +177,9 @@ def test_the_upgrade_places_the_candidates_an_earlier_rekey_listed(tmp_path):
     old, b1, b2, c1, c2 = (new_id(name) for name in ("old1", "b1", "b2", "c1", "c2"))
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
-    assert referenced_ids(case.folder / JOURNAL_FILE) == {old, b1, b2}
+    assert referenced_ids(case.folder / JOURNAL_FILE) == ({old}, {b1, b2})
     second = next_rekey(journal, case, (4, 5), {b1: c1, b2: c2})
-    assert second["rekey"]["pairs"] == {b1: c1, b2: c2}
+    assert second["rekey"] == {"pairs": {b1: c1, b2: c2}, "unplaced": {}, "merged": {}}
     for state in (journal.state, Journal(case).state):
         assert unplaced(state) == {c: [{"seq": first["seq"], "id": old, "candidates": [c1, c2]}] for c in (c1, c2)}
         assert renamed(state, b1) == (c1, [second["seq"]])
@@ -181,7 +193,7 @@ def test_the_upgrade_places_a_candidate_through_the_rekeys_between(tmp_path):
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
     next_rekey(journal, case, (4, 5), {b1: c1, b2: c2})
-    assert referenced_ids(case.folder / JOURNAL_FILE) == {old, c1, c2}
+    assert referenced_ids(case.folder / JOURNAL_FILE) == ({old}, {c1, c2})
     third = next_rekey(journal, case, (5, 6), {c1: d1})
     assert third["rekey"]["pairs"] == {c1: d1}
     found = unplaced(Journal(case).state)
@@ -189,13 +201,17 @@ def test_the_upgrade_places_a_candidate_through_the_rekeys_between(tmp_path):
 
 
 def test_the_upgrade_that_leaves_a_candidate_unplaced_lists_the_events_it_may_mean(tmp_path):
+    """No entry named the candidate, so the upgrade lists it among its candidates left unplaced, apart from the IDs the
+    journal names: its events carry the first rekey's note alone, and the overview counts the one ID the analyst
+    named."""
     case = new_case(tmp_path)
     old, b1, b2, c1, c2 = (new_id(name) for name in ("old1", "b1", "b2", "c1", "c2"))
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
     second = next_rekey(journal, case, (4, 5), {b1: c1}, {b1: c2})
-    assert second["rekey"]["unplaced"] == {b1: sorted([c1, c2])}
+    assert second["rekey"]["unplaced"] == {} and second["rekey"]["candidates_unplaced"] == {b1: sorted([c1, c2])}
     c1, c2 = sorted([c1, c2])
     of_old = {"seq": first["seq"], "id": old, "candidates": [c1, c2, b2]}
-    of_b1 = {"seq": second["seq"], "id": b1, "candidates": [c1, c2]}
-    assert unplaced(Journal(case).state) == {c1: [of_old, of_b1], c2: [of_old, of_b1], b2: [of_old]}
+    state = Journal(case).state
+    assert unplaced(state) == {c1: [of_old], c2: [of_old], b2: [of_old]}
+    assert unplaced_count(state) == 1

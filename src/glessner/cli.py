@@ -88,7 +88,8 @@ def main(argv: list[str] | None = None) -> int:
     # The default is server.PREFERRED_PORT, written here as its number so this module needn't load the server
     p.add_argument("--port", type=int, default=None,
                    help="port on 127.0.0.1; without it, 47613 when free, else a free one; 0 picks a free one")
-    p.add_argument("--no-browser", action="store_true", help="print the link instead of opening it")
+    p.add_argument("--no-browser", action="store_true",
+                   help="don't open the browser; open the printed link in the browser you choose")
 
     p = sub.add_parser("rule", help="list, add, change, or remove suggestion rules (kept in the journal)")
     p.add_argument("case_folder", type=Path)
@@ -781,7 +782,9 @@ def cmd_serve(case: Case | None, args) -> int:
     # or the one given here, can be switched from the page's Cases button.
     server, hub, url = serve_hub(_serve_open(case) if case is not None else Hub(), args.port)
     what = repr(case.settings.name) if case is not None else "the start page"
-    print(f"Serving {what} on 127.0.0.1 only. Open this link (it carries the session token):")
+    how = ("open it in the browser you choose" if args.no_browser
+           else "to open it in another browser, run serve with --no-browser")
+    print(f"Serving {what} on 127.0.0.1 only. Start link (it works once; {how}):")
     print(f"  {url}")
     # The browser keeps the page's layout by origin, so a run on another port starts from the defaults
     if args.port is None and (port := server.server_address[1]) != PREFERRED_PORT:
