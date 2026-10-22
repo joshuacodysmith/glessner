@@ -5,20 +5,27 @@
 import { $, api, codePrefix, el, fmtUs, markBadge, plural, post, S, setStatus } from './core.js';
 import { refreshCounts } from './counts.js';
 import { fetchView } from './data.js';
-import { button, claimDetails, headAfter, headCopy, loadDetails, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, detailsClaims, headAfter, headCopy, loadDetails, setPage, showingPage } from './event_page.js';
 import { renderHosts } from './hosts.js';
 import { reloadLanes } from './lanes.js';
 import { jumpTo, showRules } from './pages.js';
 
 const PANEL_OPEN = { hosts: () => { const p = $('hostsPanel'); p.hidden = false; renderHosts(); }, rules: () => showRules() };
 
-export async function showAudit(filters = {}) {
+// `settling` marks the trail's own redraw after a change: a confirm open by the time its read answers holds that redraw.
+export async function showAudit(filters = {}, { settling = false } = {}) {
   const params = new URLSearchParams({ ...filters, limit: '200' });
   const latest = claimDetails();   // a page asked for after it keeps the panel
+  const follows = answered;   // the undos and retractions this read is sure to show
   let res;
   try { res = await api(`/api/audit?${params}`); }
-  catch (err) { setStatus(`Audit trail failed: ${err.message}`); return; }
+  catch (err) {
+    setStatus(`Audit trail failed: ${err.message}`);
+    if (latest()) noteClaims();   // the trail on screen, if one shows, still settles
+    return;
+  }
   if (!latest()) return;
+  if (settling && confirmOpen()) { noteClaims(); return; }   // closing the confirm settles the trail
   const page = { key: 'audit', title: 'Audit trail', reopen: () => showAudit(filters) };
   const refilter = (change) => showAudit(Object.fromEntries(Object.entries({ ...filters, ...change }).filter(([, v]) => v)));
   const kind = el('select', { 'aria-label': 'Action' }, el('option', { value: '' }, 'All actions'),
@@ -48,7 +55,7 @@ export async function showAudit(filters = {}) {
   const j = res.journal;
   const chain = j ? [el('p', { class: `audit-journal ${j.state}` }, el('span', { class: j.state === 'broken' ? 'warn' : '' }, j.text[0]),
     ` ${j.text.slice(1).join(' ')} Head `, ...headCopy(j.head, j.short), j.seq != null ? ` (entry #${j.seq}).` : '')] : [];
-  const list = el('div', { class: 'audit-list' }, ...res.rows.map((r) => auditRow(r, filters)));
+  const list = el('div', { class: 'audit-list' }, ...res.rows.map(auditRow));
   setPage('audit', [
     ...chain,
     el('div', { class: 'actions' }, el('span', { class: 'muted' }, `${plural(res.total, 'entry', 'entries')}, newest first`),
@@ -67,6 +74,8 @@ export async function showAudit(filters = {}) {
     res.rows.length ? list : el('p', {}, 'No entry matches.'),
     ...(res.total > res.rows.length ? [el('p', { class: 'muted' }, `Showing the newest ${res.rows.length} of ${res.total.toLocaleString()}. Narrow the filters to see others.`)] : []),
   ], page);
+  drawn = { follows, claims: detailsClaims(), filters };
+  settleTrail();
 }
 
 // An entry's words, with the one event it names quoted and cut at a word or address boundary (the server's cut_name): the
@@ -81,7 +90,7 @@ function entryText(r) {
   return [r.text.slice(0, at), open, r.text.slice(at + ev.name.length)];
 }
 
-function auditRow(r, filters) {
+function auditRow(r) {
   const when = `${String(r.at).slice(5, 16).replace('T', ' ')} UTC`;
   const undone = r.undone_by != null;
   const text = el('span', { class: undone || r.retracted_by ? 'gone' : '' }, ...entryText(r));
@@ -94,8 +103,8 @@ function auditRow(r, filters) {
   const confirmBox = el('div', { class: 'audit-confirm', hidden: '' });
   const actions = [];
   if (r.count > 1) actions.push(button(`${r.count.toLocaleString()} events`, () => toggleEvents(r.seq, confirmBox), { class: 'linklike' }));
-  if (r.undoable) actions.push(button('Undo', () => confirmUndo(r, confirmBox, filters)));
-  if (r.action === 'note' && !r.retracted_by) actions.push(button('Retract', () => confirmRetract(r, confirmBox, filters)));
+  if (r.undoable) actions.push(button('Undo', () => confirmUndo(r, confirmBox)));
+  if (r.action === 'note' && !r.retracted_by) actions.push(button('Retract', () => confirmRetract(r, confirmBox)));
   if (r.panel && PANEL_OPEN[r.panel]) actions.push(button(r.panel === 'hosts' ? 'Change it in Hosts' : 'Change it in Rules', PANEL_OPEN[r.panel], { class: 'linklike' }));
   return el('div', { class: `audit-row${r.action === 'undo' ? ' correction' : ''}` },
     el('span', { class: `seq${undone ? ' gone' : ''}` }, `#${r.seq}`), el('span', { class: 'muted' }, when), el('span', {}, r.who),
@@ -103,7 +112,7 @@ function auditRow(r, filters) {
 }
 
 async function toggleEvents(seq, box) {
-  if (!box.hidden && box.dataset.kind === 'events') { box.hidden = true; return; }
+  if (!box.hidden && box.dataset.kind === 'events') { closeBox(box); return; }
   let res;
   try { res = await api(`/api/audit_events?seq=${seq}`); } catch (err) { setStatus(err.message); return; }
   box.dataset.kind = 'events';
@@ -113,10 +122,15 @@ async function toggleEvents(seq, box) {
   box.hidden = false;
 }
 
-async function confirmUndo(r, box, filters) {
+async function confirmUndo(r, box) {
   let plan;
   try { plan = await api(`/api/undo_plan?seq=${r.seq}`); }
-  catch (err) { box.dataset.kind = 'confirm'; box.replaceChildren(el('p', {}, err.message)); box.hidden = false; return; }
+  catch (err) {
+    box.dataset.kind = 'confirm';
+    box.replaceChildren(el('p', {}, err.message), button('Close', () => closeBox(box)));
+    box.hidden = false;
+    return;
+  }
   const note = el('input', { type: 'text', class: 'mark-note', placeholder: 'Note (optional), such as what went wrong' });
   const n = (k) => plural(k, 'event');
   const back = plan.changed === 1 ? 'back to how it was' : 'back to how they were';
@@ -130,29 +144,60 @@ async function confirmUndo(r, box, filters) {
     el('p', { class: 'muted' }, `${explain} The original entry stays in the journal; this adds a correction of an accident.`),
     ...(plan.changed ? [el('div', { class: 'actions' }, note,
       button(`Undo ${n(plan.changed)}`, async () => {
+        noteClaims();   // from this click, only a page asked for after it holds the trail's redraw
         try { await post('/api/undo', { seq: r.seq, note: note.value }); }
         catch (err) { setStatus(`Undo failed: ${err.message}`); return; }
+        box.hidden = true;
         setStatus(`Undid #${r.seq}: ${n(plan.changed)} ${back}`);
         await afterChange();
-        if (showingPage('audit')) showAudit(filters);   // not over a page asked for meanwhile
       }, { class: 'undo' }),
-      button('Cancel', () => { box.hidden = true; }))] : [button('Close', () => { box.hidden = true; })]));
+      button('Cancel', () => closeBox(box)))] : [button('Close', () => closeBox(box))]));
   box.hidden = false;
   note.focus();
 }
 
-function confirmRetract(r, box, filters) {
+function confirmRetract(r, box) {
   box.dataset.kind = 'confirm';
   box.replaceChildren(el('strong', {}, `Retract note #${r.seq}?`),
     el('p', { class: 'muted' }, 'The note stays on record, struck through, with who retracted it and when.'),
     el('div', { class: 'actions' }, button('Retract', async () => {
+      noteClaims();   // from this click, only a page asked for after it holds the trail's redraw
       const uid = await noteTarget(r.seq);
       try { await post('/api/note_retract', { uid, note_seq: r.seq }); }
       catch (err) { setStatus(`Retract failed: ${err.message}`); return; }
+      box.hidden = true;
+      setStatus(`Retracted note #${r.seq}`);
       await afterChange();
-      if (showingPage('audit')) showAudit(filters);
-    }, { class: 'undo' }), button('Cancel', () => { box.hidden = true; })));
+    }, { class: 'undo' }), button('Cancel', () => closeBox(box))));
   box.hidden = false;
+}
+
+// The audit trail on screen draws again, with the filters it shows, when its read went out before an undo or a
+// retraction answered, so it may not show the change. The trail settles once the change's timeline reload is done,
+// and the redraw waits while either of these holds:
+// - a confirm is open on the trail, which the redraw would close. Closing it settles the trail. A row's event list
+//   can open in place of its confirm, and closing that list settles the trail too. A confirm opened while the
+//   redraw's read is out holds the redraw in the same way when the read answers;
+// - the panel has been claimed since the trail last noted its claims: when it drew, when its own read failed, when a
+//   confirm held its redraw, and when the analyst confirmed an undo or a retraction on it. The page asked for takes
+//   the panel when it draws, and the trail again settles once it draws, since its read shows every change answered
+//   before it went out. A page that fails draws nothing, and the trail stays as it is until the next undo or
+//   retraction confirmed on it.
+let answered = 0;   // undos and retractions the server has answered
+// The trail on screen: the changes its read shows, the panel's claims it last noted, and its filters
+let drawn = { follows: 0, claims: 0, filters: {} };
+const noteClaims = () => { drawn.claims = detailsClaims(); };
+const confirmOpen = () => $('details').querySelector('.audit-confirm[data-kind="confirm"]:not([hidden])') !== null;
+
+function settleTrail() {
+  if (!showingPage('audit') || drawn.follows === answered) return;
+  if (detailsClaims() !== drawn.claims || confirmOpen()) return;
+  showAudit(drawn.filters, { settling: true });
+}
+
+function closeBox(box) {   // a row's confirm or event list
+  box.hidden = true;
+  settleTrail();
 }
 
 async function noteTarget(seq) {
@@ -167,12 +212,20 @@ export async function retractNote(uid, noteSeq) {
   loadDetails(uid);
 }
 
-// The timeline and counts follow an undo or retraction. The Details panel stays on the trail, which redraws itself;
-// reloading the focused event here as well raced it for the panel.
+// The timeline and counts follow an undo or retraction the server has just answered, and then the trail settles. The
+// Details panel stays on the trail, which redraws itself; reloading the focused event here as well raced it for the panel.
+// A reload that fails says so on the status line, in place of the change's own line.
 async function afterChange() {
-  await reloadLanes();
-  await fetchView();
-  refreshCounts();
+  answered += 1;
+  try {
+    await reloadLanes();
+    await fetchView();
+    refreshCounts();
+  } catch (err) {
+    setStatus(`The timeline didn't reload: ${err.message}`);
+  } finally {
+    settleTrail();
+  }
 }
 
 // The Event page's History: the newest entries for this event, with a way into the full trail. Returns the rows, so the

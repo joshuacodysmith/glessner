@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from conftest import SEC, T0
-from test_browser_smoke import browser, case_menu, served_page, view, window_text  # noqa: F401
+from test_browser_smoke import HOST_BOX_CHECKED, browser, case_menu, filtered_view, served_page, view, window_text  # noqa: F401
 from test_report import LONG
 
 from glessner.journal import JOURNAL_FILE
@@ -19,6 +19,9 @@ pytestmark = pytest.mark.browser
 FINDINGS = "#details[data-page='findings']"
 RESULT = "#details .export-result"
 WROTE = f"() => document.querySelector('{RESULT}')?.textContent.startsWith('Wrote')"
+# The window card counts the view drawn last; after a Sources change, it reads the last filter's count until the view
+# under the new one answers, so a test waits for that view's count
+WINDOW_COUNT_IS = "(n) => document.getElementById('exportWindowCount')?.textContent.startsWith(`${n.toLocaleString()} event`)"
 WRITTEN_NOTE = ("Each file is hashed when written and recorded in the journal, so a copy handed on can be checked against "
                 "the case.")
 
@@ -175,8 +178,10 @@ def test_the_exports_state_their_scope_and_write_their_files(browser, synthetic_
         wrote(p, "Wrote 2 indicator values from 1 Malicious event to ")
         assert entries(synthetic_case)[-1]["kind"] == "indicators"
         assert audit.locator(".ex-count").inner_text().endswith(" entries in plain words")
-        audit.get_by_role("button", name="Markdown").click()
+        # Counted before the click: the trail lists the entries before its own file's entry, which the server appends
+        # before it answers
         n = len(entries(synthetic_case))
+        audit.get_by_role("button", name="Markdown").click()
         wrote(p, f"Wrote {n} entries to ")
         assert entries(synthetic_case)[-1]["kind"] == "audit_trail"
         rows = col.locator(".files-table tbody tr")
@@ -227,7 +232,8 @@ def test_each_export_card_states_the_scope_of_the_file_it_writes(browser, synthe
 
     for p in served_page(browser, synthetic_case, setup=marks):
         p.locator("#filtersButton").click()
-        p.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True).uncheck()
+        with filtered_view(p) as drawn:
+            p.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True).uncheck()
         p.wait_for_function(
             "() => ![...document.querySelectorAll('#labels .row')].some((r) => r.textContent.includes('DESKTOP'))")
         p.locator("#filtersButton").click()
@@ -236,7 +242,7 @@ def test_each_export_card_states_the_scope_of_the_file_it_writes(browser, synthe
         assert col.locator("label[for=exportFiltered]").inner_text() == "Apply the current Sources and View (1) to the report"
         window, marked = col.locator(".export-card").nth(1), col.locator(".export-card").nth(0)
         assert window.locator(".chip.scope").inner_text().endswith(", 1 filter on")
-        p.wait_for_function("() => /^\\d/.test(document.getElementById('exportWindowCount').textContent)")
+        p.wait_for_function(WINDOW_COUNT_IS, arg=drawn.value.json()["count"])
         stated = int(window.locator("#exportWindowCount").inner_text().split()[0].replace(",", ""))
         assert not col.locator("#exportFiltered").is_checked()
         window.get_by_role("button", name="CSV").click()
@@ -278,21 +284,31 @@ def test_the_window_card_names_the_filters_turned_on_while_the_page_shows(browse
     the count the card states. The report's tick follows too, offered only while a filter is on. The card names the
     filters at the click, not those of the moment the page opened, which would name none while its file was filtered."""
     def hide_desktop(p, hide):
+        """Hide or show DESKTOP in the Sources. Hiding returns the event count of the view drawn under the filter."""
         p.locator("#filtersButton").click()
         box = p.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True)
-        box.uncheck() if hide else box.check()
+        # Until the panel's counts answer, the box can read the filter before, and uncheck or check then does nothing
+        p.wait_for_function(HOST_BOX_CHECKED, arg=["DESKTOP", hide])
+        count = None
+        if hide:
+            with filtered_view(p) as drawn:
+                box.uncheck()
+            count = drawn.value.json()["count"]
+        else:
+            box.check()
         p.wait_for_function("(hide) => [...document.querySelectorAll('#labels .row')]"
                             ".some((r) => r.textContent.includes('DESKTOP')) !== hide", arg=hide)
         p.locator("#filtersButton").click()
+        return count
 
     for p in served_page(browser, synthetic_case):
         open_findings(p)
         col = p.locator("#details .exports-col")
         window, tick = col.locator(".export-card").nth(1), col.locator("#exportFiltered")
         assert not window.locator(".chip.scope").inner_text().endswith(" on") and tick.is_disabled()
-        hide_desktop(p, True)
+        in_view = hide_desktop(p, True)
         assert p.locator(FINDINGS).count() == 1   # the page stayed
-        p.wait_for_function("() => /^\\d/.test(document.getElementById('exportWindowCount').textContent)")
+        p.wait_for_function(WINDOW_COUNT_IS, arg=in_view)
         assert window.locator(".chip.scope").inner_text().endswith(", 1 filter on")
         assert tick.is_enabled() and col.locator("label[for=exportFiltered]").inner_text() == (
             "Apply the current Sources and View (1) to the report")

@@ -314,9 +314,11 @@ def test_going_back_keeps_the_later_steps(browser, pcase):  # noqa: F811
         page.wait_for_function("() => window.__app.S.trailAt === 2")
         page.locator("#details nav.trail .here", has_text="4672 on DC01").wait_for()
         assert page.evaluate("window.__app.S.trail.length") == 4 and dim(page).count() == 1
-        # A different pivot cuts the later steps
+        # A different pivot cuts the later steps. The step moves at the click and its page draws when its event answers;
+        # a pivot clicked on the 4672's page still showing is that event's, and the page drops it.
         page.locator("#details nav.trail").get_by_role("button", name="Same logon session (2)").click()
-        page.wait_for_function("() => window.__app.S.trailAt === 1")
+        page.wait_for_function("(uid) => window.__app.S.trailAt === 1"
+                               " && document.getElementById('details').dataset.key === `event:${uid}`", arg=rdp)
         pv(page, "account").locator("button.pv-go").click()
         page.wait_for_function("() => window.__app.S.trail.length === 3 && window.__app.S.trailAt === 2")
         assert page.evaluate(STEP_TEXTS)[:2] == [FIRST, "Same logon session"] and dim(page).count() == 0
@@ -332,7 +334,8 @@ def test_going_back_keeps_the_later_steps(browser, pcase):  # noqa: F811
         select(page, other)
         select(page, rdp)   # a new start
         pv(page, "window").locator("button.pv-go").click()
-        page.wait_for_selector("#relatedList li.rel-row")
+        # The window's list: the RDP event's page shows its logon session list again until the window answers
+        page.locator("#relatedList strong", has_text="Same host within").wait_for()
         page.locator("#relatedList li.rel-row").nth(1).click()
         page.wait_for_function("() => window.__app.S.trail.length === 3 && window.__app.S.trailAt === 2")
         first_event = page.evaluate("window.__app.S.focus")
@@ -418,6 +421,8 @@ def test_the_trail_note_goes_on_the_start_event(browser, pcase):  # noqa: F811
         walk(page, rdp)
         page.locator("#details nav.trail").get_by_role("button", name="4672 on DC01").click()
         page.wait_for_function("() => window.__app.S.trailAt === 2")
+        # The step moves at the click, and the band shows it current once the 4672's page draws, when its event answers
+        page.locator("#details nav.trail .here", has_text="4672 on DC01").wait_for()
         # The pan from walk's click on the 4672 row is a last action of its own, "Window moved". Under load its data can land
         # after the save and replace the save's line (seen twice in full suites), so the save waits for it.
         page.wait_for_function("() => window.__app.S.anim === null && !window.__app.S.windowPending")

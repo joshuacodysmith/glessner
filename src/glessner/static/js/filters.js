@@ -47,10 +47,24 @@ export function describePred(p) {
   return scope.length ? `${kind} on ${scope.join(', ')}` : kind;
 }
 
+// Counts the changes applyFilter has been asked to apply, so an earlier change's answer can tell it is out of date
+let filterChanges = 0;
+
+// Resolves to { id, applied }: the id the change registered, null when it needed none or its registration failed, and
+// whether the change is still the filter in force once the timeline has drawn it. applied is false once a later change
+// was made while this one registered or drew. A caller that lists events under this change's filter takes its id.
 export async function applyFilter() {
-  // One registered filter carries both flyouts: the Sources choice and the View.
-  try { S.filterId = filterCount() || S.viewSpec ? (await post('/api/filter', { ...S.filter, ...viewPart() })).id : null; }
-  catch (err) { setStatus(`Filter failed: ${err.message}`); return; }
+  // One registered filter carries both flyouts: the Sources choice and the View. A registration that answers after a
+  // later change is dropped: it would put back the filter that change replaced.
+  const change = ++filterChanges;
+  let id = null;
+  try { if (filterCount() || S.viewSpec) id = (await post('/api/filter', { ...S.filter, ...viewPart() })).id; }
+  catch (err) {
+    if (change === filterChanges) setStatus(`Filter failed: ${err.message}`);   // not over a later change's filter
+    return { id: null, applied: false };
+  }
+  if (change !== filterChanges) return { id, applied: false };
+  S.filterId = id;
   // The state line's counts are the last filter's until the lanes answer for this one, so it says "..." meanwhile
   S.lanesShown = null;
   S.sourcesShown = null;
@@ -58,6 +72,7 @@ export async function applyFilter() {
   renderFilterState();
   renderExportScope();   // the Findings page's window card and report tick, when it shows
   await Promise.all([refreshShown(), reloadLanes().then(fetchView)]);
+  return { id, applied: change === filterChanges };
 }
 
 // Show or hide everything a pred covers. Rules inside it go; then one rule is added only where the broader
@@ -96,11 +111,14 @@ export function renderFilterState() {
 }
 
 // What the current filter shows per source file, and per channel within it, from the server; without a filter
-// everything shows.
+// everything shows. An answer for a filter that has changed since it was asked is dropped: the panel's boxes come from
+// these counts, so it would show the earlier filter's choices, and a click on a box would act on them.
 export async function refreshShown() {
   if ($('filterPanel').hidden || !S.filterId) { S.shown = null; renderFilterPanel(); return; }
+  const asked = S.filterId;
   try {
-    const res = await api(`/api/shown?filter=${S.filterId}`);
+    const res = await api(`/api/shown?filter=${asked}`);
+    if (asked !== S.filterId) return;
     S.shown = new Map();
     for (const [host, tool, artifact, file, channel, n] of res.counts) {
       const key = fileKey(host, tool, artifact, file);

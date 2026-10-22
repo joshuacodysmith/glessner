@@ -184,6 +184,59 @@ def open_all(p):
     p.evaluate("() => import('/js/lanes.js').then((m) => m.openAll())")
 
 
+def filtered_view(p):
+    """Wait for the answer to the view the page asks for under a Sources or View change made inside the `with`. The page
+    asks for it once the lanes have answered, and until it answers, the window's count and the status line's notes are
+    still the last filter's. The answer's JSON holds the view's `count`."""
+    return p.expect_response(lambda res: "/api/view?" in res.url and "&filter=" in res.url)
+
+
+def wait_held(p, held, n=1):
+    """Wait until a route that holds its requests in `held` holds `n` of them, and fail the test when it doesn't within
+    PAGE_TIMEOUT_MS. The route's handler runs only while the page is waited on, so the wait is the page's."""
+    deadline = time.monotonic() + PAGE_TIMEOUT_MS / 1000
+    while len(held) < n:
+        if time.monotonic() > deadline:
+            pytest.fail(f"The route held {len(held)} of {n} requests after {PAGE_TIMEOUT_MS / 1000:g} s")
+        p.wait_for_timeout(20)
+
+
+# Whether the Sources panel's box for a host reads checked. The panel draws its boxes from the counts the filter shows,
+# which it asks for when it opens and after each change, so until they answer a box can read the filter before.
+HOST_BOX_CHECKED = ("([host, checked]) => "
+                    "document.querySelector(`#fpTree input[aria-label=\"Show ${host}\"]`)?.checked === checked")
+
+# Keep in window.__asked the path of each request the page's code makes from now on, as it makes it, and in
+# window.__taken each path whose answer the page's code has finished with. A path joins __taken in a task queued when
+# its JSON resolves, so after the page's code for that answer has run: that code goes on in microtasks.
+RECORD_REQUESTS = """() => {
+    window.__asked = [];
+    window.__taken = [];
+    const fetch = window.fetch.bind(window);
+    window.fetch = async (path, opts) => {
+        window.__asked.push(String(path));
+        const res = await fetch(path, opts);
+        const json = res.json.bind(res);
+        res.json = () => json().then((body) => {
+            setTimeout(() => window.__taken.push(String(path)));
+            return body;
+        });
+        return res;
+    };
+}"""
+
+
+def asked(p, prefix):
+    """The paths starting with `prefix` that the page's code has asked for since RECORD_REQUESTS ran. The page runs this
+    check once the task it is in has ended, so a request made in the same task as one the test waited on is listed."""
+    return p.evaluate("(prefix) => window.__asked.filter((path) => path.startsWith(prefix))", prefix)
+
+
+def refused_with(message):
+    """A route handler that answers each request with HTTP 500 and `message` as the error."""
+    return lambda route: route.fulfill(status=500, content_type="application/json", body=json.dumps({"error": message}))
+
+
 def case_menu(p, item):
     """Choose an item of the Case menu, which holds the setup and record work."""
     p.locator("#caseMenuButton").click()
@@ -463,6 +516,178 @@ def test_filter_panel_hides_a_host_and_clear_all_restores_it(page):
     page.locator("#filterPanel").get_by_role("button", name="Clear all").click()
     page.wait_for_function("() => [...document.querySelectorAll('#labels .row')].some((r) => r.textContent.includes('DC01'))")
     assert page.locator("#filterCount").is_hidden()
+
+
+DC01_DRAWN = "(drawn) => [...document.querySelectorAll('#labels .row')].some((r) => r.textContent.includes('DC01')) === drawn"
+# Keep each text the status line takes from now on in window.__statusTexts. setStatus replaces the line's text node, and
+# a replaced node keeps its text, so a text the line held only between two of the observer's callbacks is kept too.
+STATUS_TEXTS = """() => {
+    window.__statusTexts = [];
+    new MutationObserver((records) => {
+        for (const record of records) for (const node of record.addedNodes) window.__statusTexts.push(node.textContent);
+    }).observe(document.getElementById('status'), { childList: true });
+}"""
+
+
+def test_the_sources_counts_of_a_filter_changed_since_are_dropped(page):
+    """The Sources panel's boxes come from the counts the filter shows. Counts asked under a filter that has changed
+    since they were asked are dropped when they answer: drawn, they would read DC01 hidden after it was shown again,
+    and the next click on its box would hide it."""
+    box = page.locator("#fpTree").get_by_role("checkbox", name="Show DC01", exact=True)
+    page.locator("#filtersButton").click()
+    with page.expect_response("**/api/shown?*"):   # the counts with DC01 hidden, asked once the filter is set
+        box.uncheck()
+    page.wait_for_function(HOST_BOX_CHECKED, arg=["DC01", False])
+    page.wait_for_function(DC01_DRAWN, arg=False)
+    page.locator("#filtersButton").click()
+    held = []
+    page.route("**/api/shown?*", lambda route: held.append(route))
+    with page.expect_request("**/api/shown?*"):
+        page.locator("#filtersButton").click()   # opened again, the panel asks for the counts with DC01 hidden
+    box.check()   # no filter is left, so no counts are asked
+    page.wait_for_function(DC01_DRAWN, arg=True)
+    with page.expect_response("**/api/shown?*"):
+        held[0].continue_()
+    page.unroute("**/api/shown?*")
+    # The page takes an answer as soon as it arrives, so half a second covers the redraw that taking it would make
+    page.wait_for_timeout(500)
+    assert box.is_checked() and page.locator("#filterCount").is_hidden()
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["registered", "failed"])
+def test_a_filter_registered_after_a_later_change_is_dropped(page, failed):
+    """A Sources or View change registers its filter with the server, and the timeline redraws under the id it gets
+    back. A registration that answers after a later change is dropped: taken, it would draw the filter that change
+    replaced, here DC01 hidden after Clear all. One that fails then says nothing, since "Filter failed" would stand over
+    the later change's filter."""
+    box = page.locator("#fpTree").get_by_role("checkbox", name="Show DC01", exact=True)
+    page.locator("#filtersButton").click()
+    held = []
+    page.route("**/api/filter", lambda route: held.append(route))
+    with page.expect_request("**/api/filter"):
+        box.uncheck()   # hides DC01, under a filter the server registers
+    drawn = page.evaluate("window.__timings.length")
+    # No filter is left, so nothing is registered and the timeline redraws at once
+    page.locator("#filterPanel").get_by_role("button", name="Clear all").click()
+    page.wait_for_function("(n) => window.__timings.length > n", arg=drawn)
+    # Every text the status line takes from here on is kept: Clear all's redraws rewrite the line, and would hide a
+    # "Filter failed" written before them
+    page.evaluate(STATUS_TEXTS)
+    with page.expect_response("**/api/filter"):
+        if failed:
+            held[0].fulfill(status=500, content_type="application/json", body=json.dumps({"error": "the server stopped"}))
+        else:
+            held[0].continue_()
+    page.unroute("**/api/filter")
+    page.errors[:] = [e for e in page.errors if "/api/filter" not in e]   # that refusal was the point
+    # The page takes an answer as soon as it arrives, so half a second covers the redraw that taking it would make
+    page.wait_for_timeout(500)
+    assert page.evaluate("window.__app.S.filterId") is None
+    assert page.evaluate(DC01_DRAWN, True) and box.is_checked()
+    assert [text for text in page.evaluate("window.__statusTexts") if "Filter failed" in text] == []
+
+
+def test_a_filter_change_made_while_an_earlier_one_draws_replaces_it(page):
+    """applyFilter resolves to { id, applied }, where applied says whether its change is the filter in force once
+    drawn. A change made while an earlier one's lanes reload replaces it, though the earlier registration answered
+    first, so the earlier call resolves to applied false and the later one to applied true."""
+    held = []
+
+    def hold_first(route):   # the earlier change's reload of the lanes; the later one's goes through
+        if held:
+            route.continue_()
+        else:
+            held.append(route)
+
+    page.route("**/api/lanes?*", hold_first)
+    # Each call's result is kept in window and waited for there, since an evaluate that awaits it has no time limit
+    with page.expect_request("**/api/lanes?*"):
+        page.evaluate("() => import('/js/filters.js').then((m) => {"
+                      " m.showOnly({ host: 'DC01' }).then((r) => { window.__earlier = r; }); })")
+    wait_held(page, held)
+    page.evaluate("() => import('/js/filters.js').then((m) => { m.clearFilters().then((r) => { window.__later = r; }); })")
+    page.wait_for_function("() => window.__later !== undefined")
+    assert page.evaluate("window.__later")["applied"]
+    held[0].continue_()
+    page.unroute("**/api/lanes?*")
+    page.wait_for_function("() => window.__earlier !== undefined")
+    assert page.evaluate("window.__earlier")["applied"] is False
+
+
+OVERVIEW_DC01 = "#ovHosts tr[data-host='DC01'] td.num"
+
+
+def test_events_opened_from_the_overview_are_not_listed_once_a_later_change_replaces_the_view(page):
+    """A number on the Case overview sets a View and lists the View's events in the Details panel. When a later change
+    replaces the View before the View's registration has answered, here Show all, the number's events are no longer what
+    the timeline shows, so nothing is listed."""
+    asked = []
+    page.on("request", lambda req: asked.append(req.url) if "/api/view_events" in req.url else None)
+    page.locator("#tabOverview").click()
+    held = []
+    page.route("**/api/filter", lambda route: held.append(route))
+    with page.expect_request("**/api/filter"):
+        page.locator(OVERVIEW_DC01).get_by_role("button").click()   # DC01's events, as a View
+    page.locator("#viewButton").click()
+    page.locator("#viewPanel").get_by_role("button", name="Show all").click()   # no filter is left to register
+    page.wait_for_function("() => window.__app.S.viewSpec === null")
+    wait_held(page, held)
+    with page.expect_response("**/api/filter"):
+        held[0].continue_()
+    page.unroute("**/api/filter")
+    # The page takes an answer as soon as it arrives, so half a second covers the request that taking it would make
+    page.wait_for_timeout(500)
+    assert asked == [] and page.locator("#details").get_attribute("data-page") != "opened"
+
+
+def test_events_opened_from_the_overview_are_listed_when_a_later_sources_change_keeps_the_view(page):
+    """When a Sources change replaces the filter of a View a Case overview number set before the View's registration has
+    answered, the View stays. The events are listed under the id registered for the View: /api/view_events lists only a
+    filter's View part, so the list holds the events the number stands for."""
+    asked = []
+    page.on("request", lambda req: asked.append(req.url) if "/api/view_events" in req.url else None)
+    page.locator("#tabOverview").click()
+    number = page.locator(OVERVIEW_DC01).get_by_role("button")
+    stands_for = number.inner_text()
+    held = []
+    page.route("**/api/filter", lambda route: held.append(route))
+    with page.expect_request("**/api/filter"):
+        number.click()   # DC01's events, as a View
+    page.locator("#filtersButton").click()
+    with page.expect_request("**/api/filter"):
+        page.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True).uncheck()
+    wait_held(page, held, 2)
+    with filtered_view(page):   # the Sources change's registration answers first, and the timeline draws under it
+        held[1].continue_()
+    with page.expect_response("**/api/filter") as registered:
+        held[0].continue_()
+    page.unroute("**/api/filter")
+    page.wait_for_selector("#details[data-page='opened']")
+    assert [url.split("?")[1] for url in asked] == [f"filter={registered.value.json()['id']}"]
+    assert page.locator("#details .sticky-head .actions > strong").inner_text() == f"{stands_for} events"
+
+
+def test_a_page_opened_while_an_overview_number_sets_its_view_keeps_the_panel(page):
+    """A number on the Case overview claims the Details panel when clicked, and lists its events there once its View
+    has registered and drawn. A page the analyst opens meanwhile, here Rules, keeps the panel, and the list isn't asked
+    for. The View's registration is held here until Rules shows."""
+    page.locator("#tabOverview").click()
+    held = []
+    page.route("**/api/filter", lambda route: held.append(route))
+    with page.expect_request("**/api/filter"):
+        page.locator(OVERVIEW_DC01).get_by_role("button").click()   # DC01's events, as a View
+    case_menu(page, "rulesButton")
+    page.wait_for_selector("#details[data-page='rules']")
+    page.evaluate(RECORD_REQUESTS)
+    with page.expect_response("**/api/filter") as registered:
+        held[0].continue_()
+    page.unroute("**/api/filter")
+    # The page asks for the list once the timeline has taken the view drawn under the View's filter
+    page.wait_for_function("""(id) => window.__taken.some((path) => path.startsWith('/api/view?')
+                              && new URLSearchParams(path.split('?')[1]).get('filter') === String(id))""",
+                           arg=registered.value.json()["id"])
+    assert asked(page, "/api/view_events") == []
+    assert page.locator("#details").get_attribute("data-page") == "rules"
 
 
 def test_zone_axis_from_the_hosts_zone_is_kept_across_a_reload(page):
@@ -778,7 +1003,10 @@ def test_ip_pivot_and_view_at_either_end(browser, synthetic_case, tmp_path, monk
         example = details.locator(".help-table tr", has_text="IP at either end").get_by_role("button")
         assert example.inner_text() == "addr:10.42.85.10"
 
-        # An event without an address: the next pivots say so, on the not-offered line
+        # An event without an address: the next pivots say so, on the not-offered line. The timeline without a view
+        # filter, asked for when the last one came off, can answer after the search; until then it draws an earlier
+        # filter's events, and each of those has an address.
+        page.wait_for_function("() => window.__app.S.data.events.some((e) => e.code === '4672')")
         page.evaluate("(uid) => window.__app.select(uid, false)", event_point(page, "4672")["uid"])
         page.wait_for_function("() => document.querySelector('#details .pv-not')")
         assert "Same IP at either end: This event has no source or destination IP." in details.locator(".pv-not").inner_text()
@@ -1127,7 +1355,8 @@ def test_tools_page_runs_a_tool_and_shows_it_ran(browser, synthetic_case, tmp_pa
         details = page.locator("#details")
         assert "1 event log, on 1 host" in details.locator(".tools-table").inner_text()
         details.get_by_role("button", name="Run Fake").click()
-        page.wait_for_function("() => window.__toolJob && window.__toolJob.finished")
+        # The table's result, which shows whether the page followed the job or the job had finished when the page
+        # first asked about it
         page.wait_for_function("() => document.querySelector('#details .tools-table .ok') !== null")
         assert "Ran " in details.locator(".tools-table").inner_text()
         # A job counts its runs, not hosts
@@ -1158,6 +1387,71 @@ def test_tools_page_loads_tool_output_found_in_the_evidence(browser, synthetic_c
         case_menu(page, "toolsButton")
         page.wait_for_selector("#details .tools-outputs .ok")
         assert "Loaded " in page.locator("#details .tools-outputs").inner_text()
+
+
+# Asks the server about the background job until it reports the job finished, for up to `timeout` milliseconds; true
+# when it did
+JOB_FINISHED = """async (timeout) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+        if ((await (await fetch('/api/run_status')).json()).job?.finished) return true;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return false;
+}"""
+
+
+def test_tools_page_follows_a_load_that_finishes_before_the_page_answers(browser, synthetic_case):
+    """A load started from the Tools page is followed from the click, so the timeline reloads once it has finished even
+    when the Tools page's own request is still unanswered. That request is held here until the job has finished, as a
+    short job's would be, and its answer then shows the job finished, not running."""
+    from test_tool_outputs import EVTX_COLUMNS, evtx_rows, write_rows
+
+    from glessner.intake import intake
+    from glessner.tools import load_registry
+
+    write_rows(synthetic_case.evidence / "WS02" / "Modules" / "EventLogs" / "20240514_EvtxECmd_Output.csv", EVTX_COLUMNS,
+               evtx_rows("WS02.corp.local"))
+    intake(synthetic_case)
+    held = []
+    for page in served_page(browser, synthetic_case, setup=lambda app: setattr(app, "tool_cache", (load_registry(), {}))):
+        case_menu(page, "toolsButton")
+        page.wait_for_selector("#details[data-page='tools'] .tools-outputs")
+        page.route("**/api/tools", lambda route: held.append(route))
+        with page.expect_request("**/api/tools"):
+            page.locator("#details .tools-outputs").get_by_role("button", name="Load EvtxECmd CSV on WS02").click()
+        wait_held(page, held)
+        # The timeline reloads once events have loaded; a page change isn't a load. The wait covers the job's, then the
+        # reload's.
+        with page.expect_event("load", timeout=PAGE_TIMEOUT_MS + LOAD_TIMEOUT_MS):
+            assert page.evaluate(JOB_FINISHED, PAGE_TIMEOUT_MS)
+            held[0].continue_()
+
+
+def test_a_tool_run_leaves_a_page_opened_while_it_starts_and_runs(browser, synthetic_case, tmp_path):
+    """A run started from the Tools page draws that page again when the server answers, and again when the job finishes,
+    but only while the Tools page shows: a page the analyst opened meanwhile, here Rules, keeps the panel. The run's
+    request is held here until Rules shows; the stand-in tool loads nothing, so the timeline doesn't reload."""
+    from test_server import fake_tool_case
+
+    cache = fake_tool_case(synthetic_case, tmp_path)
+    held = []
+    for page in served_page(browser, synthetic_case, setup=lambda app: setattr(app, "tool_cache", cache)):
+        case_menu(page, "toolsButton")
+        page.wait_for_selector("#details[data-page='tools'] .tools-table")
+        page.route("**/api/run_tool", lambda route: held.append(route))
+        page.locator("#details").get_by_role("button", name="Run Fake").click()
+        wait_held(page, held)
+        case_menu(page, "rulesButton")
+        page.wait_for_selector("#details[data-page='rules']")
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_response("**/api/run_tool"):
+            held[0].continue_()
+        page.unroute("**/api/run_tool")
+        # The status line says the job finished in the task that would draw the Tools page again
+        page.wait_for_function("() => document.getElementById('status').textContent === 'Fake finished.'")
+        assert asked(page, "/api/tools") == []
+        assert page.locator("#details").get_attribute("data-page") == "rules"
 
 
 def test_tools_page_loads_autoruns_and_the_event_page_shows_the_entry(browser, synthetic_case):
@@ -2143,9 +2437,10 @@ def test_the_status_line_counts_what_lies_outside_the_window_drawn_and_filtered(
         assert status.inner_text().endswith(
             " | Outside this view: 1 earlier, from 1937-10-23; 1 later, to 2037-10-21. Zoom out to see them.")
         page.locator("#viewButton").click()
+        # The View's name shows at the click, and the note follows the view drawn under it, which answers later
         page.locator("#viewPanel").get_by_role("button", name="Chain", exact=True).click()
-        page.wait_for_function("() => document.getElementById('status').textContent.includes('View: Malicious, Suspicious')")
-        assert "Outside this view" not in status.inner_text()
+        page.wait_for_function("() => { const text = document.getElementById('status').textContent;"
+                               " return text.includes('View: Malicious, Suspicious') && !text.includes('Outside this view'); }")
 
 
 def test_sources_panel_shows_and_hides_a_capture_s_record_types(browser, synthetic_case):
@@ -2524,3 +2819,408 @@ def test_an_action_that_answers_late_leaves_the_page_asked_for_after_it(browser,
 
     for page in served_page(browser, synthetic_case, setup=setup):
         run(page)
+
+
+def mark_and_note_an_event(app):
+    """Mark an event Malicious and put a note on it, so that the audit trail lists a mark to undo and a note to retract."""
+    from glessner.server import api_mark, api_note
+
+    uid = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' AND ts_us = ?",
+                          [T0 + 874 * SEC]).fetchone()[0]
+    api_mark(app, {"uids": [uid], "value": "malicious"})
+    api_note(app, {"uid": uid, "text": "a note to retract"})
+
+
+def test_a_late_retract_leaves_the_audit_trail_opened_again_alone(browser, synthetic_case):
+    """A retract redraws the audit trail once the timeline has reloaded. When the analyst has left the trail and opened it
+    again by then, the page is theirs: the redraw would close the Undo confirm they opened on it. The retract's reload of
+    the lanes is held here until that confirm shows."""
+    held = []
+
+    def hold_first(route):   # the retract's reload; any later one goes through
+        if held:
+            route.continue_()
+        else:
+            held.append(route)
+
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.route("**/api/lanes?*", hold_first)
+        with page.expect_request("**/api/lanes?*"), page.expect_response("**/api/note_retract"):
+            note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        wait_held(page, held)
+        case_menu(page, "rulesButton")
+        page.wait_for_selector("#details[data-page='rules']")
+        case_menu(page, "auditButton")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        confirm = mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event")
+        confirm.wait_for()
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_request("**/api/counts"):   # the reload is done, and the trail would ask for its redraw with it
+            held[0].continue_()
+        page.unroute("**/api/lanes?*")
+        assert asked(page, "/api/audit?") == []
+        assert confirm.is_visible()
+
+
+@pytest.mark.parametrize(("row", "ask", "confirm", "endpoint", "done"), [
+    ("Malicious", "Undo", "Undo 1 event", "undo", lambda details: details.locator(".correction-tag")),
+    ("a note to retract", "Retract", "Retract", "note_retract", lambda details: details.get_by_text("Retracted by #")),
+], ids=["undo", "retract"])
+def test_an_undo_or_a_retract_that_answers_late_draws_the_audit_trail_opened_again(
+        browser, synthetic_case, row, ask, confirm, endpoint, done):
+    """The audit trail the analyst opened again while an undo or a retract was in flight was read before the change was
+    journaled, so it draws again when the change is done and shows it. The request is held here until the trail has
+    been opened again."""
+    held = []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        entry = details.locator(".audit-row", has_text=row).first
+        entry.get_by_role("button", name=ask).click()
+        page.route(f"**/api/{endpoint}", lambda route: held.append(route))
+        with page.expect_request(f"**/api/{endpoint}"):
+            entry.locator(".audit-confirm").get_by_role("button", name=confirm).click()
+        wait_held(page, held)
+        case_menu(page, "rulesButton")
+        page.wait_for_selector("#details[data-page='rules']")
+        case_menu(page, "auditButton")
+        page.wait_for_selector("#details[data-page='audit']")
+        assert done(details).count() == 0
+        held[0].continue_()
+        done(details).first.wait_for()
+
+
+def test_an_undo_draws_the_audit_trail_again_with_the_filters_it_shows_by_then(browser, synthetic_case):
+    """An undo draws the audit trail again when it's done, with the filters the trail shows by then, so a trail the
+    analyst narrowed while the undo was in flight stays narrowed. The undo is held here until the trail lists marks only."""
+    held = []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        page.route("**/api/undo", lambda route: held.append(route))
+        with page.expect_request("**/api/undo"):
+            mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        wait_held(page, held)
+        with page.expect_response(lambda res: "/api/audit?" in res.url):
+            details.get_by_role("combobox", name="Action").select_option("Marks")
+        with page.expect_request(lambda req: "/api/audit?" in req.url) as redraw:
+            held[0].continue_()
+        assert "kind=Marks" in redraw.value.url
+        details.get_by_text("Undone by #").wait_for()
+        assert details.get_by_role("combobox", name="Action").input_value() == "Marks"
+
+
+def test_a_retract_leaves_a_confirm_open_on_the_trail_and_draws_the_trail_once_it_closes(browser, synthetic_case):
+    """A retract done while the analyst has an Undo confirm open on another row of the same trail says so on the status
+    line and leaves that confirm open, since drawing the trail again would close it. The trail draws again once the
+    confirm closes, and shows the note retracted. The retract's reload of the lanes is held here until the confirm
+    shows."""
+    held = []
+
+    def hold_first(route):   # the retract's reload; any later one goes through
+        if held:
+            route.continue_()
+        else:
+            held.append(route)
+
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.route("**/api/lanes?*", hold_first)
+        with page.expect_request("**/api/lanes?*"), page.expect_response("**/api/note_retract"):
+            note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        wait_held(page, held)
+        page.wait_for_function("() => document.getElementById('status').textContent.startsWith('Retracted note #')")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        confirm = mark.locator(".audit-confirm")
+        confirm.get_by_role("button", name="Undo 1 event").wait_for()
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_request("**/api/counts"):   # the reload is done, and the trail would ask for its redraw with it
+            held[0].continue_()
+        page.unroute("**/api/lanes?*")
+        assert asked(page, "/api/audit?") == []
+        assert confirm.get_by_role("button", name="Undo 1 event").is_visible()
+        assert details.get_by_text("Retracted by #").count() == 0
+        confirm.get_by_role("button", name="Cancel").click()
+        details.get_by_text("Retracted by #").wait_for()
+
+
+def first_held(held):
+    """A route handler that holds the route's first request in `held` and lets every later one through."""
+    def handle(route):
+        if held:
+            route.continue_()
+        else:
+            held.append(route)
+    return handle
+
+
+def start_held_undo(page, reload):
+    """Open the audit trail, undo its mark, and return the mark's row once the server has answered the undo and holds
+    the undo's reload of the lanes in `reload`."""
+    details = page.locator("#details")
+    case_menu(page, "auditButton")
+    mark = details.locator(".audit-row", has_text="Malicious").first
+    mark.get_by_role("button", name="Undo").click()
+    page.route("**/api/lanes?*", first_held(reload))
+    with page.expect_response("**/api/undo"):
+        mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+    wait_held(page, reload)
+    return mark
+
+
+def test_an_event_opened_from_the_audit_trail_during_an_undos_reload_takes_the_panel(browser, synthetic_case):
+    """An Event page asked for from the audit trail while an undo's timeline reloads draws when it answers, even after
+    the reload is done: the undo's redraw of the trail leaves alone a page asked for since that is still loading. The
+    reload is held here until the event is asked for, and the event until the reload is done."""
+    reload, event = [], []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        mark = start_held_undo(page, reload)
+        page.route("**/api/event?*", first_held(event))
+        mark.locator(".ev-name").click()
+        wait_held(page, event)
+        with page.expect_request("**/api/counts"):   # the reload is done, and the trail would have drawn again by now
+            reload[0].continue_()
+        event[0].continue_()
+        page.wait_for_selector("#details[data-page='event']")
+
+
+def test_a_trail_narrowed_during_an_undos_reload_keeps_its_filters(browser, synthetic_case):
+    """The audit trail narrowed while an undo's timeline reloads draws with its own filters when its read answers after
+    the reload. That read follows the undo, so the trail doesn't draw again. The reload is held here until the trail is
+    narrowed, and the narrowed read until the reload is done."""
+    reload, read = [], []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        start_held_undo(page, reload)
+        page.route("**/api/audit?*", first_held(read))
+        page.evaluate(RECORD_REQUESTS)
+        details.get_by_role("combobox", name="Action").select_option("Marks")
+        wait_held(page, read)
+        with page.expect_request("**/api/counts"):   # the reload is done, and the trail would have drawn again by now
+            reload[0].continue_()
+        read[0].continue_()
+        details.get_by_text("Undone by #").wait_for()
+        reads = asked(page, "/api/audit?")   # a redraw would be asked for in the task that drew the trail
+        assert len(reads) == 1 and "kind=Marks" in reads[0]
+        assert details.get_by_role("combobox", name="Action").input_value() == "Marks"
+
+
+def test_a_trail_read_before_an_undo_draws_again_when_its_read_answers_after_the_undo(browser, synthetic_case):
+    """The audit trail opened again while an undo is in flight, whose read answers only once the undo and its timeline
+    reload are done, was read before the undo, so it draws again once it has drawn, and shows the undo. The undo is
+    held here until the server has answered that read, and the read's answer until the undo is done."""
+    undo, read = [], []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        page.route("**/api/undo", lambda route: undo.append(route))
+        with page.expect_request("**/api/undo"):
+            mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        wait_held(page, undo)
+        case_menu(page, "rulesButton")
+        page.wait_for_selector("#details[data-page='rules']")
+        page.route("**/api/audit?*", first_held(read))
+        case_menu(page, "auditButton")
+        wait_held(page, read)
+        before = read[0].fetch()   # the trail as the server reads it before the undo
+        with page.expect_request("**/api/counts"):
+            undo[0].continue_()
+        read[0].fulfill(response=before)
+        details.locator(".correction-tag").first.wait_for()
+
+
+def mark_two_and_note_one(app):
+    """Mark two events Malicious in one entry and put a note on one of them, so that the audit trail lists a mark with
+    its event list and an undo, and a note to retract."""
+    from glessner.server import api_mark, api_note
+
+    rows = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' ORDER BY ts_us LIMIT 2").fetchall()
+    uids = [uid for (uid,) in rows]
+    api_mark(app, {"uids": uids, "value": "malicious"})
+    api_note(app, {"uid": uids[0], "text": "a note to retract"})
+
+
+@pytest.mark.parametrize("box", ["events", "plan error"])
+def test_a_trail_a_retract_left_unchanged_draws_once_the_box_on_another_row_closes(browser, synthetic_case, box):
+    """A retract done while another row's box holds a confirm leaves the trail as it is, and the trail draws again once
+    that box closes, showing the note retracted. The box closes as the row's event list, opened in place of its Undo
+    confirm, or as the error of an undo plan that failed, which has a Close button. The retract's reload of the lanes
+    is held here until the box shows."""
+    held = []
+    for page in served_page(browser, synthetic_case, setup=mark_two_and_note_one):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.route("**/api/lanes?*", first_held(held))
+        with page.expect_request("**/api/lanes?*"), page.expect_response("**/api/note_retract"):
+            note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        wait_held(page, held)
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        shown = mark.locator(".audit-confirm")
+        if box == "plan error":
+            page.route("**/api/undo_plan?*", lambda route: route.fulfill(
+                status=500, content_type="application/json", body=json.dumps({"error": "the plan failed"})))
+        mark.get_by_role("button", name="Undo").click()
+        shown.get_by_text("the plan failed" if box == "plan error" else "Undo 2 events").wait_for()
+        if box == "plan error":
+            page.unroute("**/api/undo_plan?*")
+            page.errors[:] = [e for e in page.errors if "/api/undo_plan" not in e]   # that refusal was the point
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_request("**/api/counts"):   # the reload is done, and the trail would ask for its redraw with it
+            held[0].continue_()
+        page.unroute("**/api/lanes?*")
+        assert asked(page, "/api/audit?") == []
+        if box == "events":
+            events = mark.get_by_role("button", name="2 events", exact=True)
+            events.click()
+            shown.locator("li").first.wait_for()
+            assert details.get_by_text("Retracted by #").count() == 0
+            events.click()
+        else:
+            assert details.get_by_text("Retracted by #").count() == 0
+            shown.get_by_role("button", name="Close").click()
+        details.get_by_text("Retracted by #").wait_for()
+
+
+def test_a_trail_whose_redraw_failed_settles_when_a_confirm_on_it_closes(browser, synthetic_case):
+    """The audit trail draws again after an undo, to show it. When that read fails, the trail on screen stays as it was,
+    and it settles again once a confirm on it closes, here a Retract confirm canceled. The redraw's read is refused
+    here."""
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        page.route("**/api/audit?*", refused_with("the trail failed"))
+        with page.expect_response("**/api/audit?*"):
+            mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        page.unroute("**/api/audit?*")
+        page.errors[:] = [e for e in page.errors if "/api/audit?" not in e]   # that refusal was the point
+        page.wait_for_function("() => document.getElementById('status').textContent.startsWith('Audit trail failed')")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.evaluate(RECORD_REQUESTS)
+        note.locator(".audit-confirm").get_by_role("button", name="Cancel").click()
+        assert len(asked(page, "/api/audit?")) == 1
+        details.locator(".correction-tag").first.wait_for()
+
+
+def test_a_retract_on_the_trail_draws_it_again_after_a_page_asked_for_failed(browser, synthetic_case):
+    """A page asked for while an undo's timeline reloads holds the audit trail's redraw, since that page takes the panel
+    when it draws. When the page fails instead, here Rules, the trail stays as it was, and the next change confirmed on
+    it, here a retract, draws it again with both changes. The undo's reload is held here until Rules has failed."""
+    reload = []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        start_held_undo(page, reload)
+        page.route("**/api/rules", refused_with("the rules failed"))
+        with page.expect_response("**/api/rules"):
+            case_menu(page, "rulesButton")
+        page.unroute("**/api/rules")
+        page.errors[:] = [e for e in page.errors if "/api/rules" not in e]   # that refusal was the point
+        with page.expect_request("**/api/counts"):   # the reload is done, and Rules' claim holds the trail's redraw
+            reload[0].continue_()
+        page.unroute("**/api/lanes?*")
+        assert details.get_attribute("data-page") == "audit"
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_request("**/api/counts"):   # the retract's reload is done, and the trail settles with it
+            note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        assert len(asked(page, "/api/audit?")) == 1
+        details.get_by_text("Retracted by #").wait_for()
+        assert details.locator(".correction-tag").count() == 1
+
+
+def test_an_undo_on_the_trail_draws_it_again_after_a_page_asked_for_failed(browser, synthetic_case):
+    """A page asked for while a retract's timeline reloads holds the audit trail's redraw, since that page takes the
+    panel when it draws. When the page fails instead, here Rules, the trail stays as it was, and the next change
+    confirmed on it, here an undo, draws it again with both changes. The retract's reload is held here until Rules has
+    failed."""
+    reload = []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.route("**/api/lanes?*", first_held(reload))
+        with page.expect_response("**/api/note_retract"):
+            note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        wait_held(page, reload)
+        page.route("**/api/rules", refused_with("the rules failed"))
+        with page.expect_response("**/api/rules"):
+            case_menu(page, "rulesButton")
+        page.unroute("**/api/rules")
+        page.errors[:] = [e for e in page.errors if "/api/rules" not in e]   # that refusal was the point
+        with page.expect_request("**/api/counts"):   # the reload is done, and Rules' claim holds the trail's redraw
+            reload[0].continue_()
+        page.unroute("**/api/lanes?*")
+        assert details.get_attribute("data-page") == "audit"
+        assert details.get_by_text("Retracted by #").count() == 0
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        page.evaluate(RECORD_REQUESTS)
+        with page.expect_request("**/api/counts"):   # the undo's reload is done, and the trail settles with it
+            mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        assert len(asked(page, "/api/audit?")) == 1
+        details.locator(".correction-tag").first.wait_for()
+        details.get_by_text("Retracted by #").wait_for()
+
+
+def test_a_confirm_opened_while_the_trail_redraws_stays_open_until_it_closes(browser, synthetic_case):
+    """The audit trail draws again after a retract, to show it. A confirm the analyst opens on the trail while that
+    read is out stays open when the read answers, since the redraw would close it, and the trail draws once the confirm
+    closes. The redraw's read is held here until the confirm shows."""
+    read = []
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        note = details.locator(".audit-row", has_text="a note to retract").first
+        note.get_by_role("button", name="Retract").click()
+        page.route("**/api/audit?*", first_held(read))
+        page.evaluate(RECORD_REQUESTS)
+        note.locator(".audit-confirm").get_by_role("button", name="Retract").click()
+        wait_held(page, read)
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        confirm = mark.locator(".audit-confirm")
+        confirm.get_by_role("button", name="Undo 1 event").wait_for()
+        read[0].continue_()
+        page.unroute("**/api/audit?*")
+        page.wait_for_function("() => window.__taken.some((path) => path.startsWith('/api/audit?'))")
+        assert confirm.get_by_role("button", name="Undo 1 event").is_visible()
+        assert details.get_by_text("Retracted by #").count() == 0
+        confirm.get_by_role("button", name="Cancel").click()
+        details.get_by_text("Retracted by #").wait_for()
+
+
+def test_an_undo_whose_timeline_reload_fails_says_so_and_draws_the_trail(browser, synthetic_case):
+    """The timeline reloads after an undo, and the audit trail then draws again to show it. When the reload fails, the
+    status line says the timeline didn't reload and why, in place of the undo's own line, and the trail still draws. The
+    reload of the lanes is refused here."""
+    for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        details = page.locator("#details")
+        case_menu(page, "auditButton")
+        mark = details.locator(".audit-row", has_text="Malicious").first
+        mark.get_by_role("button", name="Undo").click()
+        page.route("**/api/lanes?*", refused_with("the lanes failed"))
+        with page.expect_response("**/api/lanes?*"):
+            mark.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        page.unroute("**/api/lanes?*")
+        page.errors[:] = [e for e in page.errors if "/api/lanes" not in e]   # that refusal was the point
+        details.locator(".correction-tag").first.wait_for()
+        assert page.locator("#status").inner_text() == "The timeline didn't reload: the lanes failed"

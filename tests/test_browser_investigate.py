@@ -292,8 +292,11 @@ def test_a_group_action_asks_first_on_both_pages_and_cancel_changes_nothing(brow
         sent = json.loads(got.value.request.post_data)
         assert sent["confirmed"] == {"count": pending} and len(sent["uids"]) == pending and found["late"] not in sent["uids"]
         assert got.value.json()["skipped"] == 1
-        p.wait_for_function(f'() => document.querySelector("{INVESTIGATE} .rule .rule-pending")?.textContent'
-                            '.startsWith("1 event pending")')
+        # The page redraws once the decision's reload of the timeline is done, and a page asked for before that redraw
+        # loses the panel to it. The wait reads the logons row itself: hayabusa's row, above it, has read
+        # "1 event pending" since the page loaded.
+        p.wait_for_function(f'() => document.querySelector("{INVESTIGATE} .rule[data-source=\'logons\'] .rule-pending")'
+                            '?.textContent.startsWith("1 event pending")')
         entry = entries(synthetic_case)[-1]
         assert (entry["action"], entry["confirmed"]) == ("mark", {"count": pending, "skipped": 1})
         assert len(entry["targets"]) == pending - 1

@@ -74,6 +74,8 @@ export const NOT_RAW = new Set(['extra', 'hits', 'mark', 'notes', 'suggestions',
 // answers late would replace the Event page opened after it, and To investigate, Rules, or the audit trail opened after it.
 let detailsTurn = 0;
 export const claimDetails = () => { const turn = ++detailsTurn; return () => turn === detailsTurn; };
+// The claims made so far, read without claiming: a page that has drawn can tell later whether one was asked for since.
+export const detailsClaims = () => detailsTurn;
 // Whether the panel still shows the page with this key. A page's action, such as Accept all or Remove, redraws the page
 // when it answers, and the answer would replace whatever page the analyst asked for meanwhile.
 export const showingPage = (key) => $('details').dataset.key === key;

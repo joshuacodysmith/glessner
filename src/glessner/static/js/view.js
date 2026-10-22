@@ -110,7 +110,7 @@ function setSpec(marks, values) {
 async function applyView() {
   renderViewState();   // the badge and panel answer the click at once; the timeline follows when its data arrives
   renderViewPanel();
-  await applyFilter();
+  return applyFilter();
 }
 
 export function usePreset(marks) {

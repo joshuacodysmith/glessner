@@ -6,7 +6,7 @@ import json
 
 import pytest
 from conftest import DC_LOG
-from test_browser_smoke import browser, case_menu, clock_page, served_page, to_timeline, view  # noqa: F401
+from test_browser_smoke import browser, case_menu, clock_page, filtered_view, served_page, to_timeline, view  # noqa: F401
 from test_overview import app_with_work, evidence_log, held_open, overview_case  # noqa: F401
 
 from glessner import intake as intake_module
@@ -159,6 +159,9 @@ def test_every_control_that_left_the_header_still_works(browser, synthetic_case)
     record work from the Case menu."""
     intake(synthetic_case)   # the Import page lists the manifest's files
     for p in served_page(browser, synthetic_case, setup=no_tool_scan):
+        # The case buttons' hover hints carry the case's counts, so they are set when the counts answer, which can be
+        # after the page is ready
+        p.wait_for_function("() => document.getElementById('investigateButton').title !== ''")
         for control in ("lanesLabel", "fit", "filtersButton", "viewButton", "linksLabel", "machineLabel", "addZone",
                         "legendButton", "tabOverview", "tabTimeline", "investigateButton", "tabFindings", "caseMenuButton",
                         "hostsButton", "toolsButton", "importButton", "rulesButton", "exportButton", "auditButton",
@@ -178,7 +181,8 @@ def test_every_control_that_left_the_header_still_works(browser, synthetic_case)
             p.wait_for_selector(f"#{panel}:not([hidden])")
             p.locator(f"#{button}").click()
             p.wait_for_selector(f"#{panel}", state="hidden")
-        assert p.evaluate("window.__app.S.data.links.items.length") > 0
+        # The links drawn are the window's before Fit until the fitted window's data answers
+        p.wait_for_function("() => window.__app.S.data.links.items.length > 0")
         p.locator("#showLinks").uncheck()
         p.wait_for_function("() => window.__app.S.data.links.items.length === 0")
         with p.expect_request(lambda r: "/api/view" in r.url and "hide_machine=0" in r.url):
@@ -306,7 +310,11 @@ def test_a_lead_or_a_number_says_how_many_of_its_events_the_sources_hide(browser
     app.con.close()
     for p in served_page(browser, overview_case, setup=no_tool_scan):
         p.locator("#filtersButton").click()
-        p.locator("#fpTree").get_by_role("checkbox", name="Show DC01", exact=True).uncheck()
+        # The lead's line is the status line's until the next redraw of it, and the Sources change's own view redraws
+        # it when it answers, so the lead opens after the page has drawn that view
+        with filtered_view(p) as drawn:
+            p.locator("#fpTree").get_by_role("checkbox", name="Show DC01", exact=True).uncheck()
+        p.wait_for_function("(n) => window.__app.S.data.count === n", arg=drawn.value.json()["count"])
         p.wait_for_selector("#stHiddenSources")
         p.locator("#tabOverview").click()
         p.locator("#ovLeads .ov-lead").nth(0).get_by_role("button", name="Open on timeline").click()
@@ -555,6 +563,9 @@ def test_the_state_line_names_the_clock_and_aligns_from_it(clock_page):  # noqa:
     p.wait_for_selector("#clockAligned[aria-pressed='true']")
     p.wait_for_function("() => document.getElementById('stClockPill').textContent.startsWith('Aligned')")
     assert pill.inner_text() == "Aligned to capture: DC01 -3,599.5 s, DESKTOP -3,599.5 s\nShow recorded"
+    # The switch reads Aligned before the alignment has reloaded the timeline, and a click before then is dropped; the
+    # switch's halves say they're busy until it has
+    p.wait_for_selector("#clockAligned:not([aria-disabled])")
     p.locator("#stRecorded").click()
     p.wait_for_selector("#clockRecorded[aria-pressed='true']")
     p.wait_for_function("() => document.getElementById('stClockPill').textContent.startsWith('Recorded times')")

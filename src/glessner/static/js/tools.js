@@ -4,7 +4,7 @@
 // the background; the page follows it and the timeline reloads after.
 
 import { $, api, el, plural, post, setStatus } from './core.js';
-import { button, claimDetails, setPage } from './event_page.js';
+import { button, claimDetails, setPage, showingPage } from './event_page.js';
 import { refreshCaseState } from './frame.js';
 import { showImport } from './import.js';
 
@@ -192,22 +192,28 @@ function readyText(r) {
 async function runAll() {
   try { await post('/api/run_all', {}); }
   catch (err) { setStatus(`Didn't start: ${err.message}`); return; }
-  setStatus('Running and loading everything ready...');
-  showTools();
+  started('Running and loading everything ready...');
 }
 
 async function loadOutput(g, anyway) {
   try { await post('/api/load_output', { key: g.key, hosts: [g.host], anyway }); }
   catch (err) { setStatus(`${g.label} didn't load: ${err.message}`); return; }
-  setStatus(`Loading ${g.label} on ${g.host}...`);
-  showTools();
+  started(`Loading ${g.label} on ${g.host}...`);
 }
 
 async function runTool(t) {
   try { await post('/api/run_tool', { tool: t.id }); }
   catch (err) { setStatus(`${t.name} didn't start: ${err.message}`); return; }
-  setStatus(`Running ${t.name}...`);
-  showTools();
+  started(`Running ${t.name}...`);
+}
+
+// A job this page starts is followed at once: a short one can finish before the Tools page answers, and that answer
+// shows it finished, not running. Here and when the job finishes, the page draws again only while it shows. The check is
+// showingPage('tools'), so a page the analyst asked for keeps the panel once that page has drawn.
+function started(text) {
+  setStatus(text);
+  follow();
+  if (showingPage('tools')) showTools();
 }
 
 function follow() {
@@ -223,13 +229,12 @@ function follow() {
     polling = null;
     const sum = (hits) => job.results.reduce((n, r) => n + (r.status === 'ok' && !!r.hits === hits ? r.rows || 0 : 0), 0);
     const events = sum(false), hits = sum(true);
-    window.__toolJob = job;   // for browser tests
     if ((events || hits) && !job.error) {
       const loaded = [...(events || !hits ? [rowsText(events, false)] : []), ...(hits ? [rowsText(hits, true)] : [])];
       setStatus(`${job.tool} loaded ${loaded.join(' and ')}. Reloading the timeline.`);
       setTimeout(() => location.reload(), 1500);
     } else {
-      showTools();
+      if (showingPage('tools')) showTools();
       refreshCaseState();   // each run re-hashed the files it read; a load reloads the page, which reads it anyway
     }
   }, POLL_MS);

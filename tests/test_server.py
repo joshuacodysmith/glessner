@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import re
 import secrets
 import socket
 import time
@@ -672,8 +673,9 @@ def test_the_serve_command_says_when_it_fell_back_to_a_free_port(synthetic_case,
 
 def test_the_serve_command_says_what_its_open_is_doing_before_the_link(synthetic_case, monkeypatch, capsys):
     """serve names the case it opens, and its open's stages, before the link. A case at the
-    newest format has no upgrade, so no line says one runs. The server's loop is stubbed, so the command returns at
-    once."""
+    newest format has no upgrade, so no line says one runs. Each stage's line starts with the seconds since the open
+    began, which depend on how busy the machine is, so any count of seconds matches. The server's loop is stubbed, so the
+    command returns at once."""
     from glessner import server as mod
     from glessner.cli import OPENING, main
 
@@ -681,7 +683,9 @@ def test_the_serve_command_says_what_its_open_is_doing_before_the_link(synthetic
     assert main(["serve", str(synthetic_case.folder), "--no-browser", "--port", "0"]) == 0
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == f"Opening {synthetic_case.settings.name!r} from {synthetic_case.folder}."
-    assert lines[1] == f"   0 s  {OPENING}" and lines[2] == "   0 s  Opened."
+    seconds = r" *\d+ s  "
+    assert re.fullmatch(seconds + re.escape(OPENING), lines[1]), lines[1]
+    assert re.fullmatch(seconds + r"Opened\.", lines[2]), lines[2]
     assert lines[3].startswith("Serving ") and not any("upgrade" in line for line in lines)
 
 

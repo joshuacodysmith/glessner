@@ -45,11 +45,20 @@ const num = (n, action, title) => button(n.toLocaleString(), action, { class: 'l
 // A View of exactly these marks and values, on the timeline: what a number that stands for events opens, with the same
 // events listed in the Details panel under `title`, to tick and mark. The state line shows the View, with Show
 // to turn it off. The Sources stay, so the status says how many of its events they hide.
+// The list is asked under the filter registered for this View. /api/view_events reads only a filter's View part, so a
+// later change that keeps the View, such as a Sources box, leaves the list the set the number stands for. A later change
+// that replaces the View, or a failed registration, leaves nothing to list. The status counts under the filter in force,
+// so it is set only when that filter is this View's. The number claims the Details panel when clicked, so a page the
+// analyst asks for while the View registers and draws keeps the panel, and the list isn't asked for.
 async function openView(marks, values, title) {
   showTab('timeline');
-  await replaceView(marks, values);
-  await listOpened(title);
-  if (!sourcesOn()) return;
+  const latest = claimDetails();
+  const applying = replaceView(marks, values);
+  const spec = S.viewSpec;   // set at the call; the filter's registration follows
+  const { id, applied } = await applying;
+  if (!id || S.viewSpec !== spec) return;
+  await listOpened(title, id, latest);
+  if (!applied || !sourcesOn()) return;
   await shownCounted();
   const hidden = S.viewShown == null || S.lanesShown == null ? null : S.viewShown - S.lanesShown;
   if (hidden) {
@@ -60,17 +69,19 @@ async function openView(marks, values, title) {
 
 // The events a number opened, in the Details panel as a search's matches are: a tick for each, and the mark buttons,
 // so they can be reviewed and triaged where they were clicked into. The ticks start over for another number.
+// `filterId` is the filter registered for the number's View, and `latest` checks the claim on the panel made when the
+// number was clicked or the list asked to draw again.
 const opened = { key: '', checked: new Set() };
 
-async function listOpened(title) {
+async function listOpened(title, filterId, latest) {
+  if (!latest()) return;
   const key = `opened:${title}`;
   if (opened.key !== key) { opened.key = key; opened.checked = new Set(); }
-  const latest = claimDetails();
   let res;
-  try { res = await api(`/api/view_events?filter=${S.filterId}`); }
+  try { res = await api(`/api/view_events?filter=${filterId}`); }
   catch (err) { setStatus(`The events didn't load: ${err.message}`); return; }
   if (!latest()) return;
-  const reopen = () => listOpened(title);
+  const reopen = () => listOpened(title, filterId, claimDetails());
   const render = () => {
     const { buttons, list } = markableList(res.events, opened.checked, render, () => (showingPage(key) ? reopen() : null));
     const head = el('div', { class: 'sticky-head' }, el('h2', {}, title),
