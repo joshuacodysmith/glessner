@@ -26,8 +26,11 @@ from .journal import (
     Check,
     State,
     _apply,
+    analyst,
     check,
     entries,
+    unvouched_sentences,
+    unvouched_words,
 )
 from .tags import tag_label
 from .version import build_id
@@ -38,7 +41,8 @@ KINDS = {"mark": "Marks", "tag": "Tags", "tag_suggestion": "Tags", "note": "Note
          "undo": "Corrections", "host_split": "Hosts", "case_open": "Builds", "case_upgrade": "Builds",
          # The app's own records of the chain and the analyst's follow-ups, findings, and files
          "followup": "Follow-up", "finding": "Findings", "file_written": "Files", "case_created": "Builds",
-         "case_yaml": "Settings", "journal_recovered": "Integrity", "chain_break": "Integrity"}
+         "case_yaml": "Settings", "journal_recovered": "Integrity", "chain_break": "Integrity",
+         "manifest_recorded": "Integrity"}
 # Where a change the trail doesn't undo can be made instead: a finding changes both ways on the Findings page
 PANEL = {"Hosts": "hosts", "Rules": "rules", "Findings": "findings"}
 MARK_WORD = {"malicious": "Malicious", "suspicious": "Suspicious", "authorized": "Authorized", "unreviewed": "Unreviewed"}
@@ -278,16 +282,19 @@ def plan_undo(entries: list[dict], seq: int) -> dict:
 
 def lookups(entries: list[dict]) -> dict:
     """What describe looks up across entries: each finding's title, by the number of its add, as its latest edit left
-    it; and for each case_yaml entry, the record of case.yaml before it, as (its entry's number, the settings it
-    names, and whether it names every setting: case_created names four."""
+    it; for each case_yaml entry, the record of case.yaml before it, as (its entry's number, the settings it
+    names, and whether it names every setting: case_created names four; and the number of the first record of
+    manifest.jsonl."""
     titles: dict[int, str] = {}
     yaml: dict[int, tuple[int, dict, bool]] = {}
-    last = None
+    last = first_manifest = None
     for e in entries:
         action = e.get("action")
         if e.get(DAMAGED):
             continue
-        if action == "finding" and isinstance(e.get("title"), str):
+        if action == "manifest_recorded" and first_manifest is None:
+            first_manifest = e.get("seq")
+        elif action == "finding" and isinstance(e.get("title"), str):
             titles[e["seq"] if e.get("op") == "add" else e.get("finding")] = e["title"]
         elif action == "case_created":
             last = (e["seq"], {k: e.get(k) for k in ("name", "created_utc", "analyst", "evidence_path")}, False)
@@ -295,7 +302,7 @@ def lookups(entries: list[dict]) -> dict:
             if last is not None:
                 yaml[e["seq"]] = last
             last = (e["seq"], e.get("settings") or {}, True)
-    return {"titles": titles, "yaml": yaml}
+    return {"titles": titles, "yaml": yaml, "first_manifest": first_manifest}
 
 
 def describe(entry: dict, events: dict[str, str] | None = None, lookup: dict | None = None) -> str:
@@ -424,6 +431,14 @@ def _closed(value: dict) -> str:
                  f"{'was' if n == 1 else 'were'} {chain}: each names the one before it.")
         text += (" They match the head this app recorded." if value.get("head_record") == "matched"
                  else " No head recorded outside the case to compare with.")
+    if isinstance(found := value.get("manifest"), dict):
+        seq = found.get("seq")
+        text += {"matches": f" manifest.jsonl matched its record in the journal, entry #{seq}.",
+                 "grew": f" manifest.jsonl had grown past its record in the journal, entry #{seq}.",
+                 "differs": f" manifest.jsonl differed from its record in the journal, entry #{seq}.",
+                 "none": " No journal entry recorded manifest.jsonl's hash."}.get(found.get("state"), "")
+        if isinstance(reasons := found.get("unvouched"), list) and (why := unvouched_sentences(reasons)):
+            text += f" {why}."
     return text
 
 
@@ -449,6 +464,28 @@ def _closed_evidence(value: dict) -> str:
     found = "; ".join(problems[:3]) + ("; and more" if len(problems) > 3 else "")
     return (f"Closed the case. The evidence doesn't match the intake manifest{f': {found}' if found else ''}. "
             f"The case folder's verification.jsonl lists every problem.{skipped}")
+
+
+def _manifest(entry: dict, what: str, lookup: dict) -> str:
+    """A record of manifest.jsonl: what wrote it, its lines, bytes, and short SHA-256. The first record, when Add new
+    evidence wrote it, follows lines no entry recorded, which it says."""
+    lines, size = entry.get("lines"), entry.get("bytes")
+    words = (f"{_counted(lines, 'line')}, {_counted(size, 'byte')}, SHA-256 {short(entry.get('sha256', ''))}")
+    via = entry.get("via")
+    if via == "copy":
+        text = f"Recorded manifest.jsonl with the source case's record, since the copy holds its bytes: {words}"
+        return f"{text}. {unvouched}" if (unvouched := unvouched_words(entry)) else text
+    if via != "add":
+        return f"Recorded manifest.jsonl at intake: {words}"
+    text = f"Recorded manifest.jsonl after Add new evidence: {words}"
+    if lookup.get("first_manifest") == entry.get("seq"):
+        text += (". No earlier entry records manifest.jsonl, so nothing shows that its lines from before this Add new "
+                 "evidence are as intake wrote them")
+    return text
+
+
+def _counted(n, noun: str) -> str:
+    return f"{n:,} {noun}{'' if n == 1 else 's'}" if isinstance(n, int) else f"{n} {noun}s"
 
 
 def _quoted(value) -> str:
@@ -565,7 +602,8 @@ def _chain_break(entry: dict, what: str, lookup: dict) -> str:
 
 
 D16_WORDS = {"followup": _followup, "finding": _finding, "file_written": _file, "case_created": _created,
-             "case_yaml": _case_yaml, "journal_recovered": _recovered, "chain_break": _chain_break}
+             "case_yaml": _case_yaml, "journal_recovered": _recovered, "chain_break": _chain_break,
+             "manifest_recorded": _manifest}
 
 
 def single_targets(entries: list[dict]) -> set[str]:
@@ -595,21 +633,21 @@ def rows(entries: list[dict], events: dict[str, str], *, kind: str = "", who: st
     picked = []
     for e in reversed(entries):
         k = KINDS.get(e.get("action"), "Other")
-        if (kind and k != kind) or (who and e.get("who") != who) or (corrections and e.get("action") != "undo"):
+        if (kind and k != kind) or (who and analyst(e) != who) or (corrections and e.get("action") != "undo"):
             continue
         # A damaged entry's payload is not read: it names no event the filter could match
         if event and (e.get(DAMAGED) or (event not in (e.get("targets") or []) and e.get("target") != event and
                                          event not in {t for c in e.get("changes") or [] for t in c["targets"]})):
             continue
         text = describe(e, events, lookup)
-        if q and q.lower() not in f"{text} {e.get('who', '')}".lower():
+        if q and q.lower() not in f"{text} {analyst(e)}".lower():
             continue
         picked.append((e, k, text))
     out = []
     for e, k, text in picked[offset:offset + limit]:
         action, damaged = e.get("action"), bool(e.get(DAMAGED))
         named = None if damaged else next((t for t in single_targets([e]) if events.get(t) and events[t] in text), None)
-        out.append({"seq": e["seq"], "at": e.get("at", ""), "who": e.get("who", ""), "action": action, "kind": k,
+        out.append({"seq": e["seq"], "at": e.get("at", ""), "who": analyst(e), "action": action, "kind": k,
                     "text": text, "count": 0 if damaged else len(e.get("targets") or []), "undoes": e.get("undoes"),
                     "undone_by": done.get(e["seq"]),
                     "undoable": action in UNDOABLE and e["seq"] not in done and not damaged,
@@ -618,7 +656,7 @@ def rows(entries: list[dict], events: dict[str, str], *, kind: str = "", who: st
                     "event": {"uid": named, "name": events[named], "short": cut_name(events[named]),
                               "ts": (times or {}).get(named)} if named else None})
     return {"rows": out, "total": len(picked), "offset": offset,
-            "analysts": sorted({e.get("who", "") for e in entries}), "kinds": sorted(set(KINDS.values()))}
+            "analysts": sorted({analyst(e) for e in entries}), "kinds": sorted(set(KINDS.values()))}
 
 
 def rekeyed(entry: dict) -> str:
@@ -662,7 +700,7 @@ def markdown(entries: list[dict], case_name: str, events: dict[str, str],
         flag = " *(correction of an accident)*" if e.get("action") == "undo" and not e.get(DAMAGED) else ""
         flag += f" *(undone by #{done[e['seq']]})*" if e["seq"] in done else ""
         flag += f" *({rekeyed(e)})*" if e.get(REKEYED) else ""   # so the record matches journal.jsonl's line
-        lines.append(f"- **#{e['seq']}** {_md(when)} UTC, {_md(e.get('who', ''))}: "
+        lines.append(f"- **#{e['seq']}** {_md(when)} UTC, {_md(analyst(e))}: "
                      f"{_md(describe(e, events, lookup))}{flag}")
         total, shown = (listed or {}).get(e["seq"], (0, []))
         lines += [f"  - {_event_line(x)}" for x in shown]

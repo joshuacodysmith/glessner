@@ -170,13 +170,15 @@ export function renderWindow() {
   if (!count) return;
   const d = S.data, waiting = S.windowPending || !d;
   count.replaceChildren('In this window: ', el('b', {}, waiting ? '…' : d.count.toLocaleString()));
-  // The links counted are those drawn: one whose ends fall in a folded group isn't, and the hover says how many
+  // The links counted are those drawn: one whose ends fall in a folded group isn't, nor one from a host with no lane,
+  // and the hover says how many of each
   const linkWord = d && d.links.mode === 'grouped' ? 'logon link group' : 'logon link';
+  const links = [`${plural(S.linksDrawn, linkWord)} drawn`,
+                 S.linksFolded && `${plural(S.linksFolded, linkWord)} inside a folded group not drawn`,
+                 S.linksSkipped && `${S.linksSkipped.toLocaleString()} from a host with no lane not drawn`];
   count.title = waiting ? 'Counting the events in the new window.' :
     'Events in the window shown, under the current Sources and View, drawn one by one when few and as bars when many. ' +
-    ($('showLinks').checked ? `${plural(S.linksDrawn, linkWord)} drawn` +
-                              (S.linksFolded ? `; ${plural(S.linksFolded, linkWord)} inside a folded group not drawn.` : '.')
-                            : 'Logon links are off.');
+    ($('showLinks').checked ? `${links.filter(Boolean).join('; ')}.` : 'Logon links are off.');
 }
 
 // A span in days, hours, minutes, and seconds to the millisecond, leaving out the parts that are zero.

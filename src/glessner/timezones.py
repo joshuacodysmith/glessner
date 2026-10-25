@@ -51,6 +51,21 @@ def windows_to_iana(name: str) -> str:
     return buf.value[:n] if status.value <= 0 and n > 0 else ""
 
 
+def zone_key_name(text: str) -> str:
+    """A TimeZoneKeyName as Windows reads it, up to the value's terminating null. RECmd can write the bytes that follow
+    the null in the value's data too, such as "Eastern Standard Time ard Time". Where the null isn't kept, the name is
+    its longest run of leading words that names a Windows zone, or the whole text when none does."""
+    name = text.split("\x00", 1)[0].strip()
+    if windows_to_iana(name):
+        return name
+    words = name.split()
+    for end in range(len(words) - 1, 0, -1):
+        leading = " ".join(words[:end])
+        if windows_to_iana(leading):
+            return leading
+    return name
+
+
 def host_timezones(con: duckdb.DuckDBPyConnection) -> dict[str, dict]:
     """Each host's zone from its live SYSTEM hive, from the lowest-numbered control set that records one. Values come
     from one hive file and key, so a Windows.old or RegBack copy, which has the same key paths, can't mix in."""
@@ -58,14 +73,14 @@ def host_timezones(con: duckdb.DuckDBPyConnection) -> dict[str, dict]:
     names = ", ".join(f"'{v}'" for v in VALUES)
     for host, source, path, name, data in con.execute(
             "SELECT host, source_file, registry_path, registry_value, json_extract_string(NULLIF(extra, ''), '$.ValueData') "
-            f"FROM events WHERE tool = 'recmd' AND registry_path LIKE '%\\Control\\TimeZoneInformation' "
+            f"FROM events WHERE tool = 'recmd' AND registry_path ILIKE '%\\Control\\TimeZoneInformation' "
             f"AND registry_value IN ({names}) ORDER BY host, {live_hive_first('system')}, registry_path").fetchall():
         values = raw.setdefault(host, {"_path": path, "_key": (source, path)})
         if values["_key"] == (source, path):
             values[name] = (data or "").strip()
     zones = {}
     for host, values in raw.items():
-        windows, bias = values.get("TimeZoneKeyName", ""), _int(values.get("Bias"))
+        windows, bias = zone_key_name(values.get("TimeZoneKeyName", "")), _int(values.get("Bias"))
         if not windows and bias is None:
             continue
         dst_off = values.get("DynamicDaylightTimeDisabled") == "1"

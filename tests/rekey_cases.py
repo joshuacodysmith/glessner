@@ -176,16 +176,17 @@ class Format1:
 
 
 def load_format_1(case, record: RunRecord) -> None:
-    """The run's events loaded under format 1's key rule, as a format 1 build loaded them."""
+    """The run's events loaded under format 1's key rule, as a format 1 build loaded them: a load of found output
+    replaced the tool's rows on the host for every file its events name, whichever run loaded them."""
     folder = case.runs_folder / record.run_id
     events = []
     for ev in PARSERS[record.parser](parse_context(case, record, folder, former=1)):
         if ev.former:
             ev.source_file, ev.source_record = ev.former
         events.append(ev)
+    named = [ev.source_file for ev in events] if record.from_output else []
     result = load(case.db_path, events, host=record.host, tool=record.tool, tool_version=record.tool_version,
-                  run_id=record.run_id, replaces_sources=record.inputs, staging_dir=folder,
-                  replace_seen_sources=record.from_output)
+                  run_id=record.run_id, replaces_sources=[*record.inputs, *named], staging_dir=folder)
     record.loaded_rows = result.rows
 
 

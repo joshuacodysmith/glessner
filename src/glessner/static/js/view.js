@@ -3,7 +3,7 @@
 // and search. Pivot results the view hides are drawn faded until they're marked, so the analyst can build the chain:
 // show the marked events, pivot, mark what belongs, repeat.
 
-import { $, api, el, HINTS, panelBand, plural, reportAction, S, setStatus, syncPanelButtons } from './core.js';
+import { $, api, el, HINTS, panelBand, plural, reportAction, S, setStatus, showControls, syncPanelButtons } from './core.js';
 import { scheduleFetch } from './data.js';
 import { button } from './event_page.js';
 import { applyFilter } from './filters.js';
@@ -189,7 +189,7 @@ export function addressToggle(pred) {
     const search = menuItem('', () => addToSearch('addr', value), { cls: 'menu-indent', title: 'Put this term in the search box' });
     search.replaceChildren('Search ', el('code', {}, `addr:${value}`));
     const menu = $('quickMenu');
-    menu.setAttribute('aria-label', `View ${value}`);
+    menu.setAttribute('aria-label', `View ${showControls(value)}`);
     menu.replaceChildren(check(`View as ${ADDRESS_FIELDS[field]}`, pred), check('View at either end', either), search);
     const r = b.getBoundingClientRect();
     placeMenu(r.left, r.bottom + 2);
@@ -210,7 +210,7 @@ function labelToggle(b) {
     b.classList.toggle('active', on);
     return;
   }
-  const on = inViewFilter(JSON.parse(b.dataset.pred)), name = b.dataset.name ? ` ${b.dataset.name}` : '';
+  const on = inViewFilter(JSON.parse(b.dataset.pred)), name = b.dataset.name ? ` ${showControls(b.dataset.name)}` : '';
   b.textContent = on ? `Remove${name} from view filter` : `Add${name} to view filter`;
   b.title = on ? 'In the view filter now; click to take it out' : 'Show events with this value in the view filter (any letter case)';
   b.classList.toggle('active', on);

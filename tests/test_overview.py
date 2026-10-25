@@ -12,14 +12,18 @@ from test_splits import lab_case, split
 
 from glessner import cli, imports, server
 from glessner import intake as intake_module
+from glessner.audit import markdown
 from glessner.events import Event, load
+from glessner.export import _md
+from glessner.heads import forget
 from glessner.intake import add_new, intake, verify
 from glessner.journal import SYSTEM, entries, replay
 from glessner.overview import _last_action
 from glessner.queries import investigate
-from glessner.runner import RUN_FILE, RunRecord
+from glessner.runner import RUN_FILE, RunRecord, _write_record
 from glessner.server import (
     App,
+    api_audit,
     api_case_state,
     api_event,
     api_filter,
@@ -59,13 +63,21 @@ def cleared(ts, record, code, channel, source, provider=EVENTLOG):
                  log_channel=channel, event_provider=provider)
 
 
-def run_record(case, run_id, tool, host, status, rows, reason="", inputs=("x",), rules=""):
+def run_record(case, run_id, tool, host, status, rows, reason="", inputs=("x",), rules="", tool_files=None, **fields):
+    """A run's record in the case's runs folder. `tool_files` is format 4's key, None for a run made before it, and
+    `fields` are any other of the record's own, such as rows_skipped or from_output."""
     folder = case.runs_folder / run_id
     folder.mkdir(parents=True)
     record = RunRecord(run_id=run_id, tool=tool, tool_version="1", executable="", host=host, argv=[], cwd="",
                        inputs=list(inputs), started_utc="2026-10-16T01:00:00Z", status=status, reason=reason,
-                       finished_utc="2026-10-16T01:00:05Z", loaded_rows=rows, rules=rules)
+                       finished_utc="2026-10-16T01:00:05Z", loaded_rows=rows, rules=rules, tool_files=tool_files, **fields)
     (folder / RUN_FILE).write_text(json.dumps(asdict(record)), encoding="utf-8")
+
+
+def rewrite_record(case, run_id, **changes):
+    """A run's record as it is, with `changes` to its keys."""
+    path = case.runs_folder / run_id / RUN_FILE
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), **changes}), encoding="utf-8")
 
 
 @pytest.fixture
@@ -427,31 +439,40 @@ def test_the_event_page_says_no_match_while_a_line_of_the_check_log_cannot_be_re
         app.con.close()
 
 
+def case_with_a_locked_file(root, files, monkeypatch):
+    """A case whose evidence is `files` under WS01, intake having read all of them but locked.bin, as when another program
+    holds that file open with no sharing."""
+    from glessner.case import create_case
+
+    real = intake_module.sha256_file
+
+    def sha256_file(path):
+        if path.name == "locked.bin":
+            raise PermissionError(13, "The process cannot access the file")
+        return real(path)
+
+    evidence = root / "evidence" / "WS01"
+    evidence.mkdir(parents=True)
+    for file in files:
+        (evidence / file).write_bytes(file.encode())
+    case = create_case(root / "case", "Unreadable", evidence.parent, "cody")
+    with monkeypatch.context() as m:
+        m.setattr(intake_module, "sha256_file", sha256_file)
+        intake(case)
+    return case
+
+
 def test_full_checks_do_not_count_files_intake_could_not_read(tmp_path, monkeypatch, capsys):
     """Every full check, the findings summary's, the verify command's, and close's, counts only the files it re-hashed
     and names the others as unverified, a file intake couldn't read among them, also when it is the only one. Counted as
     checked, that file would make the summary say "Every evidence file (2) ... all match", close journal 2 evidence
     files that matched, and the verify command say all evidence files match, while the overview counts 1 hashed. Once
-    the file can be read, it still has no intake hash, and stays unverified."""
+    the file can be read, it still has no intake hash, and stays unverified. With no file checked at all, the verify
+    command's exit is 1, as it is for a manifest that lists no file, since nothing was verified."""
     from glessner.audit import describe, read_entries
-    from glessner.case import create_case
-
-    real = intake_module.sha256_file
-
-    def sha256_file(path):   # as when another program holds the file open with no sharing
-        if path.name == "locked.bin":
-            raise PermissionError(13, "The process cannot access the file")
-        return real(path)
 
     for name, files in (("both", ("readable.txt", "locked.bin")), ("alone", ("locked.bin",))):
-        evidence = tmp_path / name / "evidence" / "WS01"
-        evidence.mkdir(parents=True)
-        for file in files:
-            (evidence / file).write_bytes(file.encode())
-        case = create_case(tmp_path / name / "case", "Unreadable", evidence.parent, "cody")
-        with monkeypatch.context() as m:
-            m.setattr(intake_module, "sha256_file", sha256_file)
-            intake(case)
+        case = case_with_a_locked_file(tmp_path / name, files, monkeypatch)
         hashed = len(files) - 1
         app = App(case)
         try:
@@ -463,9 +484,10 @@ def test_full_checks_do_not_count_files_intake_could_not_read(tmp_path, monkeypa
                 "WS01/locked.bin.") in summary, name
         assert ("1 of the 2 evidence files was re-hashed when this report was written, and none differs" if hashed
                 else "No evidence file was re-hashed when this report was written.") in summary, name
-        assert cli.cmd_verify(case, None) == 0
+        assert cli.cmd_verify(case, None) == (0 if hashed else 1), name   # with no file checked, nothing was verified
         out = capsys.readouterr().out
         assert "All evidence files match" not in out and "is unverified: WS01/locked.bin." in out, (name, out)
+        assert ("No evidence file has an intake hash to check." in out) == (not hashed), (name, out)
         assert cli.cmd_close(case, None) == 0
         out = capsys.readouterr().out
         assert "All" not in out and "is unverified: WS01/locked.bin." in out, (name, out)
@@ -480,6 +502,27 @@ def test_full_checks_do_not_count_files_intake_could_not_read(tmp_path, monkeypa
         assert [(r["files_checked"], r["unverified"]) for r in full] == [(hashed, ["WS01/locked.bin"])] * 3, name
         # Readable now, it has no intake hash to check against
         assert intake_module.check_files(case).unverified == ["WS01/locked.bin"]
+
+
+def test_verify_exits_0_when_some_files_were_read_and_others_were_not(tmp_path, monkeypatch, capsys):
+    """One file hashed and matching, one that intake couldn't read: the exit is 0, and the output names the other as
+    unverified without the line for a check that found no file to check."""
+    case = case_with_a_locked_file(tmp_path, ("readable.txt", "locked.bin"), monkeypatch)
+    assert cli.cmd_verify(case, None) == 0
+    out = capsys.readouterr().out
+    assert "The 1 evidence file intake hashed matches the intake manifest." in out
+    assert "is unverified: WS01/locked.bin." in out and "has an intake hash to check" not in out
+
+
+def test_verify_exits_1_when_intake_could_not_read_any_file(tmp_path, monkeypatch, capsys):
+    """Every file of the manifest unreadable at intake: no later check can give one a hash, so nothing was verified. The
+    exit is 1 and a line says no file has an intake hash to check, as close's does, ahead of the files named as
+    unverified."""
+    case = case_with_a_locked_file(tmp_path, ("locked.bin",), monkeypatch)
+    assert cli.cmd_verify(case, None) == 1
+    out = capsys.readouterr().out
+    assert "No evidence file has an intake hash to check." in out and "All evidence files match" not in out
+    assert out.index("No evidence file has an intake hash to check.") < out.index("is unverified: WS01/locked.bin.")
 
 
 def test_your_last_action_leaves_out_the_apps_own_entries(overview_case):
@@ -503,7 +546,7 @@ def test_your_last_action_reads_a_line_that_repeats_prev_as_the_shared_reader_do
     and as a rekey it re-points the entries before it. After the chain starts, the same line is unreadable and re-points
     nothing. The last action reads each line as the shared reader does."""
     new = "a" * 32
-    rekey = {"seq": 2, "at": AT, "who": SYSTEM, "action": "case_upgrade", "from_format": 3, "to_format": 4, "text": "x",
+    rekey = {"seq": 2, "at": AT, "who": SYSTEM, "action": "case_upgrade", "from_format": 4, "to_format": 5, "text": "x",
              "rekey": {"pairs": {UID: new}}}
     cases = {
         "a rekey before the chain": (chained([], before=unchained(note(1)) + repeated_prev(rekey)), new, "looked at it"),
@@ -519,6 +562,29 @@ def test_your_last_action_reads_a_line_that_repeats_prev_as_the_shared_reader_do
         given = [e for e in entries(path) if e.get("action") == "note"]
         assert (given[-1]["target"], given[-1]["text"]) == (target, text), name   # the shared reader agrees
         assert replay(path).notes.get(target), name
+
+
+@pytest.mark.parametrize(("who", "listed"), [(["cody", "ann"], '["cody", "ann"]'), ({"by": "cody"}, '{"by": "cody"}'),
+                                              (5, "5"), (None, "null")], ids=["list", "object", "number", "null"])
+def test_the_overview_and_the_audit_trail_read_a_who_under_the_seal_that_is_not_a_string(overview_case, who, listed):
+    """Format 2's reader gives a line as written, so a line under the seal can hold a who that is a list, an object, a
+    number, or null. Such a line is someone's entry, not the app's. The overview builds, and its last action is that line
+    with the who as the audit trail lists it, its JSON text. The audit page that button opens lists the row, offers the
+    text as an analyst, filters by it, and the exported trail names it."""
+    folder = overview_case.folder
+    (folder / "journal.jsonl").write_bytes(chained([], before=unchained({**note(1), "who": who})))
+    forget(folder)
+    app = App(overview_case)
+    try:
+        last = api_overview(app, {})["progress"]["last"]
+        assert (last["seq"], last["who"]) == (1, listed) and "looked at it" in last["text"]
+        shown = api_audit(app, {})
+        assert [(r["seq"], r["who"]) for r in shown["rows"] if r["seq"] == 1] == [(1, listed)]
+        assert listed in shown["analysts"] and all(isinstance(name, str) for name in shown["analysts"])
+        assert [r["seq"] for r in api_audit(app, {"who": [listed]})["rows"]] == [1]
+        assert f"UTC, {_md(listed)}:" in markdown(entries(app.journal.path), "Test", {})
+    finally:
+        app.con.close()
 
 
 def test_the_overview_counts_notes_from_a_copy_of_the_journal_s(overview_case):
@@ -641,5 +707,128 @@ def test_the_state_lines_counts_come_from_the_lanes_and_one_scan_after_them(over
         shows = api_filter(app, {"only": [], "hide": [], "show": [{"host": "DC01"}],
                                  "view": {"marks": ["Suggested"], "values": []}})["id"]
         assert api_shown_counts(app, {"filter": [shows]}) == {"shown": 9}
+    finally:
+        app.con.close()
+
+
+FILES = {"hayabusa.exe": "ab" * 32, "rules/": "cd" * 32, "config/": "ef" * 32}   # what a format 4 run of Hayabusa records
+
+
+def hayabusa_chips(app):
+    """The chips of each Hayabusa lead, in the overview's order of leads, with its host."""
+    leads = api_overview(app, {})["leads"]
+    return [(lead["host"], lead["chips"]) for lead in leads if lead["kind"] == "alerts" and lead["tool"] == "hayabusa"]
+
+
+@pytest.mark.parametrize(("desktop_run", "desktop_chips"), [
+    ({}, ["Hayabusa 3.6.0", "Hayabusa rules not recorded"]),   # a run made before format 4: no tool_files
+    ({"from_output": True}, ["Hayabusa 3.6.0"]),                 # found output: no tool ran, so nothing was to record
+    ({"tool_files": FILES}, ["Hayabusa 3.6.0"]),                 # recorded, and its rules folder gave no label
+])
+def test_a_hayabusa_lead_names_the_rules_of_the_run_that_made_its_hits(overview_case, desktop_run, desktop_chips):
+    """The chip reads the label of the Hayabusa run whose hits the lead holds. The events the hits matched are
+    EvtxECmd's, whose run has a label of its own, so reading their run's would give the maps. A tool run without
+    tool_files didn't record its rules; found output, and a run without a record, say nothing. The lead's rules are the
+    titles its page links, and take no label."""
+    run_record(overview_case, "r7", "evtxecmd", "DC01", "ok", 11, rules="Maps, 456 maps",
+               tool_files={"EvtxECmd.exe": "12" * 32, "Maps/": "34" * 32})
+    run_record(overview_case, "r8", "hayabusa", "DC01", "ok", 4, rules="Hayabusa rules fffbdd1", tool_files=FILES)
+    run_record(overview_case, "r9", "hayabusa", "DESKTOP", "ok", 1, **desktop_run)
+    app, _ = app_with_work(overview_case)
+    try:
+        # The first DC01 lead's hits are of two versions, the second's of one
+        assert hayabusa_chips(app) == [("DC01", ["Hayabusa 3.6.0, t", "Hayabusa rules fffbdd1"]),
+                                       ("DC01", ["Hayabusa 3.6.0", "Hayabusa rules fffbdd1"]),
+                                       ("DESKTOP", desktop_chips)]
+        titles = [t["title"] for lead in api_overview(app, {})["leads"] for t in lead.get("rules", [])]
+        assert titles and not any("fffbdd1" in title or "Maps" in title for title in titles)
+    finally:
+        app.con.close()
+
+
+def test_a_hayabusa_lead_names_each_rule_set_its_runs_used_and_says_nothing_for_a_run_with_no_record(overview_case):
+    """After an update-rules between two runs, a lead whose hits came from both names both labels, in order. Runs with
+    no run.json, such as the case's others, add no chip."""
+    run_record(overview_case, "r5", "hayabusa", "DC01", "ok", 1, rules="Hayabusa rules 0a0a0a0", tool_files=FILES)
+    run_record(overview_case, "r8", "hayabusa", "DC01", "ok", 4, rules="Hayabusa rules fffbdd1", tool_files=FILES)
+    app, _ = app_with_work(overview_case)
+    try:
+        first, second, desktop = hayabusa_chips(app)
+        assert first == ("DC01", ["Hayabusa 3.6.0, t", "Hayabusa rules 0a0a0a0", "Hayabusa rules fffbdd1"])
+        assert second == ("DC01", ["Hayabusa 3.6.0", "Hayabusa rules fffbdd1"])   # its hits are all of the later run
+        assert desktop == ("DESKTOP", ["Hayabusa 3.6.0"])
+    finally:
+        app.con.close()
+
+
+def test_a_suricata_lead_never_says_its_rules_are_not_recorded(overview_case):
+    """Suricata's rule set has been in the run record since format 3, and its registry entry has no rules_label, so a
+    run with no label and no tool_files, such as one whose rules folder was missing, adds no chip."""
+    run = "20261016T010000Z_suricata_network"
+    rewrite_record(overview_case, run, rules="")
+    app, _ = app_with_work(overview_case)
+    try:
+        leads = api_overview(app, {})["leads"]
+        suricata = next(lead for lead in leads if lead["kind"] == "alerts" and lead["tool"] == "suricata")
+        assert suricata["chips"] == ["Suricata 8.0.7"]
+    finally:
+        app.con.close()
+
+
+def test_a_lead_of_imported_alerts_never_says_its_rules_are_not_recorded(synthetic_case):
+    """An import has no registry entry and records no tool_files, so its lead's chips name the build that imported the
+    alerts and nothing about rules."""
+    fast = Event(ts_us=T0 + 70 * SEC, ts_desc="Alert", artifact="ids_alert", source_file="fast.log", source_record="1",
+                 message="[1:2001:1] ET TEST Leak", log_channel="Attempted Information Leak",
+                 extra={"signature": "ET TEST Leak", "sid": "2001", "priority": "2"})
+    load(synthetic_case.db_path, [fast], host="network", tool="import", tool_version="t", run_id="r7",
+         replaces_sources=["fast.log"], staging_dir=synthetic_case.folder)
+    run_record(synthetic_case, "r7", "import", "network", "ok", 1, parser="import")
+    app = App(synthetic_case)
+    try:
+        lead = next(lead for lead in api_overview(app, {})["leads"] if lead["kind"] == "alerts" and lead["tool"] == "import")
+        assert lead["chips"] == ["imported by glessner t"]
+    finally:
+        app.con.close()
+
+
+def skipped_by_host(app):
+    return {h["host"]: h["skipped"] for h in api_overview(app, {})["hosts"]}
+
+
+def test_what_the_case_holds_counts_the_rows_each_host_s_latest_runs_skipped(overview_case):
+    """A host's skipped count is the sum over the latest successful run of each tool and, for a tool that runs once per
+    file, of each file. An earlier run of a file, a failed run, a parser that doesn't count, and an import, which can
+    load several hosts in one run, add nothing."""
+    run_record(overview_case, "20261016T020000Z_mftecmd_DC01", "mftecmd", "DC01", "ok", 5, inputs=("DC01/C/$MFT",),
+               rows_skipped=4)   # replaced by the next run of the same file
+    run_record(overview_case, "20261016T020100Z_mftecmd_DC01", "mftecmd", "DC01", "ok", 5, inputs=("DC01/C/$MFT",),
+               rows_skipped=2)
+    run_record(overview_case, "20261016T020200Z_mftecmd_DC01", "mftecmd", "DC01", "ok", 5, inputs=("DC01/D/$MFT",),
+               rows_skipped=3)
+    run_record(overview_case, "20261016T020300Z_pecmd_DC01", "pecmd", "DC01", "ok", 5)   # it doesn't count them
+    run_record(overview_case, "20261016T020400Z_mftecmd_DESKTOP", "mftecmd", "DESKTOP", "failed", None,
+               reason="exit code 1", inputs=("DESKTOP/C/$MFT",), rows_skipped=9)
+    run_record(overview_case, "20261016T020500Z_import_DC01", "import", "DC01", "ok", 5, rows_skipped=6)
+    rewrite_record(overview_case, "20261016T010000Z_suricata_network", rows_skipped=1)
+    app, _ = app_with_work(overview_case)
+    try:
+        assert skipped_by_host(app) == {"DC01": 5, "DESKTOP": 0, "WS03": 0, "network": 1}
+    finally:
+        app.con.close()
+
+
+def test_what_the_case_holds_shows_a_split_host_s_skipped_rows_once_on_its_first_lane(tmp_path):
+    """A run's count belongs to the host folder it ran on. After a split by recorded computer, that host's events sit in
+    lanes, and the count shows on the first lane that holds them, not on each."""
+    case, runs = lab_case(tmp_path)
+    record, folder = runs["evtx"]
+    record.rows_skipped = 7
+    _write_record(folder, record)
+    app = App(case)
+    try:
+        assert skipped_by_host(app) == {"LAB": 7}
+        split(app)
+        assert skipped_by_host(app) == {"DC1": 7, "LAB": 0, "MSEDGEWIN10": 0, "PC01": 0}
     finally:
         app.con.close()

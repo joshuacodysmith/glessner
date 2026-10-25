@@ -27,9 +27,9 @@ def test_verify_of_a_manifest_that_lists_no_file_says_so_and_exits_1(synthetic_c
     assert "Consistent" in out
 
 
-def test_verify_of_a_manifest_whose_only_file_intake_could_not_read_names_it_and_exits_0(synthetic_case, capsys, monkeypatch):
-    """That file is unverified, which fails nothing since no later check can give it a hash, so the exit differs from an
-    empty manifest's."""
+def test_verify_of_a_manifest_whose_only_file_intake_could_not_read_names_it_and_exits_1(synthetic_case, capsys, monkeypatch):
+    """That file is unverified, and no later check can give it a hash, so no file was checked: the exit is 1, as for an
+    empty manifest, and the words differ, since the manifest lists a file."""
     (synthetic_case.evidence / "DC01" / "Security.evtx").write_bytes(b"ElfFile\x00x")
 
     def locked(path):
@@ -38,7 +38,7 @@ def test_verify_of_a_manifest_whose_only_file_intake_could_not_read_names_it_and
     with monkeypatch.context() as m:
         m.setattr("glessner.intake.sha256_file", locked)
         intake(synthetic_case)
-    assert main(["verify", str(synthetic_case.folder)]) == 0
+    assert main(["verify", str(synthetic_case.folder)]) == 1
     out = capsys.readouterr().out
     assert out.startswith("No evidence file has an intake hash to check. ")
     assert "DC01/Security.evtx" in out and "lists none" not in out

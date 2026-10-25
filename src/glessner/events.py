@@ -11,12 +11,13 @@ import hashlib
 import json
 import re
 from bisect import bisect_right
-from collections.abc import Callable, Iterable, Iterator
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import cache, lru_cache
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import duckdb
 
@@ -297,16 +298,106 @@ class LoadResult:
     rows: int
     replaced: int
     without_time: int
+    # For a load of found output, the events left out because the database holds rows of the file they name from a run
+    # of the tool that read the evidence itself (SeenSources.direct): their count by the file they name
+    left_out: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SeenSources:
+    """What a load of a tool's output found in the evidence replaces. Its events name the files the tool read, not the
+    output they were loaded from, so the rows it may replace are found by run: only those of `runs`, the found-output
+    runs of the tool on the host. The rows of the runs in `superseded`, which read no file this load doesn't, are
+    replaced whole. Of the other runs' rows, those of the files the load reads are replaced, and those of each file its
+    events name under `folder`, the host's folder in the evidence ("" for a single-host case, whose host folder is the
+    evidence folder). An event isn't loaded when it names a file that the database holds rows of from a run in
+    `direct`, the tool's runs on the host that read the evidence itself: those rows stand for the file, and the event
+    may take one of their IDs. `inputs` are the files each of `runs` read, evidence-relative, which tell the whole path
+    a row of an earlier load names from the evidence-relative path under it (_extended_forms), and `root` is the evidence
+    folder's extended-length path, which tells them apart when the rows fit two roots equally well."""
+    runs: frozenset[str]
+    superseded: frozenset[str]
+    folder: str
+    direct: frozenset[str] = frozenset()
+    inputs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    root: str = ""
+
+
+def under_folder(path: str, folder: str) -> bool:
+    """Whether an evidence-relative path names a file under `folder`, a host's top-level folder in the evidence, or
+    anywhere in the evidence when `folder` is "". A path with a drive, a root, or a .. part is outside it, and Windows
+    reads the folder's name without regard to case."""
+    pure = PureWindowsPath(path)
+    if not pure.parts or pure.anchor or ".." in pure.parts:
+        return False
+    return not folder or (len(pure.parts) > 1 and pure.parts[0].casefold() == folder.casefold())
+
+
+def held_sources(db_path: Path, tool: str, host: str, runs: Iterable[str]) -> set[str]:
+    """The source files the database holds rows of from the given runs of the tool, among the rows loaded under the
+    host (origin_host)."""
+    with connect(db_path) as con:
+        held = id_table(con, "held_runs", sorted(runs))
+        return {path for (path,) in con.execute(
+            f"SELECT DISTINCT source_file FROM events WHERE tool = ? AND origin_host = ? "
+            f"AND run_id IN (SELECT v FROM {held})", [tool, host]).fetchall()}
+
+
+def names_by_root(sources: Iterable[str], inputs: Iterable[str], root: str = "") -> dict[str, str]:
+    """The one of `inputs`, evidence-relative paths, that each of `sources`, the files a run's rows name in extended-length
+    form, names. A run named all its files under one root, so a source is an input's when it is that root, a slash, and
+    the input, without regard to case: `logs/eve.json` ends in `eve.json` and is another file. The root is the one that
+    explains the most sources. Of those that explain as many, it is `root`, the evidence folder's extended-length path
+    when the evidence is still there, and otherwise the shortest, so a run with one source takes the longest input its
+    path ends in. A source that is the root and none of the inputs is not in the answer."""
+    tails = {path: path.casefold() for path in inputs}
+    by_root: dict[str, dict[str, str]] = {}
+    for source in sources:
+        low = source.casefold()
+        for path, tail in tails.items():
+            if low.endswith(f"/{tail}"):
+                by_root.setdefault(low[:-len(tail) - 1], {})[source] = path
+    here = root.casefold()
+    return by_root[max(by_root, key=lambda r: (len(by_root[r]), r == here, -len(r)))] if by_root else {}
+
+
+def _extended_forms(con: duckdb.DuckDBPyConnection, tool: str, host: str | None, inputs: Mapping[str, Iterable[str]],
+                    sources: Iterable[str], root: str = "") -> set[str]:
+    """The source paths of the rows of the runs in `inputs`, each with the files it read, that name one of `sources`,
+    evidence-relative paths, by its extended-length path (`//?/D:/folder/WS01/a.csv`). A load of found output whose
+    evidence root is the resolved one writes a file's evidence-relative path. An earlier load whose root was the
+    evidence path as case.yaml writes it, when that names the evidence through a junction, a substituted drive, or a
+    mapped one, wrote the file's whole path in this form, since a resolved file path doesn't start with that root. Those
+    rows are the same file's, so the load replaces them with its own.
+
+    A row names the file its run read that fits the run's root (names_by_root, which `root` helps), so the rows of
+    `logs/eve.json` are not those of `eve.json`, whatever else the run read and wherever the evidence was. A run whose
+    rows fit two roots equally well, because a folder named like the root's last folder holds a file of the same name,
+    takes the root the evidence is at, or the shortest when it is not at either. A row that fits none of its run's files
+    is left."""
+    wanted = {well_formed(PureWindowsPath(source).as_posix()).casefold() for source in sources}
+    read = {run: [well_formed(PureWindowsPath(p).as_posix()) for p in files] for run, files in inputs.items()}
+    held = id_table(con, "extended_runs", sorted(read))
+    where = f"tool = ? AND {'origin_host = ? AND ' if host is not None else ''}"
+    rows = con.execute(f"SELECT DISTINCT run_id, source_file FROM events WHERE {where}run_id IN (SELECT v FROM {held}) "
+                       "AND source_file LIKE '//?/%'", [tool] if host is None else [tool, host]).fetchall()
+    stored: dict[str, list[str]] = {}
+    for run_id, path in rows:
+        stored.setdefault(run_id, []).append(path)
+    return {path for run_id, paths in stored.items() for path, named in names_by_root(paths, read.get(run_id, ()), root).items()
+            if named.casefold() in wanted}
 
 
 def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str, tool_version: str, run_id: str,
-         replaces_sources: Iterable[str], staging_dir: Path, replace_seen_sources: bool = False,
+         replaces_sources: Iterable[str], staging_dir: Path, replace_seen_sources: SeenSources | None = None,
          routes: dict[str, str] | None = None) -> LoadResult:
     """Replace this tool's rows for the given source files on this host with the new events.
 
     With host None, each event names its host in lane, as an import's events can, and the tool's rows for the
-    source files are replaced on every host. With replace_seen_sources, the source files the events name are replaced
-    too: a tool's output found in the evidence names the files the tool read, not the CSV it was loaded from.
+    source files are replaced on every host. With replace_seen_sources, for a tool's output found in the evidence,
+    which names the files the tool read rather than the output it was loaded from, only rows of earlier loads of found
+    output are replaced, and the events naming a file that a run of the tool loaded from the evidence itself are left
+    out, as SeenSources says.
     `routes` is the host's split by recorded computer from the journal (splits.py): an event log or Hayabusa
     row goes to the lane its computer is routed to. Its ID, and the rows a rerun replaces, still go by the host it was
     loaded under (origin_host), so a split never changes an ID.
@@ -325,11 +416,19 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
     staging = staging_dir / "events_staging.csv"
     ids = EventIds()
     named: set[str] = set()
+    held = (held_sources(db_path, tool, host, replace_seen_sources.direct)
+            if replace_seen_sources is not None and replace_seen_sources.direct else set())
+    left_out: Counter[str] = Counter()
     lookup: set[str] = set()   # lanes gaining rows that can change their SID lookup
     count = without_time = 0
     with staging.open("w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, lineterminator="\n")   # read_csv's new_line below
         for ev in events:
+            if replace_seen_sources is not None:
+                named.add(ev.source_file)
+                if held and well_formed(ev.source_file) in held:
+                    left_out[ev.source_file] += 1
+                    continue
             # An event's own host, from an import's field, is part of its ID, which is made from UTF-8
             origin = host if host is not None else well_formed(ev.lane)
             lane = (router.lane(ev.host_name_recorded) or origin) if router else origin
@@ -338,8 +437,6 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
             uid, _ = ids(origin, ev)
             if ev.ts_us is None:
                 without_time += 1
-            if replace_seen_sources:
-                named.add(ev.source_file)
             row = _row(ev, uid, lane, tool, tool_version, run_id, origin)
             try:
                 characters = len("".join(row))
@@ -353,17 +450,28 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
             except UnicodeEncodeError:   # a failed row writes nothing, so it's written again without the surrogate
                 writer.writerow(_without_surrogates(row))
             count += 1
+    if replace_seen_sources is not None:   # a path the output names elsewhere replaces nothing
+        named = {path for path in named if path and under_folder(path, replace_seen_sources.folder)}
     # The rows hold each source path as well_formed makes it, so the rows to replace are named the same way, and a path
     # with a lone surrogate, which from_json refuses, finds its earlier rows
     sources = sorted({well_formed(s) for s in set(replaces_sources) | named})
     con = connect(db_path)
     try:
         con.execute("BEGIN TRANSACTION")
+        if replace_seen_sources is not None:
+            sources = sorted({*sources, *_extended_forms(con, tool, host, replace_seen_sources.inputs, sources,
+                                                         replace_seen_sources.root)})
         replaced_sources = id_table(con, "replaced_sources", sources)   # see insert_columns for why not parameters
         # By the host the rows were loaded under, not their lane, so a rerun on a split host replaces every lane's rows.
-        where = (f"tool = ? AND {'origin_host = ? AND ' if host is not None else ''}"
-                 f"source_file IN (SELECT v FROM {replaced_sources})")
+        where = f"tool = ? AND {'origin_host = ? AND ' if host is not None else ''}"
         params = [tool, host] if host is not None else [tool]
+        if replace_seen_sources is None:
+            where += f"source_file IN (SELECT v FROM {replaced_sources})"
+        else:
+            runs = id_table(con, "replaced_runs", sorted(replace_seen_sources.runs))
+            whole = id_table(con, "superseded_runs", sorted(replace_seen_sources.superseded))
+            where += (f"run_id IN (SELECT v FROM {runs}) AND (run_id IN (SELECT v FROM {whole}) "
+                      f"OR source_file IN (SELECT v FROM {replaced_sources}))")
         replaced, replaced_hosts = con.execute(
             f"SELECT count(*), list(DISTINCT host) FILTER (WHERE {AFFECTS_SQL}) FROM events WHERE {where}",
             params).fetchone()
@@ -388,7 +496,7 @@ def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str,
     finally:
         con.close()
         staging.unlink(missing_ok=True)
-    return LoadResult(count, replaced, without_time)
+    return LoadResult(count, replaced, without_time, dict(left_out))
 
 
 def _row(ev: Event, uid: str, host: str, tool: str, tool_version: str, run_id: str, origin: str) -> tuple:

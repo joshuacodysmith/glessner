@@ -1,4 +1,4 @@
-import { $, api, HINTS, plural } from './core.js';
+import { $, api, HINTS, plural, showControls } from './core.js';
 
 // ---------- counts on the case buttons ----------
 
@@ -17,8 +17,9 @@ export async function refreshCounts() {
   const mixed = c.hosts_mixed || [];
   const hostsTitle = c.hosts_review
     ? `${c.hosts_review === 1 ? '1 host needs' : `${c.hosts_review} hosts need`} review: a role not confirmed, ` +
-      'a name or IP another host also claims, or event logs recorded by several computers' +
-      (mixed.length ? `. ${mixed.join(', ')} can be split by recorded computer: open Hosts` : '')
+      'a name or IP another host also claims, logons from one of its IPs that name another machine, ' +
+      'a clock that looks off from the capture, or event logs recorded by several computers' +
+      (mixed.length ? `. ${mixed.map((name) => showControls(name)).join(', ')} can be split by recorded computer: open Hosts` : '')
     : 'Every host role is confirmed, and no name or IP is claimed twice';
   $('hostsButton').title = `${HINTS.hostsButton} ${hostsTitle}.`;
   $('rulesButton').title = c.rule_errors ? `${HINTS.rulesButton} ${plural(c.rule_errors, 'rule')} failed to compile or run.`

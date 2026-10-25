@@ -52,3 +52,29 @@ def test_value_name_and_data_have_their_own_columns(tmp_path):
     assert (key.registry_value, key.registry_data) == ("", "")
     assert (plugin.registry_value, plugin.registry_data) == ("", "")
     assert plugin.extra["ValueData"] == "Created on: 2020-09-19 03:30:01" and "Created on" in plugin.message
+
+
+def test_a_services_row_leaves_the_value_name_none_out_of_its_message_and_nothing_else(tmp_path):
+    """The Services plugin writes the text None as every row's value name. Its message leaves that out, while the value
+    name, the data, and the source record, which the event ID hashes, stay as RECmd wrote them. Another plugin's value
+    named None keeps its name."""
+    hive = "D:\\Evidence\\DC01\\Windows\\System32\\config\\SYSTEM"
+    services = "ROOT\\ControlSet001\\Services"
+    run = "ROOT\\Microsoft\\Windows\\CurrentVersion\\Run"
+    with (tmp_path / "recmd.csv").open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=COLUMNS)
+        w.writeheader()
+        for description, key, name, data in (("Services", services, "None", "Name: WinUpdSvc Desc: "),
+                                             ("Services", services, "None", ""),
+                                             ("Services", services, "Start", "2"),
+                                             ("Run", run, "None", "C:\\Users\\Public\\u.exe")):
+            w.writerow({"HivePath": hive, "Description": description, "KeyPath": key, "ValueName": name, "ValueData": data,
+                        "ValueData3": "Image path: C:\\wu.exe ServiceDLL: " if description == "Services" else "",
+                        "LastWriteTimestamp": "2020-09-19 03:30:01"})
+    service, bare, other_name, other_plugin = PARSERS["recmd_csv"](ParseContext(tmp_path, Path("D:/Evidence")))
+    assert service.message == "Services: Name: WinUpdSvc Desc:" and bare.message == "Services:"
+    assert (service.registry_value, service.registry_data) == ("None", "Name: WinUpdSvc Desc: ")
+    assert service.source_record == f"{services}|None|Services" and bare.source_record == f"{services}|None|Services"
+    assert service.file_path == "C:\\wu.exe"
+    assert other_name.message == "Services: Start = 2"
+    assert other_plugin.message == "Run: None = C:\\Users\\Public\\u.exe"

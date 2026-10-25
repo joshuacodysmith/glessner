@@ -3,7 +3,7 @@
 // evidence is hashed with progress, and the case then opens on its Tools page. Paths come from the analyst and folder
 // names from this computer, so they only ever go in as text.
 
-import { $, api, el, plural, post, setStatus, skippedLinks } from './core.js';
+import { $, api, el, plural, post, setStatus, showControls, skippedLinks } from './core.js';
 
 // The analyst starts as the Windows account /api/start names, and every action in the case is credited to it,
 // so the forms show it in a field the analyst sees and can change.
@@ -18,6 +18,7 @@ const startButton = (label, onclick, attrs = {}) => el('button', { type: 'button
 const fmtBytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1e3)} KB`);
 const slug = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
 const parentOf = (folder) => folder.replace(/[\\/][^\\/]+[\\/]?$/, '');
+const lastPart = (folder) => folder.split(/[\\/]/).filter(Boolean).pop() || folder;
 
 async function loadStart() {
   try { START.info = await api('/api/start'); }
@@ -124,7 +125,7 @@ function field(label, key, { browse = true, placeholder = '' } = {}) {
 // Several copies of one collection in the evidence folder: a warning under the check, which leaves the
 // case free to be created.
 function showCopies(node, c) {
-  node.textContent = (c && c.warning) || '';
+  node.textContent = showControls((c && c.warning) || '');
   node.hidden = !node.textContent;
 }
 
@@ -224,7 +225,7 @@ function scheduleCheck() {
       const c = START.checks[key];
       if (!note) continue;
       note.className = c ? (c.ok ? 'ok' : 'warn') : '';
-      note.textContent = c ? checkNote(key, c) : '';
+      note.textContent = c ? showControls(checkNote(key, c)) : '';
     }
     const copies = $('start').querySelector('[data-check="evidence-copies"]');
     if (copies) showCopies(copies, START.checks.evidence);
@@ -282,19 +283,31 @@ async function copyCase(source, folder, name, analyst) {
   await loadStart();
 }
 
+// A listed case as the status line names it: by name alone, or, when another listed case has the same name, with its
+// folder's last part. Two folders can end alike, as copies on two drives do, and Windows folder names ignore case, so
+// then the line gives the whole folder.
+function caseLabel(name, folder) {
+  const twins = START.info.recent.filter((r) => r.name === name && r.folder !== folder);
+  if (!twins.length) return name;
+  const tail = lastPart(folder).toLowerCase();
+  const endsAlike = twins.some((r) => lastPart(r.folder).toLowerCase() === tail);
+  return `${name} (folder ${endsAlike ? folder : lastPart(folder)})`;
+}
+
 // Taking a case whose folder is gone off the list: the server changes recent.json alone, keeps a case whose
 // folder is back, and answers with the list as it is now. One at a time: two sent together would each write back the
 // list it read, so one removal could come back, and a double click sent a second request that removed nothing.
 async function forget(body, name) {
   if (START.forgetting) return;
   START.forgetting = true;
+  const which = body.folder ? caseLabel(name, body.folder) : name;
   render();   // the Remove buttons off until the answer
   try {
     const res = await post('/api/start/forget', body);
     START.info.recent = res.recent;
     const back = body.folder && res.recent.some((r) => r.folder === body.folder);
-    setStatus(back ? `The folder of ${name} is there again, so it stays on the list.`
-      : body.folder ? `Removed ${name} from Recent cases.`
+    setStatus(back ? `The folder of ${which} is there again, so it stays on the list.`
+      : body.folder ? `Removed ${which} from Recent cases.`
       : res.removed ? `Removed ${plural(res.removed, 'case')} from Recent cases.`
       : 'Nothing removed: no case on the list is missing its folder now.');
   } catch (err) { setStatus(`Not removed: ${err.message}`); }

@@ -32,6 +32,8 @@ from .runner import (
     LEFT_OUT,
     NOT_CHECKED,
     NOT_READ,
+    READ_ITSELF_NOTE,
+    RULES_NOT_RECORDED,
     RUN_FILE,
     UNREADABLE,
     RunError,
@@ -39,10 +41,12 @@ from .runner import (
     RunRecord,
     finish_run,
     handles,
+    held_runs,
     load_found_output,
     own_inputs,
     plan_runs,
     read_runs,
+    rule_sets,
     run,
 )
 from .tool_outputs import BY_KIND, CAPTURES
@@ -98,14 +102,18 @@ def run_gaps(runs: list[RunRecord], specs: dict[str, ToolSpec]) -> list[dict]:
         each = r.tool == IMPORT or (r.tool in specs and specs[r.tool].input == "each_file")
         key = (r.tool, "" if r.tool == IMPORT else r.host, r.from_output, own_inputs(r, specs) if each else ())
         latest[key] = r
-    # A run a rebuild left out, because its output or evidence changed since it ran, says why from its newest note
-    # saying so
-    left_out = lambda r: next((n for n in reversed(r.notes) if LEFT_OUT in n), "")
     return [{"run_id": r.run_id, "tool": r.tool, "name": specs[r.tool].name if r.tool in specs else r.tool,
-             "host": r.host, "status": r.status, "reason": r.reason or left_out(r), "rows": r.loaded_rows or 0,
+             "host": r.host, "status": r.status, "reason": r.reason or left_out_note(r), "rows": r.loaded_rows or 0,
              "inputs": len(r.inputs), "from_output": r.from_output, "at": r.finished_utc or r.started_utc}
             for r in sorted(latest.values(), key=lambda r: r.run_id)
             if r.status == "failed" or (r.status == "ok" and not r.loaded_rows)]
+
+
+def left_out_note(record: RunRecord) -> str:
+    """Why a run holds none of the rows it was to load, from its newest note saying so: a rebuild left the run out
+    because its output or evidence changed since it ran, or a load of found output left out its rows because a tool run's
+    events stand for the files they name. "" when no note does."""
+    return next((n for n in reversed(record.notes) if LEFT_OUT in n or n.endswith(READ_ITSELF_NOTE)), "")
 
 
 INTERRUPTED = ("interrupted: the run was still marked running when the case was next opened for work, so it stopped "
@@ -157,14 +165,7 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
         matched = [e for e in entries if handles(spec, e.artifact, e.detail)]
         by_kind = Counter(next(h for h in spec.handles if h in (e.artifact, f"{e.artifact}:{e.detail}")) for e in matched)
         hosts = sorted({h for e in matched if (h := case.host_of(e.path))})
-        # The latest successful run of each host, and for a tool that runs once per file, of each file: the events the
-        # case holds. WxTCmd's runs on a host's Timeline databases each hold their own, so the host's last run alone
-        # doesn't count them. A tool that reads the host's folder replaces its earlier run's events, even
-        # when Add new evidence gave the later run more files, so that run counts alone.
-        latest: dict[tuple, object] = {}
-        for r in runs:   # oldest first, so the later run wins
-            if r.tool == spec.id and r.status == "ok":
-                latest[(r.host, own_inputs(r, specs) if spec.input == "each_file" else ())] = r
+        latest = held_runs(runs, spec, specs)
         last = max((r.finished_utc for r in latest.values()), default="")
         tool = detected.get(spec.id)
         if tool and tool.missing and hosts:
@@ -182,8 +183,7 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             "dotnet": spec.dotnet, "dotnet_root": tool.dotnet_root if tool else "", "builtin": spec.builtin,
             "missing": tool.missing if tool else "", "rules": tool.rules if tool else "", "has_rules": bool(spec.rules),
             "reads": ", ".join(_noun(k, n) for k, n in by_kind.most_common()), "hosts": hosts, "status": status,
-            "last_run": {"at": last, "rows": sum(r.loaded_rows or 0 for r in latest.values()),
-                         "hosts": sorted({host for host, _ in latest})} if latest else None,
+            "last_run": _last_run(latest, last, specs) if latest else None,
             "hits": spec.id == "hayabusa",   # its rows are hits, not events
         })
     # A file a tool copies along with its input, such as a SQLite database's logs, is read too.
@@ -209,6 +209,19 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             "to_import": [_noun(k, n) for k, n in offered.most_common()],
             "unidentified": len(unidentified), "unidentified_sample": unidentified[:50],
             "others": find_known(folder, load_known()), "gaps": run_gaps(runs, specs)}
+
+
+def _last_run(latest: dict[tuple, RunRecord], at: str, specs: dict[str, ToolSpec]) -> dict:
+    """What a tool's held runs (runner.held_runs) hold, for its row on the Tools page: the rows they loaded, those
+    without a time, and those skipped; the rule sets they used, in run order, and whether any run of a tool that names its
+    rule set made none to name (runner.RULES_NOT_RECORDED)."""
+    records = list(latest.values())
+    named = rule_sets(records, specs)
+    return {"at": at, "rows": sum(r.loaded_rows or 0 for r in records), "hosts": sorted({host for host, _ in latest}),
+            "without_time": sum(r.rows_without_time or 0 for r in records),
+            "skipped": sum(r.rows_skipped or 0 for r in records),
+            "rules": [text for text in named if text != RULES_NOT_RECORDED],
+            "rules_unrecorded": RULES_NOT_RECORDED in named}
 
 
 def found_outputs(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],
@@ -250,6 +263,7 @@ def found_outputs(case: Case, specs: dict[str, ToolSpec], detected: dict[str, De
             done = runs_of[-1].__class__(**{**runs_of[-1].__dict__,
                                             "loaded_rows": sum(r.loaded_rows or 0 for r in runs_of),
                                             "rows_without_time": sum(r.rows_without_time or 0 for r in runs_of),
+                                            "rows_skipped": sum(r.rows_skipped or 0 for r in runs_of),
                                             "finished_utc": max(r.finished_utc for r in runs_of)})
         if kind.preset:   # the app doesn't run these tools itself
             raw = False
@@ -266,9 +280,9 @@ def found_outputs(case: Case, specs: dict[str, ToolSpec], detected: dict[str, De
         out.append({"key": key, "tool": kind.tool, "tool_name": spec.name if spec else (kind.maker or kind.tool),
                     "label": kind.label, "parser": kind.parser, "preset": kind.preset, "host": host, "files": len(paths),
                     "paths": paths[:20], "status": status, "note": kind.note,
-                    # Events without a time, which nothing else on the page shows
-                    "loaded": {"at": done.finished_utc, "rows": done.loaded_rows,
-                               "without_time": done.rows_without_time or 0} if done else None})
+                    # Events without a time, which nothing else on the page shows, and the rows the parser skipped
+                    "loaded": {"at": done.finished_utc, "rows": done.loaded_rows, "without_time": done.rows_without_time or 0,
+                               "skipped": done.rows_skipped or 0} if done else None})
     return out
 
 
@@ -418,8 +432,15 @@ def _step_result(label: str, step: RunPlan | dict, records: list[RunRecord]) -> 
         evidence = NOT_READ
     else:
         evidence = "ok"
-    return {"host": label, "status": "failed" if bad else "ok", "reason": "; ".join(r.reason for r in bad),
-            "rows": sum(r.loaded_rows or 0 for r in records), "hits": hits,
+    rows = sum(r.loaded_rows or 0 for r in records)
+    if bad:
+        reason = "; ".join(r.reason for r in bad)
+    elif rows:
+        reason = ""
+    else:   # a load that left out every row says why with its runs' notes, as the Gaps do, so it doesn't read as no rows found
+        reason = "; ".join(note for r in records if (note := left_out_note(r)))
+    return {"host": label, "status": "failed" if bad else "ok", "reason": reason,
+            "rows": rows, "hits": hits,
             "seconds": round(sum(r.seconds for r in records), 2), "evidence": evidence,
             "working_copy_changes": 0, "loaded": loaded}
 

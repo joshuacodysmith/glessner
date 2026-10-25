@@ -6,6 +6,7 @@ import pytest
 from conftest import flip_a_byte
 
 from glessner import heads, server
+from glessner import journal as journal_module
 from glessner.audit import entry_targets
 from glessner.server import App, _entries_events, _entry_events, _trail_check, api_audit, api_audit_export, api_mark
 
@@ -73,6 +74,64 @@ def test_a_head_record_moved_ahead_of_the_journal_is_found_on_the_next_audit(pap
     heads.write(folder, record["seq"] + 5, "0" * 64, record.get("build", ""))
     found = api_audit(papp, {})["journal"]
     assert len(calls) == 2 and found["state"] != "consistent"
+
+
+@pytest.fixture
+def side_app(synthetic_case):
+    """An App whose journal names a side file: one left in the case folder before the open, which the open records."""
+    side = synthetic_case.folder / "journal_torn_copied.bin"
+    side.write_bytes(b'{"seq": 9, "at')
+    app = App(synthetic_case)
+    yield app, side
+    app.con.close()
+
+
+def side_lines(app):
+    """The lines of the trail's journal row about side files."""
+    return [line for line in api_audit(app, {})["journal"]["text"] if "side file" in line]
+
+
+def test_a_named_side_file_changed_or_deleted_after_a_kept_check_shows_on_the_next_audit(side_app, monkeypatch):
+    """The side file's length and SHA-256 are in the chain, so replacing it is a problem the full check finds. The kept
+    check depends on the side files it read, so the trail's journal row shows the problem each time, and not "Checked"
+    now over a result from before the change."""
+    app, side = side_app
+    calls = count_checks(app, monkeypatch)
+    assert side_lines(app) == [] and side_lines(app) == [] and len(calls) == 1   # kept while nothing changes
+    side.write_bytes(b"15 other bytes!")
+    [changed] = side_lines(app)
+    assert "journal_torn_copied.bin" in changed and "differs" in changed and len(calls) == 2
+    assert side_lines(app) == [changed] and len(calls) == 2
+    side.unlink()
+    [gone] = side_lines(app)
+    assert "journal_torn_copied.bin" in gone and "is missing" in gone and len(calls) == 3
+
+
+def test_a_side_file_replaced_by_one_of_the_same_size_shows_on_the_next_audit(side_app):
+    """The size alone doesn't show it, so the file's modification time is part of the key."""
+    app, side = side_app
+    original = side.read_bytes()
+    stat = side.stat()
+    assert side_lines(app) == []
+    side.write_bytes(bytes(b ^ 1 for b in original))
+    os.utime(side, ns=(stat.st_atime_ns, stat.st_mtime_ns + 5_000_000_000))
+    assert side.stat().st_size == stat.st_size
+    [changed] = side_lines(app)
+    assert "differs" in changed
+
+
+def test_a_check_that_found_the_tail_being_written_is_not_kept(papp, monkeypatch):
+    """Bytes after the last line while another process holds the journal's lock are a write in progress. The check can't
+    vouch for them and is not kept: once that writer stops, the same bytes are a torn line, which the next audit says."""
+    first = event_ids(papp, 1)[0]
+    api_mark(papp, {"uids": [first], "value": "suspicious"})
+    papp.journal.path.write_bytes(papp.journal.path.read_bytes() + b'{"seq": 99, "at')
+    monkeypatch.setattr(journal_module, "_writing", lambda path: True)
+    text = " ".join(api_audit(papp, {})["journal"]["text"])
+    assert "a write in progress" in text
+    monkeypatch.setattr(journal_module, "_writing", lambda path: False)
+    text = " ".join(api_audit(papp, {})["journal"]["text"])
+    assert "a write in progress" not in text and "cut short" in text
 
 
 def multi_event_entries(app):

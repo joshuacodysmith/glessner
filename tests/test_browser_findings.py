@@ -4,10 +4,11 @@ and on the card; a link of more than 25 events asking first; and Show them. They
 through Playwright, as test_browser_smoke does, and are skipped without it."""
 
 import json
+from urllib.parse import urlsplit
 
 import pytest
 from conftest import DC_LOG, SEC, T0, logon
-from test_browser_smoke import browser, served_page  # noqa: F401
+from test_browser_smoke import RECORD_REQUESTS, asked, browser, refused_with, served_page, wait_held  # noqa: F401
 
 from glessner.events import load
 from glessner.journal import JOURNAL_FILE
@@ -144,6 +145,8 @@ def test_a_finding_is_made_from_a_selection_edited_linked_unlinked_retired_and_r
         p.wait_for_function("() => document.querySelectorAll('#details .finding .ev-chip').length === 2")
         entry = entries(synthetic_case)[-1]
         assert (entry["op"], entry["finding"], entry["targets"]) == ("unlink", fid, [found["dc"]])
+        assert one.locator(".finding-form").count() == 1   # the edit form stays open after an Unlink
+        one.get_by_role("button", name="Cancel").click()
         # Retire with its reason; the card folds away, keeps its number, and Restore brings it back
         one = card(p, 1)
         one.get_by_role("button", name="Retire").click()
@@ -166,6 +169,121 @@ def test_a_finding_is_made_from_a_selection_edited_linked_unlinked_retired_and_r
         assert details.locator(".retired-fold").count() == 0 and card(p, 1).locator(".chip").inner_text() == "Critical"
         assert entries(synthetic_case)[-1]["op"] == "restore"
         assert [e["action"] for e in entries(synthetic_case)[before:]] == ["finding"] * 6
+
+
+def finding_write(url):
+    """Whether a request is a write to /api/finding. The page's reads of the findings go to /api/findings_page."""
+    return urlsplit(url).path == "/api/finding"
+
+
+def two_events(found):
+    """A setup that keeps the IDs of the case's first two events in found["uids"]."""
+    return lambda app: found.update(uids=[uid_at(app, T0), uid_at(app, T0 + 60 * SEC)])
+
+
+def finding_posts(p):
+    """How many changes the page has sent to /api/finding since RECORD_REQUESTS ran, counted as it makes each request."""
+    return asked(p, "/api/finding").count("/api/finding")
+
+
+def adds(case):
+    return [e for e in entries(case) if e["action"] == "finding" and e["op"] == "add"]
+
+
+def new_finding_form(p, uids):
+    """Select these events, open New finding's form over them on the Findings page, and fill its title and severity.
+    Returns the form and starts recording the page's requests."""
+    select(p, uids)
+    open_findings(p)
+    p.locator("#details").get_by_role("button", name=f"New finding from the {len(uids)} selected events").click()
+    form = p.locator(f"{FINDINGS} .finding-new .finding-form")
+    form.get_by_label("Title").fill("Same finding")
+    form.get_by_label("Severity").select_option("High")
+    p.evaluate(RECORD_REQUESTS)
+    return form
+
+
+def test_a_second_click_on_add_the_finding_while_its_write_is_out_adds_nothing(browser, synthetic_case):  # noqa: F811
+    """With /api/finding held, Add the finding and Cancel are disabled from the click on, and a click on the disabled Add
+    sends no second request. Once the write answers, the journal holds one add and the page lists one finding."""
+    found = {}
+    for p in served_page(browser, synthetic_case, setup=two_events(found)):
+        form = new_finding_form(p, found["uids"])
+        add, cancel = form.get_by_role("button", name="Add the finding with 2 events"), form.get_by_role("button", name="Cancel")
+        held = []
+        p.route(finding_write, lambda route: held.append(route))   # noqa: B023
+        add.click()
+        wait_held(p, held)
+        assert add.is_disabled() and cancel.is_disabled()
+        add.click(force=True)
+        assert finding_posts(p) == 1
+        held[0].continue_()
+        card(p, 1).wait_for()
+        p.unroute(finding_write)
+        assert len(adds(synthetic_case)) == 1
+        assert p.locator(f"{FINDINGS} .findings-col > .finding").count() == 1
+
+
+def test_a_double_click_on_add_the_finding_adds_one_finding(browser, synthetic_case):  # noqa: F811
+    """A double click on Add the finding, with nothing held, sends one request and journals one add."""
+    found = {}
+    for p in served_page(browser, synthetic_case, setup=two_events(found)):
+        form = new_finding_form(p, found["uids"])
+        form.get_by_role("button", name="Add the finding with 2 events").dblclick()
+        card(p, 1).wait_for()
+        assert finding_posts(p) == 1
+        assert len(adds(synthetic_case)) == 1
+        assert p.locator(f"{FINDINGS} .findings-col > .finding").count() == 1
+
+
+def test_a_refused_add_leaves_the_form_open_with_add_and_cancel_enabled_for_another_try(browser, synthetic_case):  # noqa: F811
+    """When /api/finding refuses the add, the status line says so, the form stays with its words, Add the finding and
+    Cancel are enabled again, and the next click adds the finding once."""
+    found = {}
+    for p in served_page(browser, synthetic_case, setup=two_events(found)):
+        form = new_finding_form(p, found["uids"])
+        add, cancel = form.get_by_role("button", name="Add the finding with 2 events"), form.get_by_role("button", name="Cancel")
+        p.route(finding_write, refused_with("The journal is busy."))
+        add.click()
+        p.wait_for_function("() => { const s = document.getElementById('status'); "
+                            "return (s.title || s.textContent) === 'Finding change failed: The journal is busy.'; }")
+        assert add.is_enabled() and cancel.is_enabled()
+        assert form.get_by_label("Title").input_value() == "Same finding" and adds(synthetic_case) == []
+        p.unroute(finding_write)
+        p.errors[:] = [e for e in p.errors if "/api/finding" not in e]   # that refusal was the point
+        add.click()
+        card(p, 1).wait_for()
+        assert len(adds(synthetic_case)) == 1 and finding_posts(p) == 2
+
+
+def test_a_second_click_on_save_changes_while_its_write_is_out_edits_once(browser, synthetic_case):  # noqa: F811
+    """The Edit form's Save changes and Cancel wait for the write as the new finding's form does: a second click while
+    /api/finding is held sends nothing, and the journal holds one edit."""
+    found = {}
+
+    def setup(app):
+        found["fid"] = api_finding(app, {"op": "add", "title": "A logon", "severity": "Low",
+                                         "targets": [uid_at(app, T0)]})["finding"]
+
+    for p in served_page(browser, synthetic_case, setup=setup):
+        open_findings(p)
+        one = card(p, 1)
+        one.get_by_role("button", name="Edit").click()
+        one.get_by_label("Narrative").fill("Administrator logged on over RDP.")
+        p.evaluate(RECORD_REQUESTS)
+        save, cancel = one.get_by_role("button", name="Save changes"), one.get_by_role("button", name="Cancel")
+        held = []
+        p.route(finding_write, lambda route: held.append(route))   # noqa: B023
+        save.click()
+        wait_held(p, held)
+        assert save.is_disabled() and cancel.is_disabled()
+        save.click(force=True)
+        assert finding_posts(p) == 1
+        held[0].continue_()
+        p.wait_for_function("() => document.querySelectorAll('#details .finding-form').length === 0")
+        p.unroute(finding_write)
+        edits = [e for e in entries(synthetic_case) if e["action"] == "finding" and e["op"] == "edit"]
+        assert [(e["finding"], e["narrative"]) for e in edits] == [(found["fid"], "Administrator logged on over RDP.")]
 
 
 def test_the_chips_open_their_events_and_the_caveat_shows_beside_the_record_and_on_the_card(browser, synthetic_case):  # noqa: F811
@@ -299,6 +417,9 @@ def test_linking_more_than_25_events_asks_first_and_show_them_lists_the_marked_e
         p.keyboard.press("Escape")
         p.wait_for_selector("#details .confirm-block", state="detached")
         assert entries(synthetic_case)[-1]["op"] == "link" and details.locator(".finding-form").count() == 1   # the form stays
+        # A confirm that was canceled wrote nothing, so the form's buttons work again
+        assert form.get_by_role("button", name="Add the finding with 30 events").is_enabled()
+        assert form.get_by_role("button", name="Cancel").is_enabled()
         form.get_by_role("button", name="Add the finding with 30 events").click()
         block.wait_for()
         block.get_by_role("button", name="Link 30", exact=True).click()

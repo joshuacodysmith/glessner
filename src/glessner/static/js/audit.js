@@ -5,7 +5,7 @@
 import { $, api, codePrefix, el, fmtUs, markBadge, plural, post, S, setStatus } from './core.js';
 import { refreshCounts } from './counts.js';
 import { fetchView } from './data.js';
-import { button, claimDetails, detailsClaims, headAfter, headCopy, loadDetails, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, detailsClaims, headAfter, headCopy, pageAction, setPage, showingPage } from './event_page.js';
 import { renderHosts } from './hosts.js';
 import { reloadLanes } from './lanes.js';
 import { jumpTo, showRules } from './pages.js';
@@ -206,10 +206,11 @@ async function noteTarget(seq) {
 }
 
 export async function retractNote(uid, noteSeq) {
+  const done = pageAction(`event:${uid}`);
   try { await post('/api/note_retract', { uid, note_seq: noteSeq }); }
   catch (err) { setStatus(`Retract failed: ${err.message}`); return; }
   setStatus(`Retracted note #${noteSeq}`);
-  loadDetails(uid);
+  done();
 }
 
 // The timeline and counts follow an undo or retraction the server has just answered, and then the trail settles. The

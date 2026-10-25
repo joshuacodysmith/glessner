@@ -6,6 +6,7 @@ import socket
 import threading
 
 import pytest
+from conftest import close_first
 from test_browser_smoke import LOAD_TIMEOUT_MS, PAGE_TIMEOUT_MS, VIEWPORT, browser, to_timeline  # noqa: F401
 
 from glessner import server as mod
@@ -22,27 +23,30 @@ def free_port():
 
 
 def run(case, port):
-    """One run of serve on `port`, as the fixed port gives every run: its server on a thread, its hub, and its link."""
+    """One run of serve on `port`, as the fixed port gives every run: its server on a thread, its hub, its link, and a
+    function that stops it, ending its connections from the server's side, as an exited process's are (close_first)."""
     server, hub, url = serve_hub(Hub(case), port)
+    hang_up = close_first(server)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, hub, url
 
+    def stop():
+        server.shutdown()
+        hang_up()
+        server.server_close()
+        hub.app.con.close()
 
-def stop(server, hub):
-    server.shutdown()
-    server.server_close()
-    hub.app.con.close()
+    return server, hub, url, stop
 
 
 def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(browser, synthetic_case, monkeypatch):  # noqa: F811
     """The page's next request after the new run starts is answered 403 with STALE_SESSION: the page shows the band
     without a Reload button, puts the message on the status line, draws nothing, and sends nothing more. A reload of the
-    tab gets the page's shell and then the same message, and draws nothing. The keep-alive is cut to a second, so the
-    first run's handler threads close the tab's old connections as an exited process would have; both runs live in this
-    one process."""
+    tab gets the page's shell and then the same message, and draws nothing. Both runs live in this one process: stop()
+    ends the first run's connections from the server's side, as an exited process's are, and with the keep-alive cut to
+    a second and a 2 s wait, the first run's handler threads have ended before the second run starts."""
     monkeypatch.setattr(mod, "KEEP_ALIVE_SECONDS", 1)
     port = free_port()
-    first, hub1, url = run(synthetic_case, port)
+    _, hub1, url, stop_first = run(synthetic_case, port)
     context = browser.new_context(viewport=VIEWPORT)
     context.set_default_timeout(PAGE_TIMEOUT_MS)
     p = context.new_page()
@@ -53,9 +57,9 @@ def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(
         p.wait_for_function(READY)
         to_timeline(p)
         old_id = p.evaluate("() => window.__app.S.meta.case_id")
-        stop(first, hub1)
-        p.wait_for_timeout(2_000)   # the old handler threads time out and close their sockets
-        second, hub2, _ = run(synthetic_case, port)
+        stop_first()
+        p.wait_for_timeout(2_000)   # the browser drops the ended connections, and the old handler threads end
+        second, hub2, _, stop_second = run(synthetic_case, port)
         try:
             assert second.server_address[1] == port and hub2.session != hub1.session and hub2.app.case_id != old_id
             del answered[:]
@@ -75,6 +79,6 @@ def test_a_tab_from_an_earlier_run_is_refused_with_the_message_and_sees_no_data(
             assert synthetic_case.settings.name not in p.content()
             assert p.locator("#labels > *").count() == 0
         finally:
-            stop(second, hub2)
+            stop_second()
     finally:
         context.close()

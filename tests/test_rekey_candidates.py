@@ -171,9 +171,10 @@ def test_the_upgrade_step_places_the_candidates_and_counts_only_the_analyst_s_re
     assert (rekeyed["unplaced"], rekeyed["merged"]) == ({}, {}) and "candidates_unplaced" not in rekeyed
     assert rekeyed["dropped_runs"] == {failed.run_id: {"rows": failed.loaded_rows, "references": [fx]}}
     n = rekeyed["runs"][run.run_id]["changed"]
+    # Two of the three marks reach no loaded event: fx, whose run drops, and old, which no run gives. Neither candidate counts
     assert entry["text"] == ("Event IDs no longer depend on where or in which time zone a tool ran: "
                              f"{n} Suricata events took new IDs. 2 journal references now name their events' new IDs. "
-                             "None was left unplaced.")
+                             "None was left unplaced. 2 journal references name no loaded event.")
     state = replay(f.case.folder / JOURNAL_FILE)
     note = {"seq": earlier["seq"], "id": old, "candidates": [loaded[b1], dropped[fb]]}
     assert unplaced(state) == {loaded[b1]: [note], dropped[fb]: [note]} and unplaced_count(state) == 1
@@ -238,7 +239,8 @@ def test_the_upgrade_step_leaves_a_candidate_unplaced_apart_from_the_ids_the_jou
         assert entry["rekey"]["pairs"] == {other: now["c.exe"]}
         assert (entry["rekey"]["unplaced"], entry["rekey"]["merged"]) == ({}, {})
         assert entry["rekey"]["candidates_unplaced"] == {uid: sorted([now["a.exe"], now["b.exe"]])}
-        assert entry["text"].endswith(" took new IDs. No journal reference changed.")
+        # The one reference, old, names no loaded event; the shared ID the candidates left unplaced is no reference
+        assert entry["text"].endswith(" took new IDs. No journal reference changed. 1 journal reference names no loaded event.")
         for candidate in now.values():
             notes = api_event(app, {"uid": [candidate]})["event"]["unplaced"]
             assert notes == [{"seq": earlier["seq"], "id": old, "others": 2}]

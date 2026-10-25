@@ -1,6 +1,7 @@
 """Suricata on packet captures: EVE parsing, the registry entry's Npcap check and rule set, raw first for
 found EVE files, and, in the lab, a real run on a synthetic capture."""
 
+import hashlib
 import json
 import shutil
 import tempfile
@@ -149,6 +150,24 @@ def test_registry_entry_loads_the_rule_set_beside_the_tool_and_needs_npcap(tmp_p
     with pytest.raises(RunError, match="can't run here: Needs Npcap"):
         run(case, plan_runs(case, blocked)[0])
     assert read_runs(case) == []
+
+
+def test_a_suricata_run_records_each_file_its_arguments_name_in_its_folder(tmp_path, monkeypatch):
+    """Its arguments name its configuration, its reference list, its rules, and its classification list in its folder,
+    the second and the last after an =, and its registry entry names the rule set's version file. The capture and the
+    output folder are outside the tool's folder."""
+    folder = suricata_install(tmp_path)
+    configs = {"suricata.yaml": b"%YAML 1.1\n", "reference.config": b"config reference: url http://\n",
+               "rules/classification.config": b"config classification: test,Test,1\n"}
+    for rel, data in configs.items():
+        (folder / rel).write_bytes(data)
+    monkeypatch.setattr(tools, "npcap_folder", lambda: tmp_path)
+    found = tools.detect([load_registry()["suricata"]], tmp_path / "tools")["suricata"]
+    case = capture_case(tmp_path)
+    argv = build_argv(case, plan_runs(case, found)[0], tmp_path / "out", {})
+    names = ["suricata.exe", *configs, "rules/suricata.rules", "rules/et-open-version.txt"]
+    assert tools.tool_files(found, argv) == {name: hashlib.sha256((folder / name).read_bytes()).hexdigest()
+                                             for name in names}
 
 
 def test_found_eve_waits_behind_captures_suricata_can_read(tmp_path):

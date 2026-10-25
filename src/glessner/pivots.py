@@ -144,14 +144,16 @@ def _file_missing(ev: dict) -> str:
 
 
 def _addresses(ev: dict, end: str, identity) -> list[str]:
-    """The addresses a row on the pivot at either end takes, for its `end`: the source's; the end that isn't one of the
-    seed host's addresses (remote); the end that is a collected host's (internal); an end that is not a collected host's
-    (external, the first in source, destination order); or each distinct one."""
+    """The addresses a row on the pivot at either end takes, for its `end`: the source's; the destination's; the end that
+    isn't one of the seed host's addresses (remote); the end that is a collected host's (internal); an end that is not a
+    collected host's (external, the first in source, destination order); or each distinct one."""
     source, dest = ev.get("source_ip") or "", ev.get("dest_ip") or ""
     ends = [a for a in dict.fromkeys((source, dest)) if a]
     own = set(getattr(identity.hosts.get(ev.get("host", "")), "ips", []) or [])
     if end == "source_ip":
         return [source] if source else []
+    if end == "dest_ip":
+        return [dest] if dest else []
     if end == "remote":
         away = [a for a in ends if a not in own and not identity.resolve_ip(a)] or [a for a in ends if a not in own]
         return away[:1]

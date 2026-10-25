@@ -18,6 +18,7 @@ from glessner.audit import describe, read_entries
 from glessner.case import open_case
 from glessner.cli import main
 from glessner.journal import APP_NAMES, SYSTEM
+from glessner.rekey import FORMAT_4_TEXT
 
 OLD = "triage-workbench"
 # A small case made with the old build: 2,510 events, its journal's app entries by the old name
@@ -128,19 +129,23 @@ def test_a_copy_of_a_case_from_before_the_rename_opens_rebuilds_and_exports(tmp_
         trail = json.loads(request(port, "GET", "/api/audit?kind=Builds", session=session)[1])
         texts = [r["text"] for r in trail["rows"]]   # newest first
         assert texts[0] == f"Opened with glessner {FAKE}"
-        # The open upgrades the format 1 case first, where no event of this case changes its ID, and then seals its
-        # journal
-        assert texts[1].startswith("Upgraded the case from format 2 to 3: Sealed the ")
-        assert texts[2].startswith("Upgraded the case from format 1 to 2: ") and "No journal reference changed" in texts[2]
+        # The open upgrades the format 1 case first, where no event of this case changes its ID, then seals its
+        # journal, then takes the 3 to 4 step
+        assert texts[1] == f"Upgraded the case from format 3 to 4: {FORMAT_4_TEXT}"
+        assert texts[2].startswith("Upgraded the case from format 2 to 3: Sealed the ")
+        assert texts[3].startswith("Upgraded the case from format 1 to 2: ") and "No journal reference changed" in texts[3]
         olds = [e for e in old_entries if e["action"] == "case_open"]
-        assert texts[3:] == [f"Opened with {e['who']} {e['build']}" for e in reversed(olds)]
+        assert texts[4:] == [f"Opened with {e['who']} {e['build']}" for e in reversed(olds)]
     after = path.read_bytes()
     assert after.startswith(before)   # every old line stays as written
     added = [json.loads(line) for line in after[len(before):].decode("utf-8").splitlines()]
     assert [(e["action"], e["who"], e.get("build")) for e in added] == [("case_upgrade", SYSTEM, None),
                                                                       ("case_upgrade", SYSTEM, FAKE),
                                                                       ("case_yaml", SYSTEM, FAKE),
+                                                                      ("case_upgrade", SYSTEM, FAKE),
+                                                                      ("case_yaml", SYSTEM, FAKE),
                                                                       ("case_open", SYSTEM, FAKE)]
+    assert [e.get("to_format") for e in added if e["action"] == "case_upgrade"] == [2, 3, 4]
 
     assert main(["rebuild", str(folder)]) == 0
     assert path.read_bytes() == after   # a rebuild journals nothing

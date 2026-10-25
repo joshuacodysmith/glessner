@@ -1,7 +1,7 @@
 import { $, el, plural, S, setStatus } from './core.js';
 import { draw } from './draw.js';
 import { markWord } from './confirm.js';
-import { button, decide, loadDetails } from './event_page.js';
+import { button, decide, loadDetails, pageAction } from './event_page.js';
 
 // ---------- Review one by one: a source's pending suggestions, one Event page at a time ----------
 // The queue is the set To investigate counted when it loaded, in time order. The Event page of an event in the queue
@@ -50,9 +50,12 @@ export function reviewBar(ev, uid) {
   const n = review.queue.length;
   const pending = ev.suggestions.some((x) => x.source === review.source && !x.rejected) && ev.mark.label === 'Unreviewed';
   const note = el('input', { type: 'text', class: 'mark-note', placeholder: 'Note (optional)', 'aria-label': 'Note for the decision' });
+  // The review moves on once the decision answers, unless a page was asked for meanwhile: that page keeps the panel, and
+  // the review stays on this event
   const act = async (decision) => {
+    const done = pageAction(`event:${uid}`);
     const res = await decide(decision, review.source, [uid], { note: note.value, fromEvent: false });
-    if (res) next();
+    if (res && done(false)) next();
   };
   const stop = button('Stop reviewing', () => { stopReview(); loadDetails(uid); }, { class: 'linklike', 'data-key': 'stop' });
   const where = el('strong', {}, `${review.source}: ${i + 1} of ${n}`);

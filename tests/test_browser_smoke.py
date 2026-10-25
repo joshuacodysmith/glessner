@@ -1,7 +1,8 @@
 """Browser smoke tests: the page's main interactions in a real browser, against the synthetic case.
 
 They drive the installed Microsoft Edge through Playwright, so no browser is downloaded. Set
-GLESSNER_BROWSER_CHANNEL=chrome to use Chrome instead. Skipped when Playwright or the browser is missing.
+GLESSNER_BROWSER_CHANNEL=chrome to use Chrome instead. Skipped when Playwright or the browser is missing, except that a
+browser that isn't installed fails the tests when GLESSNER_REQUIRE_BROWSER is set, as it is in CI.
 Deselect them with `-m "not browser"`.
 """
 
@@ -9,12 +10,16 @@ import getpass
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
+import warnings
+from collections import Counter
 from datetime import UTC, datetime
 
 import pytest
-from conftest import DC_LOG, SEC, T0, junction, logon, registry
+from conftest import DC_LOG, SEC, T0, BrowserRelaunched, SharedBrowser, close_first, junction, logon, registry
 from test_analysis_relations import UNTIMED_NOTE, load_untimed_pivots
 from test_clock import AHEAD, accepted, evtx_time, flow, time_changed
 from test_timezones import add_zone
@@ -45,15 +50,38 @@ READY_INPUTS = """() => ({
 })"""
 
 
-@pytest.fixture(scope="module")
-def browser():
-    with playwright_api.sync_playwright() as pw:
-        try:
-            b = pw.chromium.launch(channel=os.environ.get("GLESSNER_BROWSER_CHANNEL", "msedge"))
-        except playwright_api.Error as exc:
-            pytest.skip(f"no browser to drive: {exc.message.splitlines()[0]}")
-        yield b
-        b.close()
+# What Chromium reports when Windows has no buffer space or local port left for a socket (WSAENOBUFS).
+RETRIED_FAILURE = "net::ERR_NO_BUFFER_SPACE"
+# The kinds of request a page can't start without: the page itself and its modules. A page becomes ready without its
+# stylesheet, and a refused data request may not be the one the ready check waits on, so neither explains a page that
+# isn't ready.
+LOAD_BLOCKING = {"document", "script"}
+
+
+class LoadRetried(UserWarning):
+    """A page load that RETRIED_FAILURE explains, opened once more."""
+
+
+# Set to anything but "" or "0", it makes a missing browser fail the browser tests instead of skipping them. CI sets it.
+REQUIRE_BROWSER = "GLESSNER_REQUIRE_BROWSER"
+
+
+def launched(launch, environ=os.environ):
+    """The browser that `launch` gives, a SharedBrowser's call. When `launch` skips because the browser isn't installed
+    and `environ` sets REQUIRE_BROWSER, the test fails with the skip's reason instead, so a machine without Edge can't
+    pass with every browser test skipped."""
+    try:
+        return launch()
+    except pytest.skip.Exception as absent:
+        if environ.get(REQUIRE_BROWSER, "") in ("", "0"):
+            raise
+        pytest.fail(f"{absent.msg}. {REQUIRE_BROWSER} is set, so a missing browser fails the run.", pytrace=False)
+
+
+@pytest.fixture
+def browser(launch_browser):
+    """The browser the worker's tests share (conftest.launch_browser)."""
+    return launched(launch_browser)
 
 
 @pytest.fixture
@@ -104,9 +132,12 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
     Details panel opens at two-thirds of the stage, which leaves the lanes about eight rows; `share` seeds the
     browser's own preference, glessner.detailsShare, before the page loads, so the tests here keep the half-stage lanes
     they were written for, where the synthetic case's rows all fit; None leaves the default.
+    A load that RETRIED_FAILURE explains is opened once more (open_page). The server ends its connections before the
+    browser does (close_first).
     Tests use it as a for loop that runs once, so a closure made in the loop's body runs within that pass, and ruff's
     B023 is silenced on it."""
     server, hub, url = serve_hub(Hub(case), 0)   # the start page when case is None
+    hang_up = close_first(server)
     app = hub.app
     if setup:
         setup(app)
@@ -119,14 +150,15 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
                                 f"localStorage.setItem('glessner.detailsShare', '{share}'); }} catch (_) {{}}")
 
     def close():
-        context.close()
         server.shutdown()
+        hang_up()
+        context.close()
         server.server_close()
         if hub.app:
             hub.app.con.close()
 
     p = context.new_page()
-    p.errors, p.console = [], []
+    p.errors, p.console, p.refused = [], [], []
     # A start link that has not been used: the one in `url` works once, and a page that loses its session, as when its
     # storage is blocked and it reloads, takes a new one
     p.new_link = lambda: f"http://127.0.0.1:{server.server_address[1]}/?token={hub.new_token()}"
@@ -137,22 +169,16 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
     p.on("console", lambda msg: p.errors.append(f"console: {msg.text}")
          if msg.type == "error" and not msg.text.startswith("Failed to load resource") else None)
     p.on("response", lambda res: p.errors.append(f"HTTP {res.status}: {res.url}") if res.status >= 400 else None)
-    # A request that got no answer, such as one Windows refused or had no port left for (net::ERR_NO_BUFFER_SPACE).
-    # Such a failure otherwise shows only as a 30 s wait. The page cancels requests of its own, as when the analyst
-    # zooms on, and a navigation cancels those in flight: those end in net::ERR_ABORTED.
-    p.on("requestfailed", lambda req: p.errors.append(f"request failed: {req.method} {req.url} {req.failure}")
-         if req.failure != "net::ERR_ABORTED" else None)
-    p.goto(url, timeout=LOAD_TIMEOUT_MS)
+    p.on("requestfailed", lambda req: request_failed(p, req))
     try:
-        p.wait_for_function(ready)
-    except playwright_api.TimeoutError:
-        report = not_ready(p, ready)
+        open_page(p, url, ready)
+        if case is not None and tab == "timeline":
+            to_timeline(p)
+        if case is not None and not folds:
+            open_all(p)
+    except BaseException:
         close()
-        pytest.fail(report)
-    if case is not None and tab == "timeline":
-        to_timeline(p)
-    if case is not None and not folds:
-        open_all(p)
+        raise
     try:
         yield p
     except GeneratorExit:
@@ -165,6 +191,59 @@ def served_page(browser, case, setup=None, ready="() => window.__ready === true 
         errors = list(p.errors)
         close()
     assert errors == [], errors
+
+
+def request_failed(p, req):
+    """Record a request of `p` that got no answer in p.errors, such as one Windows refused or had no port left for
+    (net::ERR_NO_BUFFER_SPACE), which otherwise shows only as a 30 s wait, and the resource type of one that failed
+    with RETRIED_FAILURE in p.refused. The page cancels requests of its own, as when the analyst zooms on, and a
+    navigation cancels those in flight: those end in net::ERR_ABORTED and aren't recorded."""
+    if req.failure == "net::ERR_ABORTED":
+        return
+    p.errors.append(f"request failed: {req.method} {req.url} {req.failure}")
+    if req.failure == RETRIED_FAILURE:
+        p.refused.append(req.resource_type)
+
+
+def open_page(p, url, ready):
+    """Open `url` in `p`, a page served_page set up, and wait until `ready` holds. A load that RETRIED_FAILURE explains
+    is opened once more, at a new start link: a navigation that failed with it, or a page not ready in time after the
+    page itself or one of its modules failed with it, in either case with no error other than requests that failed with
+    it. A LoadRetried warning names those requests, why the first load failed, and the machine's TCP state, and the
+    load's errors are dropped. A load that fails otherwise, or fails again, fails the test: a navigation's error is
+    raised, and a page not ready in time fails with not_ready's report. Nothing after the load is retried."""
+    try:
+        if opened(p, url, ready):
+            return
+    except playwright_api.Error as exc:
+        if RETRIED_FAILURE not in exc.message or not only_refusals(p.errors):
+            raise
+        first_failure = f"The navigation failed: {exc.message.splitlines()[0]}. {port_use()}".rstrip()
+    else:
+        first_failure = not_ready(p, ready)
+        if not LOAD_BLOCKING.intersection(p.refused) or not only_refusals(p.errors):
+            pytest.fail(first_failure)
+    dropped = list(p.errors)
+    warnings.warn(LoadRetried(f"Opened the page again after {dropped}. {first_failure}"), stacklevel=2)
+    p.errors.clear()
+    p.refused.clear()
+    if not opened(p, p.new_link(), ready):
+        pytest.fail(f"{not_ready(p, ready)} The load before it failed with {dropped} and was opened again.")
+
+
+def opened(p, url, ready):
+    """Whether `p`, opened at `url`, becomes ready within PAGE_TIMEOUT_MS. A navigation that fails raises."""
+    p.goto(url, timeout=LOAD_TIMEOUT_MS)
+    try:
+        p.wait_for_function(ready)
+    except playwright_api.TimeoutError:
+        return False
+    return True
+
+
+def only_refusals(errors):
+    """Whether every error in `errors`, as served_page records them, is a request that failed with RETRIED_FAILURE."""
+    return all(e.startswith("request failed: ") and e.endswith(f" {RETRIED_FAILURE}") for e in errors)
 
 
 def to_timeline(p):
@@ -244,13 +323,44 @@ def not_ready(p, ready):
     """Why the page isn't ready: what the ready check reads, and the console's last messages. A page that can't answer
     within READ_TIMEOUT_MS is stalled; one that answers with the data not yet loaded is waiting for the server. The
     read is a wait rather than an evaluate: Playwright times a wait out from outside the page, while
-    an evaluate waits for as long as the page's main thread stays busy."""
+    an evaluate waits for as long as the page's main thread stays busy. When a request failed with RETRIED_FAILURE, the
+    report adds the machine's TCP state (port_use)."""
     try:
         inputs = p.wait_for_function(READY_INPUTS, timeout=READ_TIMEOUT_MS).json_value()
     except playwright_api.Error as exc:
         inputs = f"no answer ({exc.message.splitlines()[0]})"
-    return (f"The page wasn't ready after {PAGE_TIMEOUT_MS / 1000:g} s. Ready check: {ready}. What it reads: {inputs}. "
-            f"Last console messages: {p.console[-20:]}. Errors: {p.errors}")
+    report = (f"The page wasn't ready after {PAGE_TIMEOUT_MS / 1000:g} s. Ready check: {ready}. What it reads: {inputs}. "
+              f"Last console messages: {p.console[-20:]}. Errors: {p.errors}")
+    if any(RETRIED_FAILURE in error for error in p.errors):
+        report += f". {port_use()}"
+    return report
+
+
+def port_use():
+    """The machine's TCP sockets by state, how many ports of the dynamic range they hold, and when Windows last logged
+    that the range ran out (Tcpip event 4231), for a report on RETRIED_FAILURE: it tells a machine out of local ports
+    from one that isn't. Empty off Windows."""
+    if sys.platform != "win32":
+        return ""
+
+    def run(*args):
+        return subprocess.run(args, capture_output=True, text=True, errors="replace", check=False).stdout
+
+    try:
+        rows = [line.split() for line in run("netstat", "-anoq").splitlines()]
+        start, count = map(int, re.findall(r"\d+", run("netsh", "interface", "ipv4", "show", "dynamicport", "tcp"))[:2])
+        # The event's XML gives its time in UTC; wevtutil's text format gives local time marked Z
+        last = re.search(r"SystemTime=['\"]([^'\"]+)", run("wevtutil", "qe", "System", "/rd:true", "/c:1",
+                                                            "/q:*[System[Provider[@Name='Tcpip'] and (EventID=4231)]]"))
+    except (OSError, ValueError) as exc:
+        return f"The machine's TCP state couldn't be read: {exc}."
+    sockets = [row for row in rows if len(row) == 5 and row[0] == "TCP"]
+    ports = {int(row[1].rpartition(":")[2]) for row in sockets}
+    held = sum(start <= port < start + count for port in ports)
+    states = dict(Counter(row[3] for row in sockets).most_common())
+    return (f"At {datetime.now(UTC):%Y-%m-%dT%H:%M:%SZ} the machine's TCP sockets by state: {states}; they hold {held} "
+            f"of the {count:,} ports of the dynamic range. Last Tcpip 4231, the range ran out: "
+            f"{last[1] if last else 'none logged'}.")
 
 
 def view(p):
@@ -300,6 +410,17 @@ def point_of(p, uid):
     return point
 
 
+# Whether this event is in the index a draw filled: the lookup point_of makes
+DRAWN = """(uid) => window.__app.S.index.some((items) => (items || []).some((it) => it.kind === 'event' && it.e.uid === uid))"""
+
+
+def wait_drawn(p, uid):
+    """Wait until this event is in the index a draw fills. After the lanes change, they and their labels answer first, and
+    the view that draws the events under them follows, so a test that takes an event's point from the new lanes waits
+    here before it calls point_of."""
+    p.wait_for_function(DRAWN, arg=uid)
+
+
 def labels(p):
     return p.locator("#labels .row").all_inner_texts()
 
@@ -315,6 +436,24 @@ def test_page_loads_with_lanes_for_both_hosts(page):
     assert page.evaluate("window.__app.S.width") > 200
     assert "Could not start" not in page.locator("#status").inner_text()
     assert page.locator("#clockSwitch").is_hidden()   # no capture, so no clock to align
+
+
+def test_an_event_is_drawn_on_new_lanes_once_the_view_under_them_answers_and_wait_drawn_waits_for_it(page):
+    """After the lanes change to another grouping, the lanes and their labels answer first, and the events come with the
+    view's answer after them. Until then the lanes' index holds no tick for an event, so point_of fails with the event
+    not drawn, and wait_drawn waits for the view and then returns."""
+    uid = page.evaluate("() => window.__app.S.data.events[0].uid")
+    held = []
+    page.route(lambda url: "/api/view?" in url, lambda route: held.append(route))
+    page.locator("#groupby").select_option("3")   # User > Host
+    wait_held(page, held)   # the page asks for the view once the lanes have drawn
+    assert page.evaluate("() => window.__app.S.groupby.join()") == "user,host"
+    assert page.evaluate(DRAWN, uid) is False
+    with pytest.raises(AssertionError, match="isn't drawn"):
+        point_of(page, uid)
+    held[0].continue_()
+    wait_drawn(page, uid)
+    assert page.evaluate(DRAWN, uid) is True and point_of(page, uid)["uid"] == uid
 
 
 def test_a_page_not_ready_in_time_reports_what_it_read(browser, synthetic_case, monkeypatch):
@@ -362,6 +501,284 @@ def test_a_request_without_an_answer_fails_the_test_by_name(browser, synthetic_c
     report = str(failed.value)
     assert re.search(r"request failed: GET http://127\.0\.0\.1:\d+/probe/refused net::ERR_CONNECTION_REFUSED", report)
     assert "/probe/canceled" not in report
+
+
+def routing(browser, monkeypatch, matches, handler):
+    """Make the contexts `browser` opens from now on route the requests whose URL `matches` to `handler`."""
+    new_context = browser.new_context
+
+    def routed(**options):
+        context = new_context(**options)
+        context.route(matches, handler)
+        return context
+
+    monkeypatch.setattr(browser, "new_context", routed)
+
+
+def refusing(browser, monkeypatch, matches, times=None):
+    """Make the contexts `browser` opens from now on fail the first `times` requests whose URL `matches`, or every one
+    when `times` is None, with net::ERR_ADDRESS_UNREACHABLE. A route can't make RETRIED_FAILURE, so a test takes this
+    one for it. Returns the list of URLs failed."""
+    failed = []
+
+    def refuse(route):
+        if times is None or len(failed) < times:
+            failed.append(route.request.url)
+            route.abort("addressunreachable")
+        else:
+            route.continue_()
+
+    routing(browser, monkeypatch, matches, refuse)
+    return failed
+
+
+def loads_waiting(monkeypatch, first_wait):
+    """Make open_page's first load wait `first_wait` ms for the page to be ready, for a test whose first load can't
+    become ready. Later loads, and the page's waits after them, keep PAGE_TIMEOUT_MS. Returns the list of URLs
+    loaded."""
+    full, load = PAGE_TIMEOUT_MS, opened
+    loaded = []
+
+    def timed(p, url, ready):
+        wait = full if loaded else first_wait
+        loaded.append(url)
+        monkeypatch.setitem(globals(), "PAGE_TIMEOUT_MS", wait)   # the wait not_ready reports
+        p.set_default_timeout(wait)
+        return load(p, url, ready)
+
+    monkeypatch.setitem(globals(), "opened", timed)
+    return loaded
+
+
+MODULE = lambda url: url.endswith("/js/dividers.js")   # main.js imports it, so the page can't start without it
+START_LINK = lambda url: "/?token=" in url
+STYLESHEET = lambda url: url.endswith("/app.css")   # a page becomes ready without it
+
+
+@pytest.mark.parametrize(("matches", "first_failure"), [
+    (MODULE, "The page wasn't ready after 3 s."),
+    (START_LINK, "The navigation failed: Page.goto: net::ERR_ADDRESS_UNREACHABLE at "),
+], ids=["module", "start_link"])
+def test_a_load_refused_a_socket_is_opened_once_more_with_a_warning(browser, synthetic_case, monkeypatch, matches,
+                                                                   first_failure):
+    """A page load that RETRIED_FAILURE explains, which Windows gives when it has no buffer space or local port for a
+    socket, is opened once more at a new start link, with a warning that names the failed requests and why the first
+    load failed. Its errors are dropped and the test goes on. A failed module leaves the page not ready, and a failed
+    start link fails the navigation itself."""
+    monkeypatch.setitem(globals(), "RETRIED_FAILURE", "net::ERR_ADDRESS_UNREACHABLE")
+    loaded = loads_waiting(monkeypatch, 3_000)
+    failed = refusing(browser, monkeypatch, matches, 1)
+    with pytest.warns(LoadRetried) as warned:
+        for page in served_page(browser, synthetic_case):
+            assert page.evaluate("window.__ready") is True and page.errors == []
+    assert len(failed) == 1 and len(warned) == 1 and len(loaded) == 2
+    message = str(warned[0].message)
+    assert message.startswith(f"Opened the page again after ['request failed: GET {failed[0]} "
+                              f"net::ERR_ADDRESS_UNREACHABLE']. {first_failure}")
+    assert "the machine's TCP sockets by state" in message or sys.platform != "win32"
+
+
+def test_a_load_that_fails_otherwise_fails_the_test_without_a_second_load(browser, synthetic_case, monkeypatch):
+    """Only RETRIED_FAILURE is retried: a load that fails in any other way fails the test with the report, and the
+    page isn't opened again. Its context and server are closed."""
+    loaded = loads_waiting(monkeypatch, 2_000)
+    failed = refusing(browser, monkeypatch, MODULE)
+    with pytest.raises(pytest.fail.Exception) as report:
+        for _ in served_page(browser, synthetic_case):
+            pass
+    assert f"request failed: GET {failed[0]} net::ERR_ADDRESS_UNREACHABLE" in str(report.value)
+    assert len(failed) == 1 and len(loaded) == 1 and browser.contexts == []
+
+
+def test_a_stall_beside_a_refusal_that_cannot_explain_it_fails_without_a_second_load(browser, synthetic_case,
+                                                                                    monkeypatch):
+    """A refusal is retried only when it explains the failure. Here the page's first /api/meta never answers, so the
+    page can't become ready, and the load's one error is its stylesheet failing with RETRIED_FAILURE, without which a
+    page still becomes ready: the test fails with the report, which names the stylesheet, and the page isn't opened
+    again."""
+    monkeypatch.setitem(globals(), "RETRIED_FAILURE", "net::ERR_ADDRESS_UNREACHABLE")
+    loaded = loads_waiting(monkeypatch, 3_000)
+    held = []
+
+    def stall_once(route):   # the first is held without an answer
+        held.append(route)
+        if len(held) > 1:
+            route.continue_()
+
+    routing(browser, monkeypatch, "**/api/meta", stall_once)
+    failed = refusing(browser, monkeypatch, STYLESHEET, 1)
+    with pytest.raises(pytest.fail.Exception) as report:
+        for _ in served_page(browser, synthetic_case):
+            pass
+    # A route still pending when Playwright stops is canceled, and asyncio logs that as an error in the teardown of
+    # whichever test ends the worker's session. Ended here, once its context has closed, it logs nothing.
+    held[0].abort()
+    assert str(report.value).startswith("The page wasn't ready after 3 s.")
+    assert f"request failed: GET {failed[0]} net::ERR_ADDRESS_UNREACHABLE" in str(report.value)
+    assert len(failed) == 1 and len(held) == 1 and len(loaded) == 1 and browser.contexts == []
+
+
+class FailingNavigation:
+    """Stands in for a page served_page set up, whose every navigation raises `error` after the requests in `errors`
+    failed with RETRIED_FAILURE. `visits` lists the URLs it was opened at."""
+
+    def __init__(self, error, errors):
+        self.error, self.errors, self.refused, self.visits = error, errors, ["script"] * len(errors), []
+
+    def goto(self, url, timeout):
+        self.visits.append(url)
+        raise self.error
+
+    def new_link(self):
+        return "http://127.0.0.1:1/?token=second"
+
+
+@pytest.mark.parametrize("error", [
+    playwright_api.TimeoutError("Page.goto: Timeout 30000ms exceeded."),
+    playwright_api.Error("Page.goto: net::ERR_CONNECTION_RESET at http://127.0.0.1:1/?token=first"),
+], ids=["timeout", "reset"])
+def test_a_navigation_that_fails_otherwise_beside_a_refusal_is_not_retried(error):
+    """A navigation that fails with another error is raised, and the page isn't opened again, even when the only
+    requests that failed before it failed with RETRIED_FAILURE."""
+    p = FailingNavigation(error, [f"request failed: GET http://127.0.0.1:1/js/data.js {RETRIED_FAILURE}"])
+    with pytest.raises(type(error)) as raised:
+        open_page(p, "http://127.0.0.1:1/?token=first", "() => true")
+    assert raised.value is error and p.visits == ["http://127.0.0.1:1/?token=first"]
+
+
+def test_a_load_refused_twice_fails_the_test(browser, synthetic_case, monkeypatch):
+    """A load opened again after RETRIED_FAILURE that fails again fails the test, and its context and server are
+    closed. Edge can reload a page whose navigation failed by itself, so the first start link may fail more than once
+    before the second is opened."""
+    monkeypatch.setitem(globals(), "RETRIED_FAILURE", "net::ERR_ADDRESS_UNREACHABLE")
+    failed = refusing(browser, monkeypatch, START_LINK)
+    with pytest.warns(LoadRetried), pytest.raises(playwright_api.Error, match="net::ERR_ADDRESS_UNREACHABLE"):
+        for _ in served_page(browser, synthetic_case):
+            pass
+    assert len(set(failed)) == 2 and browser.contexts == []
+
+
+def test_the_browser_resolves_no_host_name(browser):
+    """The browser looks up no name, so most of its own traffic doesn't leave this machine (conftest.BROWSER_ARGS). The
+    tests' servers are at 127.0.0.1, an address; even localhost isn't resolved."""
+    context = browser.new_context()
+    try:
+        with pytest.raises(playwright_api.Error, match="net::ERR_NAME_NOT_RESOLVED"):
+            context.new_page().goto("http://localhost/", timeout=LOAD_TIMEOUT_MS)
+    finally:
+        context.close()
+
+
+def test_a_worker_s_tests_share_one_browser_and_one_that_closed_is_launched_again(launch_browser, request):
+    """The browser tests on a worker share one browser, and one that has disconnected, as after a crash, is replaced
+    by a new launch, with a warning that names the test it disconnected during."""
+    first = launched(launch_browser)
+    assert launch_browser() is first
+    first.close()
+    with pytest.warns(BrowserRelaunched, match=f"^The browser disconnected during .*{re.escape(request.node.name)}"):
+        again = launch_browser()
+    assert again is not first and again.is_connected()
+
+
+class Launches:
+    """Stands in for Playwright's chromium: each launch raises the next of `failures`, and once they're used up returns
+    a connected stand-in browser. `count` is the number of launches tried."""
+
+    def __init__(self, *failures):
+        self.failures, self.count = list(failures), 0
+
+    def launch(self, **options):
+        self.count += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return ConnectedBrowser()
+
+
+class ConnectedBrowser:
+    """Stands in for a browser Playwright launched, which stays connected."""
+
+    def is_connected(self):
+        return True
+
+    def on(self, event, handler):
+        pass
+
+
+def test_a_browser_that_is_not_installed_skips_its_tests_without_another_launch():
+    """When the browser isn't installed, the first call skips its test with Playwright's reason, and later calls skip
+    without launching again."""
+    chromium = Launches(playwright_api.Error("BrowserType.launch: Chromium distribution 'msedge' is not found at "
+                                             "C:/Edge/msedge.exe\nRun playwright install msedge"))
+    shared = SharedBrowser(chromium, "msedge")
+    for _ in range(2):
+        with pytest.raises(pytest.skip.Exception) as skipped:
+            shared()
+        assert skipped.value.msg == ("no browser to drive: BrowserType.launch: Chromium distribution 'msedge' is not "
+                                     "found at C:/Edge/msedge.exe")
+    assert chromium.count == 1
+
+
+def test_a_browser_that_fails_to_launch_otherwise_fails_the_test_and_is_launched_again():
+    """Any other failure to launch, such as a timeout, fails the test rather than skipping it, and the next call
+    launches again."""
+    timeout = playwright_api.TimeoutError("BrowserType.launch: Timeout 180000ms exceeded.")
+    chromium = Launches(timeout)
+    shared = SharedBrowser(chromium, "msedge")
+    with pytest.raises(playwright_api.TimeoutError) as raised:
+        shared()
+    assert raised.value is timeout
+    assert shared().is_connected() and chromium.count == 2
+
+
+def absent_browser():
+    """A SharedBrowser whose launch fails because Edge isn't installed."""
+    return SharedBrowser(Launches(playwright_api.Error("BrowserType.launch: Chromium distribution 'msedge' is not found at "
+                                                        "C:/Edge/msedge.exe\nRun playwright install msedge")), "msedge")
+
+
+ABSENT_REASON = ("no browser to drive: BrowserType.launch: Chromium distribution 'msedge' is not found at "
+                 "C:/Edge/msedge.exe")
+
+
+def ending(call):
+    """The skip or failure that `call` ends its test with. Anything else raised, or no outcome at all, fails the test."""
+    with pytest.raises((pytest.skip.Exception, pytest.fail.Exception)) as raised:
+        call()
+    return raised.value
+
+
+@pytest.mark.parametrize("environ", [{}, {REQUIRE_BROWSER: ""}, {REQUIRE_BROWSER: "0"}], ids=["unset", "empty", "zero"])
+def test_a_missing_browser_skips_its_tests_unless_the_run_requires_one(environ):
+    """Without GLESSNER_REQUIRE_BROWSER, or with it empty or 0, a browser that isn't installed skips the test."""
+    outcome = ending(lambda: launched(absent_browser(), environ))
+    assert isinstance(outcome, pytest.skip.Exception) and outcome.msg == ABSENT_REASON
+
+
+def test_a_missing_browser_fails_the_test_when_the_run_requires_one():
+    """With GLESSNER_REQUIRE_BROWSER set, a browser that isn't installed fails the test and says why and which setting
+    asked for it, so a runner without Edge can't pass with every browser test skipped. A browser that launches is
+    returned as it is."""
+    outcome = ending(lambda: launched(absent_browser(), {REQUIRE_BROWSER: "1"}))
+    assert isinstance(outcome, pytest.fail.Exception)
+    assert outcome.msg == f"{ABSENT_REASON}. {REQUIRE_BROWSER} is set, so a missing browser fails the run."
+    present = SharedBrowser(Launches(), "msedge")
+    assert launched(present, {REQUIRE_BROWSER: "1"}) is present.browser
+
+
+@pytest.mark.parametrize("launch_browser", [absent_browser()])   # stands in for the shared browser of an Edge-less machine
+def test_the_browser_fixture_fails_for_a_missing_browser_when_the_environment_requires_one(launch_browser, request, monkeypatch):
+    """A test that asks for the browser fixture fails, and doesn't skip, when GLESSNER_REQUIRE_BROWSER is set in the
+    environment and the browser isn't installed."""
+    monkeypatch.setenv(REQUIRE_BROWSER, "1")
+    assert isinstance(ending(lambda: request.getfixturevalue("browser")), pytest.fail.Exception)
+
+
+@pytest.mark.parametrize("launch_browser", [absent_browser()])
+def test_the_browser_fixture_skips_for_a_missing_browser_when_the_environment_does_not_require_one(
+        launch_browser, request, monkeypatch):
+    """With GLESSNER_REQUIRE_BROWSER unset, as on a developer's machine, the same test is skipped."""
+    monkeypatch.delenv(REQUIRE_BROWSER, raising=False)
+    assert isinstance(ending(lambda: request.getfixturevalue("browser")), pytest.skip.Exception)
 
 
 def test_click_opens_the_event_page_without_moving_the_timeline(page):
@@ -640,7 +1057,8 @@ def test_events_opened_from_the_overview_are_not_listed_once_a_later_change_repl
 def test_events_opened_from_the_overview_are_listed_when_a_later_sources_change_keeps_the_view(page):
     """When a Sources change replaces the filter of a View a Case overview number set before the View's registration has
     answered, the View stays. The events are listed under the id registered for the View: /api/view_events lists only a
-    filter's View part, so the list holds the events the number stands for."""
+    filter's View part, so the list holds the events the number stands for, and is asked for once. The first request is
+    read from the wait for it, as its event can reach the test after the page has drawn the list."""
     asked = []
     page.on("request", lambda req: asked.append(req.url) if "/api/view_events" in req.url else None)
     page.locator("#tabOverview").click()
@@ -654,14 +1072,16 @@ def test_events_opened_from_the_overview_are_listed_when_a_later_sources_change_
     with page.expect_request("**/api/filter"):
         page.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True).uncheck()
     wait_held(page, held, 2)
-    with filtered_view(page):   # the Sources change's registration answers first, and the timeline draws under it
-        held[1].continue_()
-    with page.expect_response("**/api/filter") as registered:
-        held[0].continue_()
+    with page.expect_request("**/api/view_events*") as listing:
+        with filtered_view(page):   # the Sources change's registration answers first, and the timeline draws under it
+            held[1].continue_()
+        with page.expect_response("**/api/filter") as registered:
+            held[0].continue_()
     page.unroute("**/api/filter")
     page.wait_for_selector("#details[data-page='opened']")
-    assert [url.split("?")[1] for url in asked] == [f"filter={registered.value.json()['id']}"]
+    assert listing.value.url.split("?")[1] == f"filter={registered.value.json()['id']}"
     assert page.locator("#details .sticky-head .actions > strong").inner_text() == f"{stands_for} events"
+    assert asked == [listing.value.url]
 
 
 def test_a_page_opened_while_an_overview_number_sets_its_view_keeps_the_panel(page):
@@ -1368,6 +1788,50 @@ def test_tools_page_loads_tool_output_found_in_the_evidence(browser, synthetic_c
         case_menu(page, "toolsButton")
         page.wait_for_selector("#details .tools-outputs .ok")
         assert "Loaded " in page.locator("#details .tools-outputs").inner_text()
+
+
+def test_tools_page_names_the_rule_set_the_skipped_rows_and_the_runtime_of_each_tool(browser, synthetic_case, tmp_path):
+    """A tool's version cell holds its rule set's label and its .NET line together, and a tool with a rules block and no
+    rule set keeps its warning. A tool's Ran line adds the rows without a time and the rows skipped when there are
+    any, and names the rule sets its latest runs used in the muted class, with "rules not recorded" for a run made
+    before the case recorded them. A group of found output says how many rows its parser skipped."""
+    from test_runner import eve_lines
+    from test_server import fake_tool_case
+
+    from glessner.runner import finish_run, load_found_output, start_run
+    from glessner.tools import DetectedTool
+
+    for folder, ids in (("a", [1000, 1001]), ("b", [1002])):
+        (synthetic_case.evidence / "SENSOR" / folder).mkdir(parents=True)
+        eve = synthetic_case.evidence / "SENSOR" / folder / "eve.json"
+        eve.write_text(eve_lines(ids) + '{"timestamp": "2024', encoding="utf-8")
+    specs, detected = fake_tool_case(synthetic_case, tmp_path)
+    fake, exe = specs["fake"], detected["fake"].executable
+    label = {"kind": "count", "path": "Maps", "text": "{value}"}
+    labeled = fake.__class__(**{**fake.__dict__, "dotnet": 9, "rules_label": label})
+    ruleful = fake.__class__(**{**fake.__dict__, "id": "other", "name": "Other", "rules": {"file": "rules/x.rules"}})
+    cache = ({"fake": labeled, "other": ruleful},
+             {"fake": DetectedTool(labeled, exe, "1.0", dotnet_root=str(tmp_path), rules="Maps, 456 maps"),
+              "other": DetectedTool(ruleful, exe, "1.0")})
+    for host, fields in (("DC01", {"rules": "Maps, 456 maps", "tool_files": {"Fake.exe": "ab" * 32}, "rows_skipped": 2,
+                                   "rows_without_time": 3}),
+                         ("DESKTOP", {})):   # the second ran before the case recorded tool files
+        record, folder = start_run(synthetic_case, "fake", host, tool_version="1.0", host=host, inputs=["x"], status="ok",
+                                   loaded_rows=10, **fields)
+        finish_run(folder, record)
+    found = load_found_output(synthetic_case, "suricata", "suricata_eve", "SENSOR", ["SENSOR/a/eve.json", "SENSOR/b/eve.json"])
+    assert (found.status, found.rows_skipped) == ("ok", 2)
+    for page in served_page(browser, synthetic_case, setup=lambda app: setattr(app, "tool_cache", cache)):
+        case_menu(page, "toolsButton")
+        page.wait_for_selector("#details[data-page='tools'] .tools-table .ok")
+        row = lambda n: page.locator("#details .tools-table:not(.tools-outputs) tbody tr").nth(n).locator("td")  # noqa: B023
+        assert row(0).nth(1).locator("div").all_inner_texts() == ["Rules: Maps, 456 maps", ".NET 9, from the tools folder"]
+        status = row(0).nth(3)
+        assert status.locator(".ok").inner_text().endswith(" UTC: 20 events, 3 without a time, 2 skipped")
+        assert status.locator(".muted").inner_text() == "Maps, 456 maps; rules not recorded"
+        assert row(1).nth(1).locator("div").all_inner_texts() == ["No rule set: no rule alerts"]
+        assert "rules not recorded" not in row(1).nth(3).inner_text()
+        assert page.locator("#details .tools-outputs .ok").inner_text().endswith(" UTC: 3 events, 2 skipped")
 
 
 # Asks the server about the background job, through the page's own request function, which sends the session, until it
@@ -2316,7 +2780,7 @@ def test_a_note_typed_beside_a_list_s_mark_buttons_goes_with_the_mark(page, synt
     note = page.locator("#details .related .mark-note")
     assert note.input_value() == "Logons from the attacker's foothold"
     count = page.locator("#details .related li.rel-row").count()
-    assert note.get_attribute("placeholder") == f"Note for marking {count} events (optional)"
+    assert note.get_attribute("title") == f"Note for marking {count} events (optional)"
     # A mark that fails keeps the ticks and the note for another try
     page.route("**/api/mark", lambda route: route.abort("aborted"))
     page.locator("#details").get_by_role("button", name=f"Mark {count} Suspicious").click()

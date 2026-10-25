@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from glessner.case import create_case
 from glessner.events import connect
 from glessner.identify import identify_bytes
@@ -44,6 +46,19 @@ def test_network_monitor_output_and_captures_are_recognized():
     assert identify_bytes("eve.json", (json.dumps(EVE[0]) + "\n").encode()).detail == "suricata_eve"
 
 
+@pytest.mark.parametrize("sep", [".", "_"])
+def test_a_zeek_json_log_is_recognized_by_its_originator_in_either_name_form(sep):
+    """Zeek writes id.orig_h, or id_orig_h when set to join names with an underscore. A record whose keys are exactly
+    ts and the two endpoints, with no connection or file ID, in a file whose name is no Zeek log's, is known by its
+    originator, whole or cut off."""
+    orig = f"id{sep}orig_h"
+    flows = {"ts": 1715688016.2, orig: "10.0.0.5", f"id{sep}resp_h": "10.0.0.1"}
+    assert kind_of("flows.json", json.dumps(flows)).kind == "zeek_json"
+    cut = json.dumps(flows)[:50]   # a first line cut off by the sniff
+    assert f'"{orig}"' in cut and '"uid"' not in cut
+    assert kind_of("flows.json", cut).kind == "zeek_json"
+
+
 def test_zeek_and_suricata_load_from_the_tools_page_and_captures_wait(tmp_path):
     ev = tmp_path / "evidence"
     (ev / "ZEEK").mkdir(parents=True)
@@ -79,6 +94,54 @@ def test_zeek_and_suricata_load_from_the_tools_page_and_captures_wait(tmp_path):
     assert x509 == "x509: CN=styles.fullstory.co"
     statuses = {(g["key"], g["host"]): g["status"] for g in found_outputs(case, specs, {})}
     assert statuses[("zeek", "ZEEK")] == statuses[("suricata_eve", "SENSOR")] == "loaded"
+
+
+def test_zeek_logs_with_underscore_names_load_their_endpoints_and_name_a_pe_files_sections(tmp_path):
+    """A Zeek export that writes id_orig_h, id_orig_p, id_resp_h, id_resp_p, and certificate_subject fills the same
+    event fields and message parts as id.orig_h and the rest. A pe record's message names its sections."""
+    conn = {"ts": 1715688048.855508, "uid": "CrVLu", "id_orig_h": "10.44.10.22", "id_orig_p": 53712,
+            "id_resp_h": "10.44.20.10", "id_resp_p": 53, "proto": "udp", "service": "dns", "duration": 0.004043,
+            "conn_state": "SF"}
+    pe = {"ts": 1715688240.585, "id": "FpE1", "machine": "AMD64", "os": "Windows XP x64 or Server 2003",
+          "subsystem": "WINDOWS_CUI", "is_exe": True, "is_64bit": True, "section_names": ["UPX0", "UPX1", ".rsrc"]}
+    x509 = {"ts": 1715688240.585, "id": "FqWDuc7", "fingerprint": "abc", "certificate_subject": "CN=styles.fullstory.co"}
+    ev = tmp_path / "evidence"
+    (ev / "ZEEK").mkdir(parents=True)
+    for name, record in (("conn", conn), ("pe", pe), ("x509", x509)):
+        (ev / "ZEEK" / f"{name}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    case = create_case(tmp_path / "case", "Network", ev, "cody")
+    intake(case)
+    group = next(g for g in found_outputs(case, load_registry(), {}) if g["key"] == "zeek")
+    assert [(r.status, r.loaded_rows) for r in load_group(case, group)] == [("ok", 1)] * 3
+    with connect(case.db_path) as con:
+        found = con.execute("SELECT log_channel, source_ip, source_port, dest_ip, dest_port, message FROM events "
+                            "WHERE artifact = 'zeek'").fetchall()
+    rows = {channel: rest for channel, *rest in found}
+    assert rows["conn"] == ["10.44.10.22", "53712", "10.44.20.10", "53",
+                            "conn: 10.44.10.22:53712 -> 10.44.20.10:53 udp dns SF"]
+    assert rows["pe"][4] == 'pe: AMD64 sections ["UPX0", "UPX1", ".rsrc"]'
+    assert rows["x509"][4] == "x509: CN=styles.fullstory.co"
+
+
+def test_a_zeek_tsv_pe_log_names_its_sections_as_zeek_wrote_them(tmp_path):
+    """A tab-separated pe.log writes section_names joined with its set separator, a comma, and "(empty)" for none, so
+    the message shows the sections comma-separated and leaves the part out when there are none."""
+    pe_tsv = ("#separator \\x09\n#set_separator\t,\n#empty_field\t(empty)\n#unset_field\t-\n#path\tpe\n"
+              "#fields\tts\tid\tmachine\tsection_names\n"
+              "#types\ttime\tstring\tstring\tvector[string]\n"
+              "1715688240.585000\tFpE1\tAMD64\tUPX0,UPX1,.rsrc\n"
+              "1715688241.585000\tFpE2\tAMD64\t(empty)\n")
+    ev = tmp_path / "evidence"
+    (ev / "ZEEK").mkdir(parents=True)
+    (ev / "ZEEK" / "pe.log").write_text(pe_tsv, encoding="utf-8", newline="\n")
+    case = create_case(tmp_path / "case", "Network", ev, "cody")
+    intake(case)
+    group = next(g for g in found_outputs(case, load_registry(), {}) if g["key"] == "zeek")
+    assert [(r.status, r.loaded_rows) for r in load_group(case, group)] == [("ok", 2)]
+    with connect(case.db_path) as con:
+        found = con.execute("SELECT message FROM events WHERE artifact = 'zeek' ORDER BY ts_us").fetchall()
+    messages = [message for (message,) in found]
+    assert messages == ["pe: AMD64 sections UPX0,UPX1,.rsrc", "pe: AMD64"]
 
 
 def test_a_failed_group_member_does_not_hide_a_committed_load(tmp_path):

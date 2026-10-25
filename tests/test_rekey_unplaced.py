@@ -105,13 +105,13 @@ def test_the_journal_s_state_reads_the_candidates_through_a_later_rekey(tmp_path
     first = journal.append(
         "case_upgrade",
         who=SYSTEM,
-        from_format=3,
-        to_format=4,
+        from_format=4,
+        to_format=5,
         text="Event IDs changed.",
         rekey={"pairs": {}, "unplaced": {old: [b1, b2]}},
     )
     assert sorted(unplaced(journal.state)) == sorted([b1, b2])
-    journal.append("case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="Event IDs changed.", rekey={"pairs": {b1: c1}})
+    journal.append("case_upgrade", who=SYSTEM, from_format=5, to_format=6, text="Event IDs changed.", rekey={"pairs": {b1: c1}})
     reopened = Journal(case)
     for state in (journal.state, reopened.state):
         assert unplaced(state) == {
@@ -155,7 +155,7 @@ def new_case(tmp_path):
 def first_rekey(journal, old, candidates):
     """A mark on `old`, then the upgrade that leaves `old` unplaced, with `candidates`."""
     journal.append("mark", targets=[old], value="suspicious", note="")
-    return journal.append("case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="Event IDs changed.",
+    return journal.append("case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="Event IDs changed.",
                           rekey={"pairs": {}, "unplaced": {old: candidates}})
 
 
@@ -178,7 +178,7 @@ def test_the_upgrade_places_the_candidates_an_earlier_rekey_listed(tmp_path):
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
     assert referenced_ids(case.folder / JOURNAL_FILE) == ({old}, {b1, b2})
-    second = next_rekey(journal, case, (4, 5), {b1: c1, b2: c2})
+    second = next_rekey(journal, case, (5, 6), {b1: c1, b2: c2})
     assert second["rekey"] == {"pairs": {b1: c1, b2: c2}, "unplaced": {}, "merged": {}}
     for state in (journal.state, Journal(case).state):
         assert unplaced(state) == {c: [{"seq": first["seq"], "id": old, "candidates": [c1, c2]}] for c in (c1, c2)}
@@ -192,9 +192,9 @@ def test_the_upgrade_places_a_candidate_through_the_rekeys_between(tmp_path):
     old, b1, b2, c1, c2, d1 = (new_id(name) for name in ("old1", "b1", "b2", "c1", "c2", "d1"))
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
-    next_rekey(journal, case, (4, 5), {b1: c1, b2: c2})
+    next_rekey(journal, case, (5, 6), {b1: c1, b2: c2})
     assert referenced_ids(case.folder / JOURNAL_FILE) == ({old}, {c1, c2})
-    third = next_rekey(journal, case, (5, 6), {c1: d1})
+    third = next_rekey(journal, case, (6, 7), {c1: d1})
     assert third["rekey"]["pairs"] == {c1: d1}
     found = unplaced(Journal(case).state)
     assert found == {c: [{"seq": first["seq"], "id": old, "candidates": [d1, c2]}] for c in (d1, c2)}
@@ -208,7 +208,7 @@ def test_the_upgrade_that_leaves_a_candidate_unplaced_lists_the_events_it_may_me
     old, b1, b2, c1, c2 = (new_id(name) for name in ("old1", "b1", "b2", "c1", "c2"))
     journal = Journal(case)
     first = first_rekey(journal, old, [b1, b2])
-    second = next_rekey(journal, case, (4, 5), {b1: c1}, {b1: c2})
+    second = next_rekey(journal, case, (5, 6), {b1: c1}, {b1: c2})
     assert second["rekey"]["unplaced"] == {} and second["rekey"]["candidates_unplaced"] == {b1: sorted([c1, c2])}
     c1, c2 = sorted([c1, c2])
     of_old = {"seq": first["seq"], "id": old, "candidates": [c1, c2, b2]}

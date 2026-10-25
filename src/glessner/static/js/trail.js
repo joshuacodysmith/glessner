@@ -7,12 +7,14 @@ import { $, el, plural, S } from './core.js';
 // event replaces them: S.trailAt is the step on screen. Save trail as a note journals it as an ordinary note on
 // the event the trail started from, so the reasoning path survives.
 
-// What an event is, for a step: its code, or its evidence type.
+// What an event is, for a step: its code, or its evidence type. An artifact's name is read as the Event page's
+// artifactName reads it: only a name the table holds itself, so an import named constructor reads as written.
 function eventWhat(ev) {
   const channel = ev.log_channel ? ` ${ev.log_channel}` : '';
+  const names = S.meta?.artifact_names || {};
   return ev.artifact === 'evtx' ? `${ev.event_code || 'event'}${ev.logon_type ? ` type ${ev.logon_type}` : ''}`
     : ev.artifact === 'suricata' || ev.artifact === 'zeek' ? `${ev.artifact === 'zeek' ? 'Zeek' : 'Suricata'}${channel}`
-    : (S.meta?.artifact_names || {})[ev.artifact] || ev.artifact;
+    : (Object.hasOwn(names, ev.artifact) && names[ev.artifact]) || ev.artifact;
 }
 
 // What an event is, and where.

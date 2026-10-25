@@ -127,17 +127,21 @@ ZEEK_LOGS = frozenset(("conn dce_rpc dhcp dnp3 dns dpd files ftp http intel irc 
                         "snmp socks software ssh ssl syslog tunnel weird x509").split())
 
 
+ZEEK_IDS = frozenset(("uid", "uids", "fuid", "id.orig_h", "id_orig_h"))
+
+
 def _json_kind(name: str, first_line: str) -> OutputKind | None:
-    """Suricata's EVE records carry timestamp and event_type. Zeek's carry ts, with a connection ID (uid or uids), a
-    file ID (fuid), or the connection's endpoints; logs such as x509 and pe carry only an id, so their file name, the
-    log's type, settles them. A first line too long for the sniff is matched by its keys as text."""
+    """Suricata's EVE records carry timestamp and event_type. Zeek's carry ts with one of ZEEK_IDS: a connection ID
+    (uid or uids), a file ID (fuid), or the connection's originator (id.orig_h, or id_orig_h from a Zeek set to join
+    names with an underscore). Logs such as x509 and pe carry only an id, so their file name, the log's type, settles
+    them. A first line too long for the sniff is matched by its keys as text."""
     try:
         record = json.loads(first_line)
         keys = set(record) if isinstance(record, dict) else set()
     except (ValueError, RecursionError):   # RecursionError: a line nested too deep to read
-        keys = {k for k in ("timestamp", "event_type", "ts", "uid", "uids", "fuid", "id.orig_h") if f'"{k}"' in first_line}
+        keys = {k for k in ("timestamp", "event_type", "ts", *ZEEK_IDS) if f'"{k}"' in first_line}
     if {"timestamp", "event_type"} <= keys:
         return BY_KIND["suricata_eve"]
-    if "ts" in keys and (keys & {"uid", "uids", "fuid", "id.orig_h"} or name.lower().split(".", 1)[0] in ZEEK_LOGS):
+    if "ts" in keys and (keys & ZEEK_IDS or name.lower().split(".", 1)[0] in ZEEK_LOGS):
         return BY_KIND["zeek_json"]
     return None

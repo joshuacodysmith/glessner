@@ -12,6 +12,7 @@ external requests.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import getpass
 import hashlib
@@ -22,7 +23,8 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Sequence
+import weakref
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,6 +64,7 @@ from .events import BIGINT_COLUMNS, connect, id_table, insert_columns, transacti
 from .export import (
     REPORT_CHECK,
     WHOLE_CASE,
+    cited_files,
     export_path,
     export_timeline,
     file_payload,
@@ -87,7 +90,18 @@ from .imports import (
 )
 from .imports import PRESETS as IMPORT_PRESETS
 from .intake import Check as EvidenceCheck
-from .intake import add_new, check_files, current_entries, evidence_checks, manifest_hashes, read_manifest, sha256_file
+from .intake import (
+    add_new,
+    check_files,
+    current_entries,
+    evidence_checks,
+    first_unvouched,
+    manifest_hashes,
+    manifest_missing,
+    read_manifest,
+    recorded_manifest,
+    sha256_file,
+)
 from .journal import (
     REPLAY_ERRORS,
     SYSTEM,
@@ -96,7 +110,10 @@ from .journal import (
     JournalError,
     rekey_map,
     renamed,
+    side_stamp,
     unplaced,
+    unvouched_sentences,
+    unvouched_warns,
     upgrade_recorder,
 )
 from .line_logs import LAYOUTS
@@ -121,7 +138,7 @@ from .queries import (
     event_keys,
     event_pairs,
     fit_range,
-    flagged_uids,
+    flagged_events,
     investigate,
     lanes,
     listed_events,
@@ -141,7 +158,7 @@ from .queries import (
 from .relations import outside_sources
 from .rules import BUILTIN_RULES, RuleError
 from .rules import parse as parse_rule
-from .runner import IMPORT, RunError, read_runs
+from .runner import IMPORT, RunError, read_run, read_runs
 from .search import (
     Term,
     by_name,
@@ -197,6 +214,7 @@ MAX_BODY = 16 * 1024 * 1024
 # 512 ms end to end when measured.
 KEEP_ALIVE_SECONDS = 60
 REOPEN_WAIT_SECONDS = 5   # how long Hub.open waits for a retired App of the same case to close
+SHUTDOWN_WAIT_SECONDS = 5   # how long Hub.close waits for the requests running on the Apps to end before it closes them
 # The port `serve` tries first when --port isn't given. The browser keeps the page's layout preferences by
 # origin, and the port is part of the origin, so a port that changes with every run loses them. It is below Windows'
 # dynamic range, 49152 and up, and outside the ranges `netsh interface ipv4 show excludedportrange protocol=tcp` listed
@@ -247,6 +265,11 @@ class App:
         self.counting = threading.Lock()
         self.inflight = 0
         self.retired = False
+        # The cursors reader() has handed out, which close_now interrupts: closing a connection waits for the statements
+        # its cursors are running. `cut` is set once close_now has taken them, so no later cursor can run a statement.
+        # Both change under `counting`.
+        self.cursors: weakref.WeakSet = weakref.WeakSet()
+        self.cut = False
         self.closed = threading.Event()   # set once the connection is closed, which Hub.open waits for on a reopen
         self.journal = Journal(case, client)
         if for_work:
@@ -298,10 +321,15 @@ class App:
         derived tables are built again (hits, marks, relations, identity). A step's status doesn't say: a load can
         commit and then fail its evidence check, and a group fails when any of its runs does. A job
         that a fault stopped refreshes too: the fault can come after a load committed and before its step's result was
-        recorded, as when a group's later member raises what its import doesn't catch."""
-        if job.error or any(r.get("loaded") for r in job.results):
-            self.refresh_identity(events_changed=True)
-            self.remember()
+        recorded, as when a group's later member raises what its import doesn't catch. The rebuild runs on the job's
+        thread and counts as a request, so a stop waits for it up to its bound and then cuts it off; an App the hub has
+        retired is not rebuilt."""
+        if (job.error or any(r.get("loaded") for r in job.results)) and self.enter():
+            try:
+                self.refresh_identity(events_changed=True)
+                self.remember()
+            finally:
+                self.leave()
 
     def remember(self) -> None:
         """Recent cases' count of timeline events, when the case opens (Hub.open) and after a load. It is the case's
@@ -348,9 +376,26 @@ class App:
             self.retired = False
             return True
 
+    def close_now(self) -> None:
+        """Close the connection at once, under any request still running on the App, which then fails. Hub.close uses it
+        for requests that outlast its wait. A statement running on the connection or on one of its cursors is
+        interrupted first, because the close would otherwise wait for it to end, a count over millions of events
+        included, and the request's statement would end in "No open result set". A cursor asked for after this is
+        refused, so a request that goes on to another statement can't hold the close up again."""
+        with self.counting:
+            self.cut = True
+            cursors = list(self.cursors)
+        for running in (self.con, *cursors):
+            with contextlib.suppress(duckdb.Error):   # a connection that is closed already has nothing to interrupt
+                running.interrupt()
+        self._close()
+
     def _close(self) -> None:
         """Close the connection and set `closed`, which a reopen of the case waits on, even when the close raises: an
-        App whose event stayed unset would make every later open of its case wait and then refuse."""
+        App whose event stayed unset would make every later open of its case wait and then refuse. Once only: a
+        request that ends after close_now finds the App closed."""
+        if self.closed.is_set():
+            return
         try:
             self.con.close()
         except duckdb.Error as exc:   # for the console `serve` runs in
@@ -458,7 +503,13 @@ class App:
             self.generation += 1
 
     def reader(self):
-        return self.con.cursor()   # one DuckDB cursor per request thread
+        """A DuckDB cursor for a request thread, one per thread. ConnectionException once close_now has begun."""
+        with self.counting:
+            if self.cut:
+                raise duckdb.ConnectionException("The events database is closing, so no new statement can start.")
+            cursor = self.con.cursor()
+            self.cursors.add(cursor)
+        return cursor
 
     def keep_anchor(self, uid: str, event: dict) -> None:
         """Keep the event an Event page read, for the counts of its pivots, which each start from it: reading the event
@@ -575,6 +626,28 @@ class Hub:
             old.retire()
         app.remember()
         return app
+
+    def close(self, wait: float | None = None) -> int:
+        """Stop serving the case, once the server accepts no more connections. The open case is taken out of service, so a
+        request that arrives meanwhile is answered "No case is open.", and every App is retired, the open one and those
+        switched away from. A connection closes when the last request on its App ends, so a request in flight finishes in
+        its own answer and not in a 500 from a connection closed under its cursor. The wait for them is at most `wait`
+        seconds in all, SHUTDOWN_WAIT_SECONDS by default, since a request such as an import can run for minutes. A
+        connection still in use when it runs out is closed anyway, after the statements running on it are interrupted
+        (App.close_now), so the close itself doesn't wait for a long count. The number of requests that were running on
+        those connections is returned; 0 when every connection closed by itself."""
+        deadline = time.monotonic() + (SHUTDOWN_WAIT_SECONDS if wait is None else wait)
+        with self.lock:
+            apps = [*self.retired, *([self.app] if self.app else [])]
+            self.app = None
+        for app in apps:
+            app.retire()
+        running = 0
+        for app in apps:
+            if not app.closed.wait(max(0.0, deadline - time.monotonic())):
+                running += app.inflight
+                app.close_now()
+        return running
 
 
 class BodyError(Exception):
@@ -873,14 +946,29 @@ def _case_state(app: App) -> dict:
     file, so a close the command line journals beside the server shows; the evidence intake hashed, with the files it
     couldn't read and the folders it couldn't list counted apart; and what the evidence checks found since
     (intake.evidence_checks), which a close outranks no more than any other check, with the files changed and those not
-    re-read counted apart (overview.problem_files)."""
+    re-read counted apart (overview.problem_files). A missing manifest.jsonl that the journal records is named in
+    intake.manifest_missing's words, since it is a change, not a case still waiting for intake; "" otherwise. Without a
+    manifest the journal is caught up first, so a record the command line appended beside the server counts.
+    `manifest_record` is what the journal's first manifest record says of why its source couldn't vouch for it, which only
+    a copy's does (intake.first_unvouched): the reasons, whether one is a warning, and their words. It comes from the
+    journal, as Integrity's does, so a copy shows it before its own first full re-hash, whatever the verification history
+    it holds from its source says."""
     _, close = journal_facts(app.journal.path)
     value = (close or {}).get("value")
     files = _manifest_facts(app)
     checks = evidence_checks(app.case)
     changed, not_reread = problem_files(checks["problems"])
+    has_manifest = app.case.manifest_path.exists()
+    if not has_manifest:
+        app.journal.refresh()
+    records = app.journal.state.manifests
+    reasons = first_unvouched(records)
     return {"closed": {"at": value.get("at") or close.get("at", "")} if isinstance(value, dict) else None,
-            "intake": app.case.manifest_path.exists(), "evidence_files": files["hashed"], "added_files": files["added"],
+            "intake": has_manifest,
+            "manifest_missing": manifest_missing(records) if records and not has_manifest else "",
+            "manifest_record": {"unvouched": list(reasons), "warn": unvouched_warns(reasons),
+                                "text": unvouched_sentences(reasons)},
+            "evidence_files": files["hashed"], "added_files": files["added"],
             "unreadable": len(files["unreadable"]), "unlisted": len(files["unlisted"]),
             "checks": {**checks, "changed_files": len(changed), "not_reread": len(not_reread)},
             "journal": _journal_state(app)}
@@ -897,7 +985,7 @@ def _journal_state(app: App) -> dict:
     and the head the app holds."""
     journal = app.journal
     reason = journal.read_only
-    return {"broken": bool(reason), "read_only": reason, "can_continue": bool(reason) and journal._started(),
+    return {"broken": bool(reason), "read_only": reason, "can_continue": bool(reason) and journal.started(),
             "head": journal.chain.head, "short": short(journal.chain.head), "seq": journal.chain.seq}
 
 
@@ -1086,32 +1174,39 @@ def _event_names(app: App, uids: set[str]) -> dict[str, str]:
     return {uid: name for uid, (name, _) in _event_facts(app, uids).items()}
 
 
-def _trail_key(app: App) -> tuple | None:
+def _trail_key(app: App, sides: Iterable[str] = ()) -> tuple | None:
     """What a full check of the journal depends on: the journal file's SHA-256, the head record kept outside the case,
-    the lines the state left out, and the breaks already found. The file's hash changes with an edit of a line that
-    leaves its length as it was; the record, when the head moves; the last two, when the check's reading of the file
-    changes. None when the file can't be read."""
+    the lines the state left out, the breaks already found, and the size and modification time of each of `sides`, the
+    side files an entry names. The file's hash changes with an edit of a line that leaves its length as it was; the
+    record, when the head moves; the next two, when the check's reading of the file changes; a side file's stamp, when
+    the file is replaced or deleted, which the chain covers but the journal file's hash doesn't. None when the file
+    can't be read."""
     journal = app.journal
     try:
         digest = sha256_file(journal.path)
     except OSError:
         return None
+    folder = journal.path.parent
     problems = tuple((p.get("line"), p["kind"]) for p in journal.problems)
-    return digest, heads.read(journal.path.parent), frozenset(journal._skip), problems
+    return (digest, heads.read(folder), journal.skipped_lines, problems,
+            tuple((name, side_stamp(folder, name)) for name in sides))
 
 
 def _trail_check(app: App) -> tuple[Check, dict | None]:
     """The journal's full check with its entries, for the trail, undo, and the export: each entry the state couldn't
     apply, or the trail can't read, is marked, so no reader of the trail stops on a changed line. The check re-reads
     and re-hashes every line, so its result is kept until _trail_key changes, and callers read it without changing
-    it. A result is kept only if the file and the head record are the same after the check as before it."""
-    key = _trail_key(app)
+    it. A result is kept only if the file, the head record, and the side files are the same after the check as when it
+    read them, and not when it found the journal's tail being written, which it can't vouch for."""
+    kept = app.trail_cache[1][0].sides if app.trail_cache else ()
+    key = _trail_key(app, kept)
     if key is not None and app.trail_cache is not None and app.trail_cache[0] == key:
         return app.trail_cache[1]
     found, record = app.journal.full_check(keep=True)
     found.entries = mark_unreadable(found.entries)
-    after = _trail_key(app)   # the breaks the check found are part of it
-    if key is not None and after is not None and after[:2] == key[:2]:
+    after = _trail_key(app, found.sides)   # the breaks the check found are part of it
+    same = key is not None and after is not None and after[:2] == key[:2] and after[-1] == tuple(found.sides.items())
+    if same and found.tail != "writing":
         app.trail_cache = (after, (found, record))
     return found, record
 
@@ -1374,7 +1469,6 @@ def api_event(app: App, query: dict) -> dict:
     # Entries made before an upgrade under an ID it couldn't place on one event, which may have meant this one
     details["unplaced"] = [{"seq": u["seq"], "id": u["id"], "others": len(u["candidates"]) - 1}
                            for u in unplaced(app.journal.state).get(uid, [])]
-    details["evidence_sha256"] = app.manifest.get(details.get("source_file", ""), "")
     details["notes"] = app.journal.state.notes.get(uid, [])
     state = app.journal.state
     details["followup"] = state.followed.get(uid)   # Followed up: {seq, at, who}, kept when the mark changes
@@ -1397,6 +1491,8 @@ def api_event(app: App, query: dict) -> dict:
         traceback.print_exc()
         details["provenance"] = {"sha256": "", "state": "error", "text": f"could not be read ({type(exc).__name__}: {exc})",
                                  "checks": 0}
+    # The intake hash the page cites, which for found output is its output's, not that of the file the event names
+    details["evidence_sha256"] = details["provenance"]["sha256"]
     try:
         details["pivots"] = guidance(details, app.identity, app.pivot_windows, app.time_window_seconds)
     except Exception as exc:   # noqa: BLE001
@@ -1414,17 +1510,44 @@ def api_event(app: App, query: dict) -> dict:
 
 
 def _provenance(app: App, details: dict) -> dict:
-    """The evidence file's hash against the intake manifest, for the Event page's one line of provenance: the hash intake
-    took, and what the case's checks since have found of the file. The re-hash each run and each full check makes
-    names the files that changed and those it couldn't read (intake.evidence_checks, overview.problem_files), so a file
-    no check names matches intake, unless a line of the check log that can't be read may have named it."""
+    """The intake hash the Event page's one line of provenance cites, and what the case's checks since have found of its
+    file (_file_check). The cited files are in `files` (export.cited_files): the event's own for a tool's run or an import,
+    and for output found in the evidence, the output its run read and hashed, which the text names. A run of found
+    output that read several files doesn't record which one an event came from, so no one hash is cited, and the state
+    is the worst among them."""
     path = details.get("source_file", "")
-    sha = app.manifest.get(path, "")
-    unreadable = any(well_formed(f["path"]) == path for f in _manifest_facts(app)["unreadable"])
+    files = cited_files(path, read_run(app.case, details.get("run_id", "")), details.get("tool_version", ""))
     stamp = _stamp(app.case.verification_path)   # read again only when a check adds to the log
     if app.checks_cache is None or app.checks_cache[0] != stamp:
         app.checks_cache = (stamp, evidence_checks(app.case))
     checks = app.checks_cache[1]
+    found = [(file, *_file_check(app, file, checks)) for file in files]
+    if files == [path]:
+        _, sha, state, text = found[0]
+    elif not files:
+        sha, state, text = "", "absent", "the run's record is gone, so the output it was read from is unknown"
+    elif len(files) == 1:
+        file, sha, state, text = found[0]
+        name = file.rsplit("/", 1)[-1]
+        text = f"of the output file {name}: {text}"
+    else:
+        worst_first = ("changed", "unreadable", "absent", "uncounted", "unchecked", "matches")
+        file, _, state, text = min(found, key=lambda check: worst_first.index(check[2]))
+        name = file.rsplit("/", 1)[-1]
+        sha = ""
+        text = (f"of the {len(files)} output files the run read: all match intake" if state == "matches"
+                else f"of the output file {name}, 1 of {len(files)} the run read: {text}")
+    return {"sha256": sha, "state": state, "text": text, "checks": checks["checks"],
+            "unreadable_lines": checks["unreadable_lines"], "files": files}
+
+
+def _file_check(app: App, path: str, checks: dict) -> tuple[str, str, str]:
+    """An evidence file's intake hash, and what the case's checks have found of it: a state and its words. The re-hash
+    each run and each full check makes names the files that changed and those it couldn't read (intake.evidence_checks,
+    overview.problem_files), so a file no check names matches intake, unless a line of the check log that can't be read
+    may have named it."""
+    sha = app.manifest.get(path, "")
+    unreadable = any(well_formed(f["path"]) == path for f in _manifest_facts(app)["unreadable"])
     changed, not_reread = problem_files(checks["problems"])
     problem = next((found for rel, found in changed.items() if well_formed(rel) == path), "")
     unread = next((found for rel, found in not_reread.items() if well_formed(rel) == path), "")
@@ -1444,7 +1567,7 @@ def _provenance(app: App, details: dict) -> dict:
         state, text = "unchecked", "the intake hash; nothing has re-checked the file since"
     else:
         state, text = "matches", "matches intake"
-    return {"sha256": sha, "state": state, "text": text, "checks": checks["checks"], "unreadable_lines": lines}
+    return sha, state, text
 
 
 def _event_clock(app: App, details: dict) -> tuple[dict | None, dict | None]:
@@ -1912,15 +2035,24 @@ def api_investigate(app: App, query: dict) -> dict:
 
     The marked events come a page at a time, `limit` of them (1 to WORKLIST_PAGE_MAX, WORKLIST_PAGE by default) from
     `offset`, with `total`, the number of them all, and `followed`, how many of all of them are ticked. The sources'
-    pending events are read for the first page only, which is the one that draws them."""
+    pending events are read for the first page only, which is the one that draws them. The events are in adjusted-time
+    order, which a host's clock offset, an alignment, a split, or a mark can change without changing `total`. Each page
+    carries `order`, a digest of the marked events' IDs, adjusted times, and hosts in that order, so a reader can tell
+    that rows read earlier, or an offset taken from them, no longer match the events. It differs after a mark or unmark
+    that changes which events are listed, after a change of time, whether or not it moves one event past another, and
+    after a split that renames a host. It stays after a tag, a rule, a decision, a tick, or a mark that changes only an
+    event's label. The page and its digest come from one reading of the tables."""
     offset, limit = _worklist_page(query)
     con = app.reader()
     state = app.journal.state
-    flagged = flagged_uids(con)
-    total = len(flagged)
-    offset = min(offset, total)
-    items = investigate(con, offset, limit)
-    followed = sum(1 for uid in flagged if uid in state.followed)
+    with transaction(con):   # a rewrite that commits meanwhile shows on the next page, not between the order and the rows
+        flagged = flagged_events(con)
+        total = len(flagged)
+        offset = min(offset, total)
+        items = investigate(con, offset, limit)
+    lines = "\n".join(f"{uid} {ts} {host}" for uid, ts, host in flagged)
+    order = hashlib.blake2b(lines.encode(), digest_size=8).hexdigest()
+    followed = sum(1 for uid, _, _ in flagged if uid in state.followed)
     for item in items:
         ev = item.pop("event")
         item["rows"] = worklist_rows(ev, app.identity, app.pivot_windows, app.time_window_seconds)
@@ -1933,7 +2065,7 @@ def api_investigate(app: App, query: dict) -> dict:
         for rule in payload["rules"]:
             if rule.get("pending"):
                 rule.update(pending_source_events(con, rule["id"], cap=MAX_MARK_TARGETS))
-    return {"items": items, "total": total, "offset": offset, "limit": limit, "followed": followed, **payload}
+    return {"items": items, "total": total, "offset": offset, "limit": limit, "followed": followed, "order": order, **payload}
 
 
 WORKLIST_PAGE = 200   # the marked events To investigate lists at first, and each time its button adds more
@@ -2016,7 +2148,7 @@ def api_overview(app: App, query: dict) -> dict:
         names = page_names()
         result = case_overview(
             app.reader(), identity=app.identity, state=app.journal.state, report=app.suggestion_report,
-            journal_path=app.journal.path, runs=runs, run_gaps=run_gaps(runs, specs),
+            journal_path=app.journal.path, runs=runs, specs=specs, run_gaps=run_gaps(runs, specs),
             manifest=read_manifest(case) if case.manifest_path.exists() else [],
             unidentified=sum(1 for e in entries if e.artifact is None and not e.error), orphans=app.orphans,
             checks=evidence_checks(case), tool_names=names["tool_names"], artifact_names=names["artifact_names"],
@@ -2100,12 +2232,17 @@ def api_export(app: App, body: dict) -> dict:
 
 def _rehash_evidence(app: App) -> tuple[tuple[int, int] | None, EvidenceCheck | None]:
     """The evidence re-hash a report states, and the manifest's stamp it was made against; no re-hash without a manifest.
-    It runs on the caller's thread under the App's check lock only, so a marking request doesn't wait for the hashing."""
+    manifest.jsonl is compared with its record first, under a short hold of the journal after a catch-up, so a record
+    the command line appended beside the server counts (intake.recorded_manifest). Without a manifest the journal is
+    caught up too, so the report names a missing manifest that such a record names as missing. The re-hash runs on the
+    caller's thread under the App's check lock only, so a marking request doesn't wait for the hashing."""
     stamp = _stamp(app.case.manifest_path)
     if stamp is None:
+        app.journal.refresh()
         return None, None
+    manifest = recorded_manifest(app.case, app.journal)
     with app.check_lock:
-        return stamp, check_files(app.case, reason=REPORT_CHECK)
+        return stamp, check_files(app.case, reason=REPORT_CHECK, manifest=manifest)
 
 
 def api_report(app: App, body: dict) -> dict:
@@ -2114,10 +2251,14 @@ def api_report(app: App, body: dict) -> dict:
     marking request would otherwise wait behind for as long as the hashing takes. Then, under the lock, so nothing it
     prints, marks, notes, hosts, findings, or the summary, is newer or older than the head it prints, which comes from the
     journal whose state it reads, after a second full check that refuses on a break made meanwhile. Evidence added while
-    it hashed changes the manifest, so the re-hash is made again under the lock, which only that case waits behind."""
+    it hashed changes the manifest, so the re-hash is made again under the lock, which only that case waits behind. A
+    run.json this build can't read refuses the report by its file's name before the evidence is hashed, so no re-hash is
+    recorded for a report that is never written; the records themselves are read again with the report's text, under the
+    lock, so a run that finished meanwhile is in it."""
     app.journal.full_check()
     _refuse_on_break(app)
     extra, note, filters = _export_filter(app, body)
+    read_runs(app.case)
     stamp, checked = _rehash_evidence(app)
     with app.lock:
         found, record = app.journal.full_check()
@@ -2431,9 +2572,12 @@ def api_import(app: App, body: dict) -> dict:
 
 
 def api_evidence_add(app: App, body: dict) -> dict:
-    """Add new evidence: hash and list the files copied into the evidence folder since intake."""
+    """Add new evidence: hash and list the files copied into the evidence folder since intake. On a case whose journal
+    records the manifest, add_new runs the journal's append checks after a catch-up before any file is hashed, so a
+    broken chain is refused first, one made while the app has the case open included, since the journal would refuse
+    the record."""
     with app.lock:
-        summary = add_new(app.case)
+        summary = add_new(app.case, app.journal)
         app.manifest = manifest_hashes(app.case)
     return {"files": summary.files, "bytes": summary.total_bytes, "by_artifact": summary.by_artifact,
             "errors": summary.errors, "missing": summary.missing, "links": summary.links}

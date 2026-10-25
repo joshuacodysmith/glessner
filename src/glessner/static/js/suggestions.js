@@ -1,7 +1,7 @@
 import { askGroupDecision } from './confirm.js';
 import { api, codePrefix, el, fmtUs, markBadge, S, setStatus } from './core.js';
 import { draw } from './draw.js';
-import { button, claimDetails, decide, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, decide, pageAction, pageRead, setPage } from './event_page.js';
 import { jumpTo, listFind } from './pages.js';
 
 // ---------- Suggestions page: one source's pending suggestions, grouped ----------
@@ -16,6 +16,7 @@ export const shownSuggestions = () => shown;
 // `limit` lists more than the first 200 of each group, for the confirm's "Show all N first".
 export async function showSuggestions(source, groupBy = '', limit = 0) {
   const latest = claimDetails();   // a page asked for after it keeps the panel
+  const drew = pageRead();
   let res;
   try { res = await api(`/api/pending?source=${encodeURIComponent(source)}${groupBy ? `&group_by=${groupBy}` : ''}${limit ? `&limit=${limit}` : ''}`); }
   catch (err) { setStatus(err.message); return; }
@@ -24,10 +25,12 @@ export async function showSuggestions(source, groupBy = '', limit = 0) {
   shown = { source, groupBy, limit };
   const loadedAt = new Date();   // what the confirm names as when the page counted
   const value = res.groups.length ? res.groups[0].events[0].value : '';
+  const key = `suggestions:${source}`;   // regrouping is the same page
   const refresh = () => showSuggestions(source, groupBy, limit);
   const act = async (decision, opts) => {
+    const done = pageAction(key);
     await decide(decision, source, opts.uids || null, { ...opts, fromEvent: false });
-    if (showingPage(`suggestions:${source}`)) refresh();   // not over a page asked for while the decision was made
+    done();   // not over a page asked for while the decision was made
   };
   // Accept all, Reject all, and a group's Accept N or Reject N ask first: the question names the exact events the
   // page counted when it loaded, and the decision then covers those, not whatever is pending at the click
@@ -96,5 +99,6 @@ export async function showSuggestions(source, groupBy = '', limit = 0) {
     el('p', { class: 'muted' }, `Accept marks the events ${value}. Reject leaves them unreviewed and stops ${source} suggesting them; ` +
        'the Event page can restore a rejected suggestion. Accept all, Reject all, and a group\'s buttons ask first. Click an event to open it.'),
     ...(groups.length ? groups : [el('p', {}, 'Nothing is pending from this source.')]),
-  ], { key: `suggestions:${source}`, title: `${source} suggestions`, reopen: refresh });   // regrouping is the same page
+  ], { key, title: `${source} suggestions`, reopen: refresh });
+  drew(key, refresh);
 }

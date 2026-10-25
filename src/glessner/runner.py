@@ -17,20 +17,20 @@ import time
 from contextlib import closing, suppress
 from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import duckdb
 
 from .case import CASE_FILE, Case, CaseError, check_outside_evidence, write_atomically
-from .events import connect, load
-from .intake import NOT_IN_MANIFEST, current_entries, sha256_file, verify, walk_evidence
+from .events import SeenSources, connect, load
+from .intake import NOT_IN_MANIFEST, current_entries, placeholders_among, sha256_file, verify, walk_evidence
 from .journal import host_layout
 from .long_paths import long_path
-from .parsers import LOCAL_TIME, PARSERS, ParseContext
+from .parsers import COUNTS_SKIPPED, LOCAL_TIME, PARSERS, ParseContext
 from .parsers.common import LOCAL_TIME_NOTE, SKIPPED_NOTE
 from .parsers.sbecmd import MESSAGES
 from .timezones import ZoneError, fmt_offset, host_timezones, resolve_zone
-from .tools import DetectedTool, ToolSpec, load_registry, rules_file, tool_env
+from .tools import DetectedTool, ToolSpec, load_registry, rules_file, rules_label, rules_version, tool_env, tool_files
 from .version import build_id
 
 RUN_FILE = "run.json"
@@ -92,15 +92,42 @@ class RunRecord:
     input_root: str = ""
     dotnet_root: str = ""                    # the private .NET runtime the tool ran on, if any
     from_output: bool = False                # loaded a tool's output found in the evidence, not run
-    rules: str = ""                          # the rule set the tool ran with, such as "ET Open 11310"
+    # The rule or map set the tool ran with, named as the run starts (tools.rules_label), such as "Hayabusa rules
+    # fffbdd1, files 7c30c465" or "ET Open 11310". "" for none, and, in a case below format 4, for each tool not named
+    # by its rules block's version file, as Suricata is (tools.rules_version)
+    rules: str = ""
     # The host's zone a load read local times in (parsers.LOCAL_TIME, runner.host_zone), so a rebuild reads them the
     # same way after the zone changes; None when the host had none or the output needs none
     zone: dict | None = None
+    # Case format 4's keys (FORMAT_4_KEYS), which a case below format 4 never fills. The SHA-256 of the files in the
+    # tool's folder that the run names (tools.tool_files): its executable and the .dll of the same name, what its
+    # arguments name there, its rules block's version file, and the files and folders its registry entry lists, by
+    # their paths there, a folder's with a trailing /. Other files the tool loads from its folder, such as further
+    # libraries, are left out. {} for a builtin tool, and None for an import, found output, or a run made before the case
+    # was at format 4
+    tool_files: dict[str, str] | None = None
+    # The rows or lines the parser made no event of, for a parser that counts them (parsers.COUNTS_SKIPPED); a rebuild
+    # counts them for every run it loads
+    rows_skipped: int | None = None
+    # A check of the tool's files against a list of their hashes: read and written back as it is, and filled by
+    # nothing in this build
+    tool_check: dict | None = None
 
 
 # The keys a run.json may hold, which are the record's fields, and those it must hold, which have no default
 RECORD_KEYS = frozenset(f.name for f in fields(RunRecord))
 REQUIRED_KEYS = frozenset(f.name for f in fields(RunRecord) if f.default is MISSING and f.default_factory is MISSING)
+# The keys case format 4 added, which run.json leaves out while None (_write_record), so a case below format 4, which
+# never fills them (records_format_4), keeps the records its own format's builds read. read_runs checks each one's
+# shape by its name (_misshapen), so a key added here needs a check there
+FORMAT_4_KEYS = ("tool_files", "rows_skipped", "tool_check")
+
+
+def records_format_4(case: Case) -> bool:
+    """Whether the case's runs record format 4's keys and name their rule set by tools.rules_label: those of a case at
+    format 4 or later. A case kept below it, as one whose journal is read-only is, is read by builds that refuse a key
+    they don't know."""
+    return case.settings.case_format >= 4
 
 
 def plan_runs(case: Case, tool: DetectedTool, hosts: list[str] | None = None) -> list[RunPlan]:
@@ -244,25 +271,34 @@ def check_host_folder(case: Case, plan: RunPlan) -> None:
     """Refuse a run of a tool that lists the host's folder itself (reads_host_folder) when the folder holds what intake
     didn't hash: a file the manifest doesn't list, which the tool would load though no evidence check covers it, a
     link, which the tool may follow out of the evidence, or a cloud placeholder, which the tool would download by
-    reading it. The folder is listed as intake lists it (intake.walk), from its extended-length path, so a name that is
-    long or ends in a dot is listed as it is."""
+    reading it. A placeholder that intake hashed before it became one is reported apart from one that intake couldn't
+    read. The folder is listed as intake lists it (intake.walk), from its extended-length path, so a name that is long
+    or ends in a dot is listed as it is."""
     spec = plan.tool.spec
     if not reads_host_folder(spec):
         return
     host = "" if case.settings.single_host else plan.host
     prefix = f"{host}/" if host else ""
-    known = {e.path for e in current_entries(case)}
-    links, placeholders = [], []
-    listing = walk_evidence(long_path(case.evidence, host), links, placeholders=placeholders)
-    new = [path for rel in listing if (path := prefix + rel) not in known]
-    if new or links or placeholders:
-        raise RunError(_unhashed(spec, plan.host, new, [prefix + link for link in links],
-                                 [prefix + path for path in placeholders]))
+    entries = {e.path: e for e in current_entries(case)}
+    links, found = [], []
+    listing = walk_evidence(long_path(case.evidence, host), links, placeholders=found)
+    new = [path for rel in listing if (path := prefix + rel) not in entries]
+    placeholders, became = [], []   # intake never hashed the first; it hashed the second before they became ones
+    for rel in found:
+        entry = entries.get(prefix + rel)
+        (became if entry and not entry.error else placeholders).append(prefix + rel)
+    if new or links or placeholders or became:
+        raise RunError(_unhashed(spec, plan.host, new, [prefix + link for link in links], placeholders, became))
 
 
-def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str], placeholders: list[str]) -> str:
-    """Why check_host_folder refused a run, with what the analyst can do about it."""
-    text = f"{spec.name} wasn't run on {host}: it lists the host's folder itself, which holds what intake didn't hash."
+def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str], placeholders: list[str],
+              became: list[str]) -> str:
+    """Why check_host_folder refused a run, with what the analyst can do about it: the files the manifest doesn't list,
+    the links, and the placeholders intake never hashed, then `became`, the placeholders that intake hashed before they
+    became ones."""
+    unhashed = bool(new or links or placeholders)
+    text = f"{spec.name} wasn't run on {host}: it lists the host's folder itself, which holds " + (
+        "what intake didn't hash." if unhashed else "files that intake hashed before they became cloud placeholders.")
     if new:
         files, them = ("1 file", "it") if len(new) == 1 else (f"{len(new):,} files", "them")
         text += (f" {files} the intake manifest doesn't list: {_paths(new)}. Hash {them} with Add new evidence, or "
@@ -272,12 +308,47 @@ def _unhashed(spec: ToolSpec, host: str, new: list[str], links: list[str], place
         text += (f" {what}, which the tool may follow out of the evidence: {_paths(links)}. Remove each link, or "
                  "replace it with a copy of the files it points to and add those.")
     if placeholders:
-        what = ("1 cloud placeholder, whose content isn't on this disk" if len(placeholders) == 1
-                else f"{len(placeholders):,} cloud placeholders, whose content isn't on this disk")
-        text += (f" {what}, which the tool would download by reading {'it' if len(placeholders) == 1 else 'them'}: "
-                 f"{_paths(placeholders)}. Make the folder available on this disk and start a new case from it, or "
-                 f"remove {'it' if len(placeholders) == 1 else 'them'}.")
+        text += f" {cloud_placeholders_text(placeholders)}"
+    if became:
+        if unhashed:
+            text += " It also holds files that intake hashed before they became cloud placeholders."
+        text += f" {cloud_placeholders_text(became, hashed=True)}"
     return text
+
+
+def cloud_placeholders_text(paths: list[str], reader: str = "the tool", hashed: bool = False) -> str:
+    """What a refusal says of cloud placeholders: how many there are, that their content isn't on this disk, that `reader`
+    would download them by reading them, their paths, and what the analyst can do. For `hashed` placeholders, which
+    intake hashed before they became ones, the advice is to make them available again, since intake's hash covers
+    them; otherwise it is to start a new case from the folder once it is on this disk, or to remove them."""
+    one = len(paths) == 1
+    them = "it" if one else "them"
+    what = "1 cloud placeholder" if one else f"{len(paths):,} cloud placeholders"
+    advice = (f"Make {them} available on this disk and try again; intake's hash still covers {them}." if hashed
+              else f"Make the folder available on this disk and start a new case from it, or remove {them}.")
+    return f"{what}, whose content isn't on this disk, which {reader} would download by reading {them}: {_paths(paths)}. {advice}"
+
+
+def evidence_read(case: Case, plan: RunPlan) -> list[str]:
+    """The evidence files a run of the plan has its tool read, without repeats: its inputs, the host's file of each
+    ToolSpec.related entry (related_files), the files beside its inputs that it reads (read_beside), and, for a tool that
+    works on copies, the files it copies with its inputs (_copy_also)."""
+    spec = plan.tool.spec
+    paths = [*plan.inputs, *read_beside(case, plan)]
+    for entry in spec.related:
+        paths += related_files(case, plan, entry["artifact"])
+    if spec.work_on_copies:
+        paths += _copy_also(case, plan)
+    return list(dict.fromkeys(paths))
+
+
+def check_not_placeholders(case: Case, plan: RunPlan, paths: list[str]) -> None:
+    """Refuse a run that would read a file that is a cloud placeholder now but was an ordinary file when intake hashed
+    it: the tool would download it, and no record would show the download. It reads the files' attributes and opens no
+    file."""
+    if placeholders := placeholders_among(case, paths):
+        raise RunError(f"{plan.tool.spec.name} wasn't run on {plan.host}: it reads files that intake hashed before they "
+                       f"became cloud placeholders. {cloud_placeholders_text(placeholders, hashed=True)}")
 
 
 def check_selected(plan: RunPlan) -> None:
@@ -301,10 +372,14 @@ def _paths(paths: list[str]) -> str:
 
 def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> RunRecord:
     """Run a tool on its plan's evidence, check its output and the evidence, load the output, and record it all in the
-    run's folder. The evidence check covers the run's inputs and the files the tool reads beside them (read_beside).
+    run's folder. The evidence check covers the run's inputs and the files the tool reads beside them (read_beside). In
+    a case at format 4 the record holds the SHA-256 of the tool's files (tools.tool_files), with a note naming any link
+    in their folders that the hashes leave out, and the rule set as named when the run starts (tools.rules_label).
     Refused before anything is made: RunError when the tool can't run here, would read none of its inputs, as its name
-    patterns select files (check_selected), has arguments that can't be filled, or has a host folder that holds what
-    intake didn't hash (check_host_folder); CaseError for a run folder that can't be made safely (_new_run_folder)."""
+    patterns select files (check_selected), has arguments that can't be filled, has a host folder that holds what
+    intake didn't hash, or a file that became a cloud placeholder after it (check_host_folder), would read a file that
+    became a cloud placeholder after intake (check_not_placeholders), or, in a case at format 4, has a file
+    tools.tool_files can't hash; CaseError for a run folder that can't be made safely (_new_run_folder)."""
     spec = plan.tool.spec
     if plan.tool.missing:
         raise RunError(f"{spec.name} can't run here: {plan.tool.missing}.")
@@ -314,6 +389,18 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
     copies_root = folder / "input" if spec.work_on_copies else None
     argv = build_argv(case, plan, output_dir, options or {}, copies_root)   # validate before creating anything
     check_host_folder(case, plan)
+    check_not_placeholders(case, plan, evidence_read(case, plan))
+    hashes, links = None, []
+    if records_format_4(case):
+        try:
+            hashes = tool_files(plan.tool, argv, links)
+        except OSError as exc:
+            raise RunError(f"{spec.name} wasn't run on {plan.host}: one of its files that a run records by SHA-256 "
+                           f"couldn't be hashed: {exc}") from exc
+        # Named now rather than at detection, which the server keeps, so a rule set updated since is named as it runs
+        rules = rules_label(spec, plan.tool.executable, hashes)
+    else:
+        rules = rules_version(spec, plan.tool.executable)
     output_dir.mkdir(parents=True)
     related, notes = [], []
     for rel in spec.related:
@@ -333,12 +420,17 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         notes.append(f"{_files(len(plan.left_out))} that intake identified for {spec.name} {'was' if one else 'were'} not "
                      f"read: it reads only files named {' or '.join(spec.selects)} in a folder, and "
                      f"{'this one is' if one else 'these are'} named otherwise: {_paths(list(plan.left_out))}.")
+    if links:
+        what = "a link in its folder points" if len(links) == 1 else f"{len(links):,} links in its folder point"
+        notes.append(f"The SHA-256s recorded for {spec.name}'s files don't cover what {what} to, which {spec.name} may "
+                     f"read: {_paths(links)}.")
     record = RunRecord(run_id=run_id, tool=spec.id, tool_version=plan.tool.version,
                        executable=str(plan.tool.executable), host=plan.host, argv=argv,
                        cwd=str(folder if spec.run_in_run_folder else plan.tool.executable.parent),
                        inputs=[*plan.inputs, *related], notes=notes,
                        started_utc=_utc_now(), parser=spec.parser or "", dotnet_root=plan.tool.dotnet_root,
-                       rules=plan.tool.rules, evidence_root=str(case.evidence), input_root=str(copies_root or ""))
+                       rules=rules, evidence_root=str(case.evidence), input_root=str(copies_root or ""),
+                       tool_files=hashes)
     if copies_root is not None:
         try:
             record.working_copies = _make_copies(case, plan, copies_root)
@@ -408,24 +500,59 @@ def load_output(case: Case, record: RunRecord, folder: Path, layout: dict[str, d
     routes = (host_layout(case) if layout is None else layout).get(record.host)
     result = load(case.db_path, parser(ctx), host=record.host, tool=record.tool, tool_version=record.tool_version,
                   run_id=record.run_id, replaces_sources=record.inputs, staging_dir=folder,
-                  replace_seen_sources=record.from_output, routes=routes)
+                  replace_seen_sources=seen_sources(case, record) if record.from_output else None, routes=routes)
     record.loaded_rows = result.rows
     record.replaced_rows = result.replaced
     record.rows_without_time = result.without_time
     record.load_seconds = round(time.perf_counter() - t0, 2)
+    if record.parser in COUNTS_SKIPPED and records_format_4(case):
+        record.rows_skipped = sum(ctx.skipped)
     # Replaced on each load, so a rebuild doesn't repeat them: the parser's own, such as the offset Autoruns' local
     # times were read at, which it notes only when it read one, and the count of events without a
     # time, since nothing on the page shows one: Autoruns entries without one mustn't vanish silently. Also the count
-    # of lines or rows a parser made no event of (SKIPPED_NOTE).
+    # of lines or rows a parser made no event of (SKIPPED_NOTE), and of a found output's rows left out because a run of
+    # the tool loaded the files they name itself (READ_ITSELF_NOTE).
     record.notes = [n for n in record.notes
-                    if not (n.startswith((LOCAL_TIME_NOTE, SKIPPED_NOTE)) or n.endswith(NO_TIME_NOTE))]
+                    if not (n.startswith((LOCAL_TIME_NOTE, SKIPPED_NOTE)) or n.endswith((NO_TIME_NOTE, READ_ITSELF_NOTE)))]
     record.notes += ctx.notes
     if result.without_time:
         n = result.without_time
         record.notes.append(f"{n:,} {'event has' if n == 1 else 'events have'} {NO_TIME_NOTE}")
+    if result.left_out:
+        n, files = sum(result.left_out.values()), sorted(result.left_out)
+        record.notes.append(f"{n:,} {'row' if n == 1 else 'rows'} naming {_paths(files)} {'was' if n == 1 else 'were'} "
+                            f"not loaded: a run of this tool on the host read {'the file' if len(files) == 1 else 'each file'} "
+                            f"itself, {READ_ITSELF_NOTE}")
 
 
 NO_TIME_NOTE = "no time: off the timeline, and out of search and exports."
+READ_ITSELF_NOTE = "and that run's events stand for it."
+
+
+def evidence_root_name(case: Case) -> str:
+    """The evidence folder's extended-length path with forward slashes, the root that a load of found output under a link
+    wrote in front of a file's evidence-relative path (events.names_by_root)."""
+    return PureWindowsPath(str(long_path(case.evidence))).as_posix()
+
+
+def seen_sources(case: Case, record: RunRecord) -> SeenSources:
+    """What a load of found output replaces (events.SeenSources), from the case's run records: only rows that loads of
+    found output of its tool on its host put there, this run's own included, never those of a tool's run or an import.
+    This load reads again every file of a load that read no other, so that load's rows are replaced whole, whatever
+    files they name. The other loads' rows are replaced for a file this load reads, or one its events name under the
+    host's folder. Its events naming a file that a run of the tool on the host loaded from the evidence itself are left
+    out. That goes by the rows the database holds, not by the run's inputs: a run that a rebuild left out holds none,
+    nor does a run for an input its tool skipped. A rebuild loads the runs in the order they were made, so a load finds
+    the rows of the tool's runs made before it that the rebuild loaded, and a tool's run made after it replaces the
+    found rows naming its inputs, as it replaces its own on a rerun."""
+    runs = [r for r in read_runs(case) if (r.tool, r.host) == (record.tool, record.host)]
+    found = [r for r in runs if r.from_output]
+    inputs = set(record.inputs)
+    return SeenSources(runs=frozenset({record.run_id, *(r.run_id for r in found)}),
+                       superseded=frozenset({record.run_id, *(r.run_id for r in found if set(r.inputs) <= inputs)}),
+                       folder="" if case.settings.single_host else record.host,
+                       direct=frozenset(r.run_id for r in runs if not r.from_output),
+                       inputs={r.run_id: tuple(r.inputs) for r in (*found, record)}, root=evidence_root_name(case))
 
 
 def parse_context(case: Case, record: RunRecord, folder: Path, former: int = 0) -> ParseContext:
@@ -446,24 +573,52 @@ def parse_context(case: Case, record: RunRecord, folder: Path, former: int = 0) 
 
 
 def read_runs(case: Case) -> list[RunRecord]:
-    """Every run's record, oldest first. A run.json that isn't a JSON object, lacks a key every record has, or has a key
-    RunRecord doesn't declare (written by a newer build) is refused by name, as open_case refuses a setting, rather than
-    failing as a TypeError."""
-    records = []
-    for path in sorted(case.runs_folder.glob(f"*/{RUN_FILE}")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        run = path.parent.name
-        if not isinstance(data, dict):
-            raise CaseError(f"{path} isn't a JSON object, so run {run} can't be read. "
-                            "Restore the file from a copy of the case.")
-        if unknown := sorted(set(data) - RECORD_KEYS):
-            raise CaseError(f"{path} has keys this build of glessner ({build_id()}) doesn't read: {', '.join(unknown)}. "
-                            "A newer build may have written them; open the case with that build.")
-        if missing := sorted(REQUIRED_KEYS - set(data)):
-            raise CaseError(f"{path} lacks the {'key' if len(missing) == 1 else 'keys'} {', '.join(missing)} that every "
-                            f"run's record has, so run {run} can't be read. Restore the file from a copy of the case.")
-        records.append(RunRecord(**data))
-    return records
+    """Every run's record, oldest first. A run.json that isn't a JSON object, lacks a key every record has, has a key
+    RunRecord doesn't declare (written by a newer build), or has a format 4 key that is neither null nor of its shape
+    (_misshapen) is refused by name, as open_case refuses a setting, rather than failing as a TypeError on a page or
+    carrying the value into a rewrite."""
+    return [_read_record(path) for path in sorted(case.runs_folder.glob(f"*/{RUN_FILE}"))]
+
+
+def read_run(case: Case, run_id: str) -> RunRecord | None:
+    """One run's record, read and checked as read_runs reads each, or None when the case has no run by that ID. An ID
+    that isn't a single folder name in the runs folder names no run."""
+    if not run_id or run_id in (".", "..") or Path(run_id).name != run_id:
+        return None
+    path = case.runs_folder / run_id / RUN_FILE
+    return _read_record(path) if path.is_file() else None
+
+
+def _read_record(path: Path) -> RunRecord:
+    """A run.json's record, refused by name as read_runs says."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    run = path.parent.name
+    if not isinstance(data, dict):
+        raise CaseError(f"{path} isn't a JSON object, so run {run} can't be read. "
+                        "Restore the file from a copy of the case.")
+    if unknown := sorted(set(data) - RECORD_KEYS):
+        raise CaseError(f"{path} has keys this build of glessner ({build_id()}) doesn't read: {', '.join(unknown)}. "
+                        "A newer build may have written them; open the case with that build.")
+    if missing := sorted(REQUIRED_KEYS - set(data)):
+        raise CaseError(f"{path} lacks the {'key' if len(missing) == 1 else 'keys'} {', '.join(missing)} that every "
+                        f"run's record has, so run {run} can't be read. Restore the file from a copy of the case.")
+    if misshapen := _misshapen(data):
+        raise CaseError(f"{path} has {misshapen}, so run {run} can't be read. Restore the file from a copy of the case.")
+    return RunRecord(**data)
+
+
+def _misshapen(data: dict) -> str:
+    """The first format 4 key in a run.json that is neither null nor of its shape, described, or "": tool_files is an
+    object of paths to SHA-256s, rows_skipped an integer from 0, and tool_check an object."""
+    files, skipped, check = data.get("tool_files"), data.get("rows_skipped"), data.get("tool_check")
+    if files is not None and not (isinstance(files, dict)
+                                  and all(isinstance(k, str) and isinstance(v, str) for k, v in files.items())):
+        return "a tool_files that isn't a JSON object of paths to SHA-256s"
+    if skipped is not None and (isinstance(skipped, bool) or not isinstance(skipped, int) or skipped < 0):
+        return "a rows_skipped that isn't a whole number from 0"
+    if check is not None and not isinstance(check, dict):
+        return "a tool_check that isn't a JSON object"
+    return ""
 
 
 def rebuild(case: Case, progress=None, report=None) -> list[RunRecord]:
@@ -520,7 +675,8 @@ def _unfinished(record: RunRecord) -> RunRecord:
     """A run's record as a rebuild of a case whose events database is missing or empty leaves it until the rebuild ends:
     no rows, and a note saying why, which the Tools page and the overview's Gaps show as its reason."""
     notes = [n for n in record.notes if not n.endswith(UNFINISHED_NOTE)]
-    return replace(record, loaded_rows=0, notes=[*notes, f"Rebuild at {_utc_now()}{LEFT_OUT}{UNFINISHED_NOTE}"])
+    return replace(record, loaded_rows=0, rows_skipped=None,
+                   notes=[*notes, f"Rebuild at {_utc_now()}{LEFT_OUT}{UNFINISHED_NOTE}"])
 
 
 def _refuse_held(case: Case) -> None:
@@ -568,6 +724,50 @@ def own_inputs(record: RunRecord, specs: dict[str, ToolSpec]) -> tuple[str, ...]
     return tuple(sorted(record.inputs))
 
 
+RULES_NOT_RECORDED = "rules not recorded"
+
+
+def held_runs(runs: list[RunRecord], spec: ToolSpec, specs: dict[str, ToolSpec]) -> dict[tuple, RunRecord]:
+    """The latest successful run of a tool for each host and, for a tool that runs once per file, each file: the runs
+    whose events the case holds, a load of the tool's output found in the evidence counting as a run. WxTCmd's runs on a
+    host's Timeline databases each hold their own, so the host's last run alone doesn't count them. A tool that reads the
+    host's folder replaces its earlier run's events, even when Add new evidence gave the later run more files, so that
+    run counts alone. `runs` are read_runs', oldest first."""
+    held: dict[tuple, RunRecord] = {}
+    for record in runs:
+        if record.tool == spec.id and record.status == "ok":
+            held[(record.host, own_inputs(record, specs) if spec.input == "each_file" else ())] = record
+    return held
+
+
+def rules_text(record: RunRecord, specs: dict[str, ToolSpec]) -> str:
+    """The rule or map set a run used, as the pages name it: its label. A run of a tool whose registry entry has a
+    rules_label, made without tool_files, which only a case at format 4 or later records, has none to name and reads
+    RULES_NOT_RECORDED. A load of found output, an import, a tool without a rules_label, and a run whose rules folder
+    gave no label read ""."""
+    if record.rules:
+        return record.rules
+    spec = specs.get(record.tool)
+    unrecorded = spec is not None and spec.rules_label and not record.from_output and record.tool_files is None
+    return RULES_NOT_RECORDED if unrecorded else ""
+
+
+def rule_sets(records: list[RunRecord], specs: dict[str, ToolSpec]) -> list[str]:
+    """What `records` used (rules_text), each named once, in the order of the runs."""
+    return list(dict.fromkeys(text for record in sorted(records, key=lambda r: r.run_id)
+                              if (text := rules_text(record, specs))))
+
+
+def rows_skipped_by_host(runs: list[RunRecord], specs: dict[str, ToolSpec]) -> dict[str, int]:
+    """The rows or lines the held runs (held_runs) of every registry tool skipped, summed by the host folder they ran on.
+    An import adds nothing: it can load several hosts in one run, and the registry doesn't name it."""
+    skipped: dict[str, int] = {}
+    for spec in specs.values():
+        for (host, _), record in held_runs(runs, spec, specs).items():
+            skipped[host] = skipped.get(host, 0) + (record.rows_skipped or 0)
+    return skipped
+
+
 def run_problems(case: Case, record: RunRecord, reason: str) -> tuple[list[str], list[str]]:
     """What a run's load would read that differs from its record: its evidence files' hashes for an import or a load of
     output found in the evidence, which read evidence files again rather than the run's own output, and for found output
@@ -591,24 +791,40 @@ def _reload(case: Case, record: RunRecord, layout: dict[str, dict[str, str]], re
     """Load one run's output again into the case's database, after checking it (run_problems), and add a note to its
     record on what the check found, without writing the record."""
     folder = case.runs_folder / record.run_id
-    problems, unhashed = run_problems(case, record, f"rebuild reads {record.run_id}")
-    record.notes = [n for n in record.notes if not n.endswith((UNHASHED_NOTE, UNFINISHED_NOTE))]
+    problems, unchecked = run_problems(case, record, f"rebuild reads {record.run_id}")
+    record.notes = [n for n in record.notes if not n.endswith((UNHASHED_NOTE, UNLISTED_NOTE, UNFINISHED_NOTE))]
     if problems:
-        record.loaded_rows = 0
+        record.loaded_rows, record.rows_skipped = 0, None
         note = f"Rebuild at {_utc_now()}{LEFT_OUT}{'; '.join(problems)}"
     else:
         load_output(case, record, folder, layout)
-        note = (f"Rebuild at {_utc_now()}: {len(unhashed):,} output {'file was' if len(unhashed) == 1 else 'files were'}"
-                f" loaded unchecked ({', '.join(unhashed[:10])}{', and more' if len(unhashed) > 10 else ''}): "
-                f"{UNHASHED_NOTE}") if unhashed else ""
+        note = _unchecked_note(record, unchecked)
     if note:
         record.notes = [*record.notes, note]
         if report:
             report(record, note)
 
 
+def _unchecked_note(record: RunRecord, files: list[str]) -> str:
+    """A rebuild's note on the files its load read without a check, or "" when there are none. For a load of found
+    output they are the files its parser reads beside the output that the manifest doesn't list (companions); for a
+    tool's run, the output files the run never hashed."""
+    if not files:
+        return ""
+    one = len(files) == 1
+    named = f"{', '.join(files[:10])}{', and more' if len(files) > 10 else ''}"
+    if record.from_output:
+        return (f"Rebuild at {_utc_now()}: {'1 file' if one else f'{len(files):,} files'} beside the output "
+                f"{'was' if one else 'were'} read unchecked, since the manifest doesn't list {'it' if one else 'them'} "
+                f"({named}). {UNLISTED_NOTE}")
+    return (f"Rebuild at {_utc_now()}: {len(files):,} output {'file was' if one else 'files were'} loaded unchecked "
+            f"({named}): {UNHASHED_NOTE}")
+
+
 # The end of a rebuild's note on the output files an older run never hashed
 UNHASHED_NOTE = "the run recorded no hash for them."
+# The end of its note on the files beside found output that the manifest doesn't list
+UNLISTED_NOTE = "Add new evidence lists such files, so the next rebuild checks them."
 # The end of the note a rebuild of a case with no events database, such as a copy's first, gives each run it loads
 # until it finishes
 UNFINISHED_NOTE = "the case has no events database until a rebuild finishes. Rebuild the case to load this run."
@@ -739,15 +955,21 @@ def host_zone(case: Case, host: str) -> dict | None:
         return None
 
 
+def _copy_also(case: Case, plan: RunPlan) -> list[str]:
+    """The host's files that a tool working on copies has copied beside its inputs (ToolSpec.copy_also), such as a
+    database's log files, other than the inputs themselves."""
+    found = (e.path for e in current_entries(case)
+             if (case.host_of(e.path) == plan.host and _matches(plan.tool.spec.copy_also, e.artifact, e.detail)
+                 and e.path not in plan.inputs))
+    return list(dict.fromkeys(found))
+
+
 def _make_copies(case: Case, plan: RunPlan, root: Path) -> list[str]:
     """Copy the run's inputs, and the host's files named by copy_also, to root in the evidence layout. Each copy
-    must match its intake hash, so the tool reads the evidence as it was taken in."""
-    spec = plan.tool.spec
-    wanted = list(plan.inputs)
-    for e in current_entries(case):
-        if (case.host_of(e.path) == plan.host and _matches(spec.copy_also, e.artifact, e.detail)
-                and e.path not in wanted):
-            wanted.append(e.path)
+    must match its intake hash, so the tool reads the evidence as it was taken in. RunError, with nothing copied, when
+    one of the files is a cloud placeholder now, since copying it would download it."""
+    wanted = [*plan.inputs, *_copy_also(case, plan)]
+    check_not_placeholders(case, plan, wanted)
     hashes = {e.path: e.sha256 for e in current_entries(case)}
     for rel in wanted:
         dst = long_path(root, rel)   # the evidence's names as they are, under the run folder
@@ -893,13 +1115,17 @@ def _new_run_id(case: Case, tool_id: str, host: str) -> str:
 
 
 def _write_record(folder: Path, record: RunRecord) -> None:
-    """Write run.json. `outputs_all` is left out while it's false, so a run recorded without it, which a rebuild or a
-    copy writes again, keeps the shape older builds read: their read_runs takes each key as a field, and an unknown
-    one fails their Case overview and Tools page with a TypeError. A tool run this build makes keeps the key, and
-    only the case format number makes an older build refuse such a case cleanly."""
+    """Write run.json. `outputs_all` is left out while it's false, and each of format 4's keys (FORMAT_4_KEYS) while
+    it's None, so a run recorded without them, which a rebuild or a copy writes again, keeps the shape older builds
+    read: their read_runs takes each key as a field, and an unknown one fails their Case overview and Tools page with a
+    TypeError, or is refused by name. A tool run this build makes keeps the keys, and only the case format number makes
+    an older build refuse such a case cleanly."""
     data = asdict(record)
     if not data["outputs_all"]:
         del data["outputs_all"]
+    for key in FORMAT_4_KEYS:
+        if data[key] is None:
+            del data[key]
     write_atomically(folder / RUN_FILE, json.dumps(data, indent=2))
 
 

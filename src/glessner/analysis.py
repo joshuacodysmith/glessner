@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 import duckdb
@@ -17,7 +18,7 @@ from . import attack
 from .accounts import build_account_domains
 from .clock import check_clocks
 from .events import id_table, insert_columns, live_hive_first, sql_literal
-from .identity import HostIdentity, Identity
+from .identity import HostIdentity, Identity, lookup_key
 from .journal import State
 from .parsers.common import is_digits, normalize_ip
 from .relations import build_logon_links
@@ -32,6 +33,8 @@ MARK_LABELS = {"authorized": "Authorized", "suspicious": "Suspicious", "maliciou
 LEVEL_RANK = {"informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5}
 DC_PATTERN = re.compile(r"(^|[^A-Z])DC(\d|[^A-Z]|$)")
 SERVER_PATTERN = re.compile(r"SRV|SERVER|(^|[^A-Z])(FS|SQL|EXCH|WEB|APP)(\d|[^A-Z]|$)")
+# A NetBIOS name keeps the first 15 characters of a longer computer name, and NTLM logons record that name.
+NETBIOS_NAME_LENGTH = 15
 
 
 # Windows records a machine's type in the SYSTEM hive: ControlSet00N\Control\ProductOptions\ProductType.
@@ -57,16 +60,19 @@ class RoleEvidence:
 
 
 def build_identity(con: duckdb.DuckDBPyConnection, state: State) -> Identity:
-    """Names from each host's EVTX Computer values and SYSTEM ComputerName; IPs from Tcpip interfaces."""
+    """Names from each host's EVTX Computer values and SYSTEM ComputerName; IPs from Tcpip interfaces. A host needs
+    review while its role is a guess, while another host claims one of its names or IPs, and while logons from one of
+    its IPs name another machine."""
     hosts: dict[str, HostIdentity] = {}
     for (host,) in con.execute("SELECT DISTINCT host FROM events ORDER BY host").fetchall():
         hosts[host] = HostIdentity(host, "", "guess")
-    # Registry first, so the current ComputerName leads; EVTX names, newest first, add earlier names.
+    # Registry first, so the current ComputerName leads; EVTX names, newest first, add earlier names. Key paths match
+    # without case, as Windows compares key names: a hive can write `services` for Services.
     for host, _path, name, data in con.execute(
             "SELECT host, registry_path, registry_value, json_extract_string(NULLIF(extra, ''), '$.ValueData') FROM events "
-            "WHERE tool = 'recmd' AND ((registry_path LIKE '%\\Control\\ComputerName\\ComputerName' "
+            "WHERE tool = 'recmd' AND ((registry_path ILIKE '%\\Control\\ComputerName\\ComputerName' "
             "AND registry_value = 'ComputerName') "
-            "OR (registry_path LIKE '%\\Services\\Tcpip\\Parameters\\Interfaces\\%' "
+            "OR (registry_path ILIKE '%\\Services\\Tcpip\\Parameters\\Interfaces\\%' "
             "AND registry_value IN ('IPAddress', 'DhcpIPAddress')))"
     ).fetchall():
         if name == "ComputerName":
@@ -109,13 +115,54 @@ def build_identity(con: duckdb.DuckDBPyConnection, state: State) -> Identity:
     conflicts = sorted(key for key, owners in claims.items() if len(owners) > 1)
     for key in conflicts:
         lookup.pop(key, None)   # an ambiguous name or IP resolves to nothing rather than to the wrong host
+    named = _other_machine_names(con, hosts, lookup)
     for h in hosts.values():
         if h.role_source == "guess":
             h.review.append("Role not confirmed")
         for key in [*h.names, *h.ips]:
             if key in conflicts:
                 h.review.append(f"{key} is also claimed by {', '.join(o for o in claims[key] if o != h.host)}")
+        h.review.extend(_named_note(ip, named[ip]) for ip in h.ips if ip in named)
     return Identity(hosts, lookup, conflicts)
+
+
+def _other_machine_names(con: duckdb.DuckDBPyConnection, hosts: dict[str, HostIdentity],
+                         lookup: dict[str, str]) -> dict[str, Counter]:
+    """For each address that resolves to a host, the WorkstationNames that 4624 type 3 logons from it record and that
+    aren't that host's own, each with its count of logons. A stale DHCP lease or a virtual adapter's address can give a
+    host an address another machine held; its logons still link from the host, and these names are the sign. A name is
+    read as resolve_name reads it (lookup_key), and is the host's own when it is one of the host's names or addresses,
+    or a name's first 15 characters, the NetBIOS name that NTLM records for a longer computer name. A blank or "-" name
+    doesn't count, nor does a type 10 logon, which can record the target's own name. Every host edit reads this: on a
+    synthetic case of 1 million events, 300,000 of them such logons, the query took about 15 ms."""
+    own = {}
+    for h in hosts.values():
+        names = {h.host.upper(), *h.names}
+        own[h.host] = {*names, *(name[:NETBIOS_NAME_LENGTH] for name in names), *h.ips}
+    named: dict[str, Counter] = {}
+    for ip, workstation, count in con.execute(
+            "SELECT source_ip, source_workstation, count(*) FROM events "
+            "WHERE artifact = 'evtx' AND ts_us IS NOT NULL AND event_code = '4624' AND logon_type = '3' "
+            "AND source_ip <> '' AND trim(source_workstation) NOT IN ('', '-') GROUP BY ALL").fetchall():
+        owner = lookup.get(ip)
+        name = lookup_key(workstation)
+        if owner is not None and name and name not in own[owner]:
+            named.setdefault(ip, Counter())[name] += count
+    return named
+
+
+def _named_note(ip: str, names: Counter) -> str:
+    """The review note for an address whose logons name other machines, the most frequent first:
+    "3 logons from 192.168.1.23 name ATTACKER-PC, not this host"."""
+    total = names.total()
+    ranked = sorted(names, key=lambda name: (-names[name], name))
+    shown = ranked[:3]
+    if len(ranked) > 3:
+        rest = len(ranked) - 3
+        shown.append(f"{rest} other{'s' if rest > 1 else ''}")
+    listed = " and ".join(shown) if len(shown) < 3 else f"{', '.join(shown[:-1])}, and {shown[-1]}"
+    counted = f"1 logon from {ip} names" if total == 1 else f"{total:,} logons from {ip} name"
+    return f"{counted} {listed}, not this host"
 
 
 def role_evidence(con: duckdb.DuckDBPyConnection, systems: dict[str, dict] | None = None) -> dict[str, RoleEvidence]:
@@ -124,7 +171,7 @@ def role_evidence(con: duckdb.DuckDBPyConnection, systems: dict[str, dict] | Non
     evidence: dict[str, RoleEvidence] = {}
     for host, data in con.execute(
             "SELECT host, json_extract_string(NULLIF(extra, ''), '$.ValueData') FROM events "
-            "WHERE tool = 'recmd' AND registry_path LIKE '%\\Control\\ProductOptions' AND registry_value = 'ProductType' "
+            "WHERE tool = 'recmd' AND registry_path ILIKE '%\\Control\\ProductOptions' AND registry_value = 'ProductType' "
             f"ORDER BY host, {live_hive_first('system')}, registry_path").fetchall():
         e = evidence.setdefault(host, RoleEvidence())
         if not e.product_type:   # the live hive's lowest-numbered control set comes first
@@ -158,7 +205,7 @@ def host_os(con: duckdb.DuckDBPyConnection) -> dict[str, dict]:
     # name can be the shorter one, so the file is ranked before the key.
     for host, source, path, name, data in con.execute(
             "SELECT host, source_file, registry_path, registry_value, json_extract_string(NULLIF(extra, ''), '$.ValueData') "
-            "FROM events WHERE tool = 'recmd' AND registry_path LIKE '%\\Windows NT\\CurrentVersion' "
+            "FROM events WHERE tool = 'recmd' AND registry_path ILIKE '%\\Windows NT\\CurrentVersion' "
             f"AND registry_value IN ({names}) "
             f"ORDER BY host, {live_hive_first('software')}, length(registry_path), registry_path").fetchall():
         values = raw.setdefault(host, {"_key": (source, path)})

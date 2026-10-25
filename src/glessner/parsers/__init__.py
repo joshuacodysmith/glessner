@@ -54,6 +54,9 @@ FORMER_RULES: dict[str, frozenset[int]] = {
 # Parsers of output written in the local time of the computer that made it, at the one offset in force when it ran. A
 # load resolves the host's zone from its SYSTEM hive (runner.host_zone), records it, and passes it in ParseContext.zone.
 LOCAL_TIME = frozenset({"autoruns_csv"})
+# Parsers that count, in ParseContext.skipped, the rows or lines they make no event of, which a load sums into its run's
+# rows_skipped. Others, such as PECmd's and SQLECmd's, leave out rows without counting them.
+COUNTS_SKIPPED = frozenset({"mftecmd_csv", "suricata_eve"})
 # What the page calls each parser's events, by their artifact: the Event page's header and the Hosts panel.
 # An import's ready-made mappings name their own (imports.PRESETS).
 ARTIFACT_NAMES = {
@@ -63,4 +66,4 @@ ARTIFACT_NAMES = {
     "timeline": "Windows Timeline", "suricata": "Suricata", "autoruns": "Autoruns",
 }
 
-__all__ = ["ARTIFACT_NAMES", "FORMER_RULES", "LOCAL_TIME", "PARSERS", "ParseContext", "Parser"]
+__all__ = ["ARTIFACT_NAMES", "COUNTS_SKIPPED", "FORMER_RULES", "LOCAL_TIME", "PARSERS", "ParseContext", "Parser"]

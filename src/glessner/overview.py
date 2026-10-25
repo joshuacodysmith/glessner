@@ -14,27 +14,25 @@ import duckdb
 
 from .analysis import HAYABUSA_SOURCE, IDS_ALERT_SOURCE, NETWORK_DEVICE_ARTIFACTS, SURICATA_SOURCE, level_rank
 from .audit import describe, recovered_words, short
+from .case import MANIFEST_FILE
 from .events import from_us
 from .identity import Identity
-from .intake import UNLISTED
+from .intake import FAILED_STATES, UNLISTED
 from .journal import (
-    APP_NAMES,
     Check,
     Journal,
     State,
-    _applies,
-    _chained,
-    _format2,
-    _rekey_ok,
-    _replayable,
-    is_rekey,
+    analyst,
     lacks,
     parse_line,
-    strict,
-    translate,
     unplaced_count,
+    unvouched_warns,
+    unvouched_words,
 )
+from .journal import last_action as _last_action
 from .queries import TS
+from .runner import RULES_NOT_RECORDED, RunRecord, rows_skipped_by_host, rule_sets
+from .tools import ToolSpec
 
 MINUTE = 60_000_000
 CLUSTER_GAP_US = 30 * MINUTE   # alerts more than this far apart start a new lead
@@ -109,95 +107,30 @@ NEARBY = f"""
 
 
 def case_overview(con: duckdb.DuckDBPyConnection, *, identity: Identity, state: State, report: dict[str, dict],
-                  journal_path: Path, runs: list, run_gaps: list[dict], manifest: list, unidentified: int, orphans: int,
-                  checks: dict, tool_names: dict[str, str], artifact_names: dict[str, str], build: str,
-                  alignment: str, journal: dict | None = None) -> dict:
-    """The overview's sections. `con` is a cursor of its own: the temp tables it makes are its connection's. `checks`
-    is intake.evidence_checks's reading of verification.jsonl; `journal` is Integrity's Journal row (journal_row)."""
+                  journal_path: Path, runs: list[RunRecord], specs: dict[str, ToolSpec], run_gaps: list[dict], manifest: list,
+                  unidentified: int, orphans: int, checks: dict, tool_names: dict[str, str], artifact_names: dict[str, str],
+                  build: str, alignment: str, journal: dict | None = None) -> dict:
+    """The overview's sections. `con` is a cursor of its own: the temp tables it makes are its connection's. `runs` are
+    the case's run records and `specs` the registry's tools, which name each tool's rule set and count the rows it skipped.
+    `checks` is intake.evidence_checks's reading of verification.jsonl; `journal` is Integrity's Journal row
+    (journal_row)."""
     last = _last_action(journal_path)
     events = _events_of_interest(con, last)
-    leads = _alert_leads(con, runs, tool_names) + _rule_leads(con, state, report) + _clock_leads(identity)
+    leads = _alert_leads(con, runs, specs, tool_names) + _rule_leads(con, state, report) + _clock_leads(identity)
     leads.sort(key=lambda lead: (TIER_ORDER[lead["level"]], lead["first"] is None, lead["first"] or 0, lead["id"]))
-    hosts = _hosts(con, identity, artifact_names)
+    hosts = _hosts(con, identity, artifact_names, rows_skipped_by_host(runs, specs))
     if last and last.get("action"):
-        last = {"seq": last.get("seq"), "at": last.get("at", ""), "who": last.get("who", ""),
+        last = {"seq": last.get("seq"), "at": last.get("at", ""), "who": analyst(last),
                 "text": describe(last, events)}
     files = manifest_facts(manifest)
     return {"leads": leads, "ranking": RANKING, "progress": _progress(con, state, leads, last, orphans),
             "by_host": _by_host(con, identity, leads), "hosts": hosts["rows"],
             "gaps": {"runs": run_gaps, "unidentified": unidentified, "unreadable": files["unreadable"],
                      "unlisted": files["unlisted"], "clears": hosts["clears"], "no_event_logs": hosts["no_event_logs"]},
-            "integrity": {**_integrity(files, checks, journal_path, build, alignment, identity), "journal": journal}}
-
-
-def _last_action(path: Path) -> dict | None:
-    """The journal's newest entry by someone, as the shared reader (journal.entries) gives it, read from the file's end
-    rather than by parsing every line. The app's own entries, such as the build each new build journals when it opens
-    the case, are left to the audit trail and Integrity: they answer no "where was I". The case format upgrades' rekeys
-    it passes on the way are exactly those that follow the entry, so it is read through them, in file order, as every
-    other reader reads it: through each rekey the shared reader gives that _apply can take (journal._applies)."""
-    start = None   # where the chain starts (_chain_start), found the first time a line that names no prev needs it
-    with path.open("rb") as f:
-        size = f.seek(0, 2)
-        back = min(size, 65_536)
-        while True:
-            f.seek(size - back)
-            # As the shared reader reads: up to the last LF, and before a last line holding 0x00. Either is a write in
-            # progress, or a crash's
-            *lines, torn = f.read(back).split(b"\n")
-            end = size - len(torn) - 1   # where the newest whole line ends, at its LF
-            if lines and not torn and b"\0" in lines[-1]:
-                end -= len(lines.pop()) + 1
-            if back < size:
-                lines = lines[1:]   # the first may start mid-line
-            rekeys = []   # the rekeys passed that the shared reader applies, newest first
-            for line in reversed(lines):
-                at = end - len(line)   # where the line starts
-                end = at - 1           # where the line before it ends, at its LF
-                if not line.strip():
-                    continue
-                # A line is chained when it names prev, or when a chained line comes before it, as journal._read
-                # decides; an unchained line is parsed as format 2 read it
-                entry = strict(line)
-                chained = entry is not None and "prev" in entry
-                if not chained:
-                    start = _chain_start(path) if start is None else start
-                    chained = at > start
-                    entry = entry if chained else _format2(line)
-                if not _given(entry, chained):
-                    continue
-                if entry.get("who") not in APP_NAMES:
-                    return translate(entry, rekeys[::-1]) if rekeys else entry
-                if is_rekey(entry) and _applies(entry):
-                    rekeys.append(entry)
-            if back == size:
-                return None
-            back = min(size, back * 4)   # long lines, such as a mark of many events, or several build entries
-
-
-def _given(entry: dict | None, chained: bool) -> bool:
-    """Whether the shared reader (journal._read) gives a line's entry, parsed as it parses the line, or None when that
-    parse failed. A chained line's entry must have an envelope replay can read, complete when it names prev
-    (journal.lacks), and no entry may be a rekey that no build of this format writes (journal._rekey_ok). `chained` is
-    whether the line is chained: it names prev, or a chained line comes before it. _rekey_ok reads that only for an
-    entry that names no prev, which is chained only when a chained line comes before it."""
-    if entry is None:
-        return False
-    if chained and (not _replayable(entry) or ("prev" in entry and lacks(entry))):
-        return False
-    return not is_rekey(entry) or _rekey_ok(entry, chained)
-
-
-def _chain_start(path: Path) -> int:
-    """Where the journal's first chained line starts (journal._chained), or its size when no line is chained: a line
-    that starts after it is chained, as the shared reader reads it."""
-    at = 0
-    with path.open("rb") as f:
-        for line in f:
-            if _chained(line.removesuffix(b"\n")):
-                break
-            at += len(line)
-    return at
+            "integrity": {**_integrity(files, checks, journal_path, build, alignment, identity),
+                          "manifest": _manifest_row(checks["last_full"], state.manifests,
+                                                    not (journal_path.parent / MANIFEST_FILE).exists()),
+                          "journal": journal}}
 
 
 # Where each journal was read to, its entries, and its newest close (journal_facts)
@@ -282,10 +215,12 @@ def _events_of_interest(con: duckdb.DuckDBPyConnection, last: dict | None) -> di
     return {single: f"{row[0]} {row[1] or row[2]}: {row[3]}"} if row else {}
 
 
-def _alert_leads(con: duckdb.DuckDBPyConnection, runs: list, tool_names: dict[str, str]) -> list[dict]:
+def _alert_leads(con: duckdb.DuckDBPyConnection, runs: list[RunRecord], specs: dict[str, ToolSpec],
+                 tool_names: dict[str, str]) -> list[dict]:
     """Clusters of alerts per host and tool, split where two alerts are more than 30 minutes apart. An event counts as
     worked when it has a mark, or when the analyst rejected its source's suggestion. Alerts without a time are on no
-    timeline, so they're in no cluster."""
+    timeline, so they're in no cluster. A lead's chips name the tool's version and the rule sets of the runs that made
+    its alerts: Suricata's own, and Hayabusa's, not those of the EvtxECmd run that parsed the events its hits matched."""
     sources = " ".join(f"WHEN '{tool}' THEN '{source}'" for tool, source in ALERT_SOURCE.items())
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE ov_clustered AS
@@ -309,27 +244,23 @@ def _alert_leads(con: duckdb.DuckDBPyConnection, runs: list, tool_names: dict[st
     # matches on, and the alerts' signatures. Each title counts the cluster's events it matched.
     titles: dict[tuple, list[tuple[str, int]]] = defaultdict(list)
     versions: dict[tuple, set[str]] = defaultdict(set)
-    for host, tool, cluster, title, n, found in con.execute(f"""
-            SELECT c.host, c.tool, c.cluster, h.rule_title, count(DISTINCT c.event_uid), list(DISTINCT h.tool_version)
+    made_by: dict[tuple, set[str]] = defaultdict(set)   # the IDs of the runs whose rows hold the alerts
+    for host, tool, cluster, title, n, found, run_ids in con.execute(f"""
+            SELECT c.host, c.tool, c.cluster, h.rule_title, count(DISTINCT c.event_uid), list(DISTINCT h.tool_version),
+                   list(DISTINCT h.run_id)
             FROM ov_clustered c JOIN ov_ev v ON v.event_uid = c.event_uid
             JOIN events h ON h.tool = 'hayabusa' AND h.origin_host = v.origin_host AND h.log_channel = v.log_channel
                 AND h.record_id = v.record_id AND h.source_file = v.source_file
             WHERE c.tool = 'hayabusa' AND {level_rank("h.rule_level")} >= 3 GROUP BY ALL
             UNION ALL
             SELECT c.host, c.tool, c.cluster, COALESCE(s.signature, f.signature, '(no signature)'),
-                   count(DISTINCT c.event_uid), list(DISTINCT v.tool_version)
+                   count(DISTINCT c.event_uid), list(DISTINCT v.tool_version), list(DISTINCT v.run_id)
             FROM ov_clustered c JOIN ov_ev v ON v.event_uid = c.event_uid
             LEFT JOIN suricata_alerts s ON s.event_uid = c.event_uid LEFT JOIN fast_alerts f ON f.event_uid = c.event_uid
             WHERE c.tool <> 'hayabusa' GROUP BY ALL""").fetchall():
         titles[(host, tool, cluster)].append((title, n))
         versions[(host, tool, cluster)].update(found)
-    rule_sets: dict[tuple, set[str]] = defaultdict(set)   # a Suricata run's rule set, such as ET Open 11310
-    rules_of_run = {r.run_id: r.rules for r in runs if getattr(r, "rules", "")}
-    for host, cluster, run in con.execute(
-            "SELECT DISTINCT c.host, c.cluster, v.run_id FROM ov_clustered c JOIN ov_ev v ON v.event_uid = c.event_uid "
-            "WHERE c.tool = 'suricata'").fetchall():
-        if run in rules_of_run:
-            rule_sets[(host, "suricata", cluster)].add(rules_of_run[run])
+        made_by[(host, tool, cluster)].update(run_ids)
     leads = []
     for host, tool, cluster, n, first, last, top, levels, open_ in clusters:
         key = (host, tool, cluster)
@@ -339,9 +270,12 @@ def _alert_leads(con: duckdb.DuckDBPyConnection, runs: list, tool_names: dict[st
         why = (f"{'Rules' if tool == 'hayabusa' else 'Signatures'}: {shown}"
                + (f", and {more} more" if more > 0 else "") + ".")
         made = ", ".join(sorted(versions[key]))
+        name = tool_names.get(tool, tool)
+        # The rule sets of the lead's runs, in run order; a run with no record names none
+        sets = rule_sets([r for r in runs if r.run_id in made_by[key]], specs)
         # An import's events carry the build that imported them as their tool version
-        chips = [f"imported by glessner {made}" if tool == "import" else f"{tool_names.get(tool, tool)} {made}",
-                 *sorted(rule_sets[key])]
+        chips = [f"imported by glessner {made}" if tool == "import" else f"{name} {made}",
+                 *(f"{name} {text}" if text == RULES_NOT_RECORDED else text for text in sets)]
         prefix, word = LEVEL_WORDS[tool]
         words = prefix + _join([word[lv] for lv in levels])
         noun = ALERT_NOUN[tool][n != 1]
@@ -464,7 +398,8 @@ def _by_host(con: duckdb.DuckDBPyConnection, identity: Identity, leads: list[dic
     return rows
 
 
-def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: dict[str, str]) -> dict:
+def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: dict[str, str],
+           skipped: dict[str, int]) -> dict:
     """What each host holds, from one pass over its events: timeline events, the first and last time, the kinds of
     evidence loaded, and Hayabusa's rows; then its events with a hit, and its log clears. The first and last times are
     recorded ones plus the host's offset, which is the same for all of a host's events, so the pass reads no join: with
@@ -473,14 +408,19 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
     A Hayabusa row stays under the host it was loaded under, and after a host split, one whose record names no
     computer stays on the split host while the event it matched moves. So the hits are counted by the lane of
     the event they matched, as the timeline draws them and the alert leads count them; the rows loaded under a host
-    count apart, for a host that holds them and no events."""
+    count apart, for a host that holds them and no events.
+
+    `skipped` is the rows each host folder's runs skipped (runner.rows_skipped_by_host). A split host's lanes hold
+    its events, not its runs, so its count shows once, on its first lane by name."""
     offsets = dict(con.execute("SELECT host, COALESCE(offset_us, 0) FROM hosts").fetchall())
     found: dict[str, dict] = {}
-    for host, tool, artifact, timed, rows, first, last in con.execute(
-            "SELECT host, tool, artifact, count(*) FILTER (WHERE ts_us IS NOT NULL), count(*), min(ts_us), max(ts_us) "
-            "FROM events GROUP BY ALL ORDER BY 1, 3").fetchall():
+    lanes_of: dict[str, set[str]] = defaultdict(set)   # the lanes that hold rows of each host folder
+    for host, origin, tool, artifact, timed, rows, first, last in con.execute(
+            "SELECT host, origin_host, tool, artifact, count(*) FILTER (WHERE ts_us IS NOT NULL), count(*), min(ts_us), "
+            "max(ts_us) FROM events GROUP BY ALL ORDER BY 1, 4").fetchall():
         h = found.setdefault(host, {"events": 0, "untimed": 0, "first": None, "last": None, "hits": 0, "hit_rows": 0,
-                                    "kinds": {}, "clears": []})
+                                    "kinds": {}, "clears": [], "skipped": 0})
+        lanes_of[origin].add(host)
         if tool == "hayabusa":
             h["hit_rows"] += rows
             continue
@@ -495,6 +435,9 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
                                "GROUP BY 1").fetchall():
         if host in found:
             found[host]["hits"] = n
+    for origin, n in skipped.items():
+        if origin in lanes_of:
+            found[min(lanes_of[origin])]["skipped"] += n
     for uid, host, ts, code, channel, msg in con.execute(f"""
             SELECT e.event_uid, e.host, {TS}, e.event_code, e.log_channel, left(e.message, 120)
             FROM events e LEFT JOIN hosts h ON h.host = e.host WHERE {CLEAR_WHERE}
@@ -509,7 +452,7 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
         rows_out.append({
             "host": name, "role": ident.role if ident else "", "guessed": bool(ident and ident.role_source == "guess"),
             "os": (ident.os or {}).get("display", "") if ident else "", "events": h["events"], "untimed": h["untimed"],
-            "first": h["first"], "last": h["last"], "hits": h["hits"], "hit_rows": h["hit_rows"],
+            "skipped": h["skipped"], "first": h["first"], "last": h["last"], "hits": h["hits"], "hit_rows": h["hit_rows"],
             "kinds": [{"artifact": a, "label": artifact_names.get(a, a), "events": n}
                       for a, n in sorted(h["kinds"].items(), key=lambda kv: -kv[1])],
             "clock": _clock_text(ident, clock), "review": list(ident.review) if ident else []})
@@ -557,21 +500,82 @@ def _integrity(files: dict, checks: dict, journal_path: Path, build: str, alignm
             "times": times, "offsets": offsets, "build": build}
 
 
+# Integrity's manifest line for the state the newest full re-hash found (intake.manifest_state); {entry} is the entry
+# number of the record it compared, left out when the re-hash is a copy's source's, and {when} whose re-hash it was
+MANIFEST_WORDS = {"matches": "matched its record{entry}, at {when}",
+                  "grew": "grew past its record{entry}, at {when}",
+                  "differs": "differed from its record{entry}, at {when}",
+                  "none": "no record of its hash counted at {when}"}
+OWN_REHASH = "the last full re-hash"
+SOURCE_REHASH = "its source's last full re-hash"
+
+
+def _manifest_row(last_full: dict | None, records: list[dict], missing: bool) -> dict | None:
+    """Integrity's manifest.jsonl line: what the newest full re-hash found of it against its record in the journal; the
+    newest record, when it is newer than the one that re-hash compared, or when that re-hash counted none; and when the
+    first record came with Add new evidence, that nothing shows the lines before it are as intake wrote them. `records`
+    may lag the journal, as a state not caught up with the command line's Add new evidence does, so an older record is
+    never named as newer. A copy holds its source's verification history, whose entry numbers are the source's, so a
+    re-hash dated before the copy's first record is its source's: it is said to be, and names no entry, and a copy's
+    own names an entry only when it is a record of this journal. A re-hash with no usable time is not called the
+    source's. A file `missing` while the journal records it is named as missing, whatever a re-hash found before.
+    None for a case with neither a record nor a full re-hash that compared one, such as a case below format 4. `warn`
+    when the manifest grew past or differs from its record, or is missing, or the first record is a copy's whose
+    source's journal had a break or no head recorded here (UNVOUCHED_WARNS). A copy's first record names the reasons its
+    source couldn't vouch for it (journal.unvouched_words)."""
+    if missing and records:
+        return {"state": "missing", "warn": True,
+                "text": f"missing, but the journal records it, entry #{records[-1]['seq']}; restore it from a copy of the "
+                        "case"}
+    found = (last_full or {}).get("manifest")
+    state = found.get("state") if isinstance(found, dict) else None
+    newest = records[-1]["seq"] if records else None
+    if state in MANIFEST_WORDS:
+        seq = found.get("seq")
+        copied = bool(records) and records[0]["via"] == "copy"
+        checked_at, recorded_at = (last_full or {}).get("at", ""), records[0]["at"] if records else ""
+        dated = isinstance(checked_at, str) and bool(checked_at)   # a hand edit may leave a time that is none or no string
+        inherited = copied and dated and checked_at[:19] < recorded_at[:19]   # whole seconds: a check's time has no fraction
+        ours = isinstance(seq, int) and not inherited and (not copied or any(record["seq"] == seq for record in records))
+        text = MANIFEST_WORDS[state].format(entry=f", entry #{seq}" if ours else "",
+                                            when=SOURCE_REHASH if inherited else OWN_REHASH)
+        if state == "none" and newest is not None:
+            text += f"; entry #{newest} records it"
+        elif ours and newest is not None and newest > seq:
+            text += f"; entry #{newest} is a newer record of it"
+    elif records:
+        state, text = "unchecked", f"recorded in the journal, entry #{records[-1]['seq']}; no full re-hash has compared it yet"
+    else:
+        return None
+    warn = state in FAILED_STATES
+    if records and records[0]["via"] == "add":
+        text += (". The first record came with Add new evidence, so nothing shows that the lines before it are as "
+                 "intake wrote them")
+    elif records and (unvouched := unvouched_words(records[0])):   # a copy's, which names why its source couldn't vouch
+        text += f". {unvouched}"
+        warn = warn or unvouched_warns(records[0]["unvouched"])
+    return {"state": state, "text": text, "warn": warn}
+
+
 # The entries after a recorded head, by action, in Integrity's words
 ACTION_NOUNS = {"mark": ("mark", "marks"), "note": ("note", "notes"), "file_written": ("file record", "file records"),
                 "tag": ("tag entry", "tag entries"), "case_setting": ("setting", "settings"),
                 "followup": ("follow-up", "follow-ups"), "finding": ("finding entry", "finding entries"),
-                "undo": ("correction", "corrections"), "case_open": ("open by a build", "opens by a build")}
+                "undo": ("correction", "corrections"), "case_open": ("open by a build", "opens by a build"),
+                "manifest_recorded": ("manifest record", "manifest records")}
 
 
-# What an entry of these actions after the recorded head means. This app records the head right after it writes either,
-# so one after it was written by something else, or by a build whose record failed: a rekey re-points every earlier
-# entry's event IDs, and a chain_break puts earlier breaks on record
+# What an entry of these actions after the recorded head means. This app records the head right after it writes any of
+# them, so one after it was written by something else, or by a build whose record failed: a rekey re-points every
+# earlier entry's event IDs, a chain_break puts earlier breaks on record, and a manifest record can vouch for a
+# changed manifest.jsonl
 AFTER_HEAD_WORDS = {
     "case_upgrade": "A case_upgrade among them can change what earlier entries mean. This app records its head right "
                     "after it writes one, so check who added it.",
     "chain_break": "A chain_break among them puts earlier breaks on record. This app records its head right after it "
-                   "writes one, so check who added it."}
+                   "writes one, so check who added it.",
+    "manifest_recorded": "A manifest record among them can vouch for a changed manifest.jsonl. This app records its head "
+                         "right after it writes one, so check who added it."}
 
 
 def utc_minute(at: str) -> str:
@@ -646,7 +650,7 @@ def journal_row(journal: Journal, checked: str, found: Check | None = None, reco
         text.append("Bytes follow the last line while another process holds the journal's lock: a write in progress, "
                     "which this check can't vouch for. Check again in a moment.")
     return {"state": state, "text": text, "summary": summary, "head": head, "short": short(head), "seq": seq,
-            "entries": entries, "read_only": read_only, "can_continue": bool(read_only) and journal._started(),
+            "entries": entries, "read_only": read_only, "can_continue": bool(read_only) and journal.started(),
             "checked": checked}
 
 

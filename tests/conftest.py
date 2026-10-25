@@ -1,13 +1,17 @@
 """A small two-host case shaped like the Szechuan Sauce facts, built without running any tools."""
 
+import contextlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import warnings
+from dataclasses import dataclass
 
 import pytest
 
@@ -174,19 +178,45 @@ def suricata_case(synthetic_case):
     return synthetic_case
 
 
+def close_first(server):
+    """Make `server` keep each connection it accepts from now on, and return a function that ends the server's side of
+    them. Called before the client closes, it sends the server's FIN first. The side that closes a TCP connection first
+    holds it in TIME_WAIT, for 2 minutes on Windows, and keeps its local port for that time. On the server's side that
+    is the server's own port, one for all its connections; on a browser's side it is a port of the dynamic range for
+    each connection, 6 for a page load."""
+    accepted = []
+    accept = server.get_request
+
+    def get_request():
+        sock, address = accept()
+        accepted.append(sock)
+        return sock, address
+
+    def hang_up():
+        for sock in accepted:
+            with contextlib.suppress(OSError):   # a connection its handler has closed already
+                sock.shutdown(socket.SHUT_WR)
+
+    server.get_request = get_request
+    return hang_up
+
+
 def serving(case):
     """Serve a case on a free port for one pass of a for loop: yields the app, the port, and the launch link. A closure
-    made in the loop's body runs within that pass, so ruff's B023 is silenced on it."""
-    from glessner.server import serve
+    made in the loop's body runs within that pass, so ruff's B023 is silenced on it. The stop is `serve`'s: the server
+    stops accepting, and the hub retires the app and waits for its running requests before the connection closes."""
+    from glessner.server import Hub, serve_hub
 
-    server, app, url = serve(case, 0)
+    hub = Hub(case)
+    server, _, url = serve_hub(hub, 0)
+    app = hub.app
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     port = server.server_address[1]
     yield app, port, url
     server.shutdown()
     server.server_close()
-    app.con.close()
+    hub.close()
 
 
 @pytest.fixture
@@ -298,6 +328,77 @@ def network_guard(monkeypatch):
     assert not refused, f"The test reached past this machine: {refused}"
 
 
+# Edge resolves no host name, so most of its own connections to services past this machine, each of which holds a local
+# port of the dynamic range, aren't made. The rule maps addresses too, so 127.0.0.1, where the tests' servers listen, is
+# excluded from it.
+BROWSER_ARGS = ["--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1"]
+# Playwright's launch error when the browser isn't installed: for a channel such as msedge, and for a browser
+# Playwright downloads
+BROWSER_ABSENT = re.compile(r"Chromium distribution '[^']+' is not found|Executable doesn't exist")
+
+
+class BrowserRelaunched(UserWarning):
+    """The browser the tests share had disconnected, as after a crash, and another was launched."""
+
+
+@dataclass
+class SharedBrowser:
+    """The browser a worker's browser tests share. A call returns it connected: `chromium`, Playwright's browser type,
+    launches it with `channel` on the first call, and again once it has disconnected, with a BrowserRelaunched warning
+    that names the test it disconnected during. A launch that fails because the browser isn't installed skips the
+    test, and later calls skip without launching. Any other failed launch fails the test, and the next call launches
+    again."""
+
+    chromium: object
+    channel: str
+    browser: object = None
+    absent: str = ""
+    lost_during: str = ""
+
+    def __call__(self):
+        from playwright.sync_api import Error
+
+        if self.browser is not None and self.browser.is_connected():
+            return self.browser
+        if self.absent:
+            pytest.skip(self.absent)
+        try:
+            browser = self.chromium.launch(channel=self.channel, args=BROWSER_ARGS)
+        except Error as exc:
+            reason = exc.message.splitlines()[0]
+            if not BROWSER_ABSENT.search(reason):
+                raise
+            self.absent = f"no browser to drive: {reason}"
+            pytest.skip(self.absent)
+        if self.browser is not None:
+            warnings.warn(BrowserRelaunched(f"The browser disconnected during {self.lost_during or 'an earlier test'}, "
+                                            "so another was launched."), stacklevel=2)
+        browser.on("disconnected", self.disconnected)
+        self.browser = browser
+        return browser
+
+    def disconnected(self, browser):
+        """Note the test running when Playwright learned that `browser` disconnected."""
+        self.lost_during = os.environ.get("PYTEST_CURRENT_TEST", "")
+
+    def close(self):
+        """Close the browser, unless it has disconnected."""
+        if self.browser is not None and self.browser.is_connected():
+            self.browser.close()
+
+
+@pytest.fixture(scope="session")
+def launch_browser():
+    """The worker's SharedBrowser, of the installed Edge or the channel GLESSNER_BROWSER_CHANNEL names. Each test opens a
+    context of its own in it, so tests share no storage or session."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        shared = SharedBrowser(pw.chromium, os.environ.get("GLESSNER_BROWSER_CHANNEL", "msedge"))
+        yield shared
+        shared.close()
+
+
 def pytest_xdist_auto_num_workers(config):
     """-n auto starts one worker per two logical CPUs. On 16 threads, 8 workers ran the suite in 5 min 54 s against 6 to
     6.5 min for 16, and two suites at once in 9 min 21 s each against 9 min 51 s, where 32 workers slowed a timed test
@@ -309,7 +410,8 @@ def pytest_xdist_auto_num_workers(config):
 @pytest.hookimpl(tryfirst=True)   # before pytest-xdist's own hook, which reads the group into each test's ID
 def pytest_collection_modifyitems(items):
     """With pytest-xdist's --dist loadgroup, a module's browser tests, and its lab tests, run on one worker in order: its
-    Edge launches once, and test_lab_runs.py runs the tools once. Other tests go to whichever worker is free."""
+    browser tests share that worker's Edge, and test_lab_runs.py runs the tools once. Other tests go to whichever worker
+    is free."""
     for item in items:
         if item.get_closest_marker("browser") or item.get_closest_marker("lab"):
             item.add_marker(pytest.mark.xdist_group(item.path.name))

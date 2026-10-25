@@ -1,6 +1,6 @@
 """How runs are reported: a group load refused before it read anything shows as not checked, one that failed while it
-read shows as not read, a run.json that lacks a key is refused by name, and the import command marks the runs an
-earlier command left running."""
+read shows as not read, a run.json that lacks a key, or has a format 4 key not of its shape, is refused by name, the
+import command marks the runs an earlier command left running, and a rebuild says why it read a file unchecked."""
 
 import json
 import time
@@ -13,8 +13,18 @@ from test_interrupted_runs import started, statuses
 from glessner import imports, runner, toolbox
 from glessner.case import CaseError
 from glessner.cli import main
-from glessner.intake import intake
-from glessner.runner import NOT_CHECKED, NOT_READ, UNREADABLE, RunRecord, read_runs
+from glessner.intake import add_new, intake
+from glessner.runner import (
+    NOT_CHECKED,
+    NOT_READ,
+    UNLISTED_NOTE,
+    UNREADABLE,
+    RunRecord,
+    finish_run,
+    load_found_output,
+    read_runs,
+    rebuild,
+)
 from glessner.tools import load_registry
 
 GROUP = {"key": "sbecmd_csv", "host": "HOST", "preset": "", "tool": "sbecmd", "parser": "sbecmd_csv"}
@@ -117,6 +127,52 @@ def test_a_run_record_that_is_not_an_object_is_refused_naming_the_run(synthetic_
     assert path.parent.name in str(refused.value)
 
 
+def test_a_tool_check_object_is_read_as_it_was_written(synthetic_case):
+    check = {"manifest": "tools.json", "files": {"EvtxECmd.exe": "matches"}, "found": [1, None, "x"]}
+    _, path = started(synthetic_case, "HOST1")
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "tool_check": check}), encoding="utf-8")
+    (record,) = read_runs(synthetic_case)
+    assert record.tool_check == check
+
+
+def test_format_4_s_keys_given_as_null_read_as_none_and_are_left_out_when_written_back(synthetic_case):
+    """null is the value each key has when none was recorded, as a record written as a whole holds it."""
+    _, path = started(synthetic_case, "HOST1")
+    nulls = {"tool_files": None, "rows_skipped": None, "tool_check": None}
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), **nulls}), encoding="utf-8")
+    (record,) = read_runs(synthetic_case)
+    assert (record.tool_files, record.rows_skipped, record.tool_check) == (None, None, None)
+    finish_run(path.parent, record)
+    assert not nulls.keys() & json.loads(path.read_text(encoding="utf-8")).keys()
+
+
+MISSHAPEN = {"tool_check": "a tool_check that isn't a JSON object",
+             "tool_files": "a tool_files that isn't a JSON object of paths to SHA-256s",
+             "rows_skipped": "a rows_skipped that isn't a whole number from 0"}
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    *(("tool_check", value) for value in ([], ["matches"], "matches", 5, True)),
+    *(("tool_files", value) for value in ("x", [], ["python.exe"], {"python.exe": 5}, {"python.exe": None})),
+    *(("rows_skipped", value) for value in ("3", -2, 1.5, True, [], {})),
+])
+def test_a_format_4_key_not_of_its_shape_is_refused_naming_the_run(synthetic_case, key, value):
+    """The pages read and sum these keys, which would fail there as a TypeError, and a rewrite would carry the value."""
+    _, path = started(synthetic_case, "HOST1")
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), key: value}), encoding="utf-8")
+    with pytest.raises(CaseError, match=f"has {MISSHAPEN[key]}, so run ") as refused:
+        read_runs(synthetic_case)
+    assert path.parent.name in str(refused.value)
+
+
+def test_format_4_s_keys_of_their_shape_are_read_as_written(synthetic_case):
+    _, path = started(synthetic_case, "HOST1")
+    keys = {"tool_files": {"python.exe": "ab" * 32, "Maps/": "cd" * 32}, "rows_skipped": 0, "tool_check": {}}
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), **keys}), encoding="utf-8")
+    (record,) = read_runs(synthetic_case)
+    assert (record.tool_files, record.rows_skipped, record.tool_check) == tuple(keys.values())
+
+
 def test_the_runs_command_says_which_run_record_lacks_which_key(case_with_a_record_missing_a_key, capsys):
     case, run_id = case_with_a_record_missing_a_key
     assert main(["runs", str(case.folder)]) == 2
@@ -202,3 +258,20 @@ def test_the_import_command_marks_no_run_while_another_program_holds_the_events_
         assert main(["import", str(import_case.folder), "DC01/notes.csv"]) == 2
     assert "another program has its events database open" in capsys.readouterr().err
     assert statuses(import_case)["HOST1"] == "running"
+
+
+def test_a_rebuild_names_a_messages_file_it_read_unchecked_because_the_manifest_does_not_list_it(tmp_path):
+    case = found_case(tmp_path)
+    assert load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV]).status == "ok"
+    write_messages(case.evidence)   # after intake
+    rebuild(case)
+    (saved,) = read_runs(case)
+    said = saved.notes[-1].split(": ", 1)[1]
+    assert said == (f"1 file beside the output was read unchecked, since the manifest doesn't list it ({MESSAGES}). "
+                    f"{UNLISTED_NOTE}")
+    assert "recorded no hash" not in saved.notes[-1]
+    rebuild(case)   # the note replaces the last rebuild's
+    assert sum(note.endswith(UNLISTED_NOTE) for note in read_runs(case)[0].notes) == 1
+    add_new(case)
+    rebuild(case)   # the manifest lists the file now, so the rebuild checks it
+    assert not any(note.endswith(UNLISTED_NOTE) for note in read_runs(case)[0].notes)

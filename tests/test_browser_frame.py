@@ -7,11 +7,13 @@ import json
 import pytest
 from conftest import DC_LOG
 from test_browser_smoke import browser, case_menu, clock_page, filtered_view, served_page, to_timeline, view  # noqa: F401
-from test_overview import app_with_work, evidence_log, held_open, overview_case  # noqa: F401
+from test_manifest_record import copy_naming_reasons
+from test_overview import FILES, app_with_work, evidence_log, held_open, overview_case, rewrite_record, run_record  # noqa: F401
 
 from glessner import intake as intake_module
 from glessner.events import connect
 from glessner.intake import add_new, intake, verify
+from glessner.journal import unvouched_words
 from glessner.tools import load_registry
 
 pytestmark = pytest.mark.browser
@@ -331,6 +333,64 @@ def test_a_lead_or_a_number_says_how_many_of_its_events_the_sources_hide(browser
         assert p.locator("#stShown").inner_text().startswith("Showing 0 of ")
 
 
+def test_the_overview_names_each_hayabusa_lead_s_rule_set_and_the_rows_each_host_skipped(browser, overview_case):  # noqa: F811
+    """A Hayabusa lead's chips give the rule set of the Hayabusa run that made its hits, not the maps of the EvtxECmd
+    run that parsed the events they matched, and say so when a run made before the case recorded its rules has no label.
+    A Suricata lead keeps its rule set's chip. A host's events cell says how many rows its latest runs skipped."""
+    run_record(overview_case, "r7", "evtxecmd", "DC01", "ok", 11, rules="Maps, 456 maps",
+               tool_files={"EvtxECmd.exe": "12" * 32, "Maps/": "34" * 32})
+    run_record(overview_case, "r8", "hayabusa", "DC01", "ok", 4, rules="Hayabusa rules fffbdd1", tool_files=FILES)
+    run_record(overview_case, "r9", "hayabusa", "DESKTOP", "ok", 1)
+    run_record(overview_case, "20261016T020000Z_mftecmd_DC01", "mftecmd", "DC01", "ok", 5, inputs=("DC01/C/$MFT",),
+               rows_skipped=4)
+    rewrite_record(overview_case, "20261016T010000Z_suricata_network", rows_skipped=1)
+    app, _ = app_with_work(overview_case)
+    app.con.close()
+    for p in served_page(browser, overview_case, tab="overview", setup=no_tool_scan):
+        p.wait_for_selector("#ovLeads .ov-lead")
+        leads = p.locator("#ovLeads .ov-lead")
+        assert [leads.nth(i).locator(".ov-chip").all_inner_texts() for i in range(4)] == [
+            ["Hayabusa 3.6.0, t", "Hayabusa rules fffbdd1"], ["Suricata 8.0.7", "ET Open 11310"],
+            ["Hayabusa 3.6.0", "Hayabusa rules fffbdd1"], ["Hayabusa 3.6.0", "Hayabusa rules not recorded"]]
+        skipped = lambda host: p.locator(f"#ovHosts tr[data-host='{host}'] td.num div.muted").all_inner_texts()  # noqa: B023
+        assert (skipped("DC01"), skipped("network"), skipped("DESKTOP")) == (["and 4 skipped"], ["and 1 skipped"], [])
+
+
+def test_a_gap_s_reason_ends_in_one_period_on_the_overview_and_the_tools_page(browser, overview_case):  # noqa: F811
+    """A reason that already ends in a period, as a failed run's can and a found load's note does, takes no second one
+    where the Overview's Gaps and the Tools page's list of runs end it, and a reason without one takes one on both."""
+    note = ("1 row naming x.evtx was not loaded: a run of this tool on the host read the file itself, and that run's "
+            "events stand for it.")
+    rewrite_record(overview_case, "20261016T010100Z_srumecmd_DESKTOP", reason="exit code 1.")
+    rewrite_record(overview_case, "20261016T010200Z_rbcmd_DC01", notes=[note])
+    run_record(overview_case, "20261016T010500Z_jlecmd_DESKTOP", "jlecmd", "DESKTOP", "failed", None, reason="exit code 3")
+    app, _ = app_with_work(overview_case)
+    app.con.close()
+    squeeze = lambda texts: [" ".join(t.split()) for t in texts]
+    for p in served_page(browser, overview_case, tab="overview", setup=no_tool_scan):
+        p.wait_for_selector("#ovGaps li[data-run]")
+        assert squeeze(p.locator("#ovGaps li[data-run]").all_inner_texts()) == [
+            "SrumECmd on DESKTOP: failed: exit code 1. See the run", f"RBCmd on DC01: ran and loaded nothing. {note} See the run",
+            "JLECmd on DESKTOP: failed: exit code 3. See the run"]
+        case_menu(p, "toolsButton")
+        p.wait_for_selector("#details[data-page='tools'] .tools-gaps li")
+        assert squeeze(p.locator("#details .tools-gaps li").all_inner_texts()) == [
+            "SrumECmd on DESKTOP: failed. exit code 1. Run 20261016T010100Z_srumecmd_DESKTOP, 2026-10-16 01:00 UTC",
+            f"RBCmd on DC01: ran and loaded nothing. {note} Run 20261016T010200Z_rbcmd_DC01, 2026-10-16 01:00 UTC",
+            "JLECmd on DESKTOP: failed. exit code 3. Run 20261016T010500Z_jlecmd_DESKTOP, 2026-10-16 01:00 UTC"]
+
+
+def test_the_report_outline_says_its_method_covers_the_rule_sets(browser, synthetic_case):  # noqa: F811
+    """The Method line of the report's outline names the tools, their versions, their rule sets, the runs, and the build."""
+    for p in served_page(browser, synthetic_case):
+        p.locator("#tabFindings").click()
+        p.wait_for_selector("#details .report-outline li")
+        p.wait_for_function("() => [...document.querySelectorAll('#details .exports-col .ex-count')]"
+                            ".every((n) => n.textContent !== '…')")
+        method = p.locator("#details .report-outline li").nth(6).inner_text()
+        assert method.startswith("Method, tools, versions, rule sets, ") and method.endswith(", and the build")
+
+
 def test_the_header_line_reads_every_evidence_check_and_follows_a_findings_summary(browser, overview_case):  # noqa: F811
     """The case was closed with its evidence matching; a later full re-hash found a file changed, and a
     run's check of another file matched after it. The line says closed and changed, since a close outranks no later
@@ -385,6 +445,116 @@ def test_the_header_line_and_integrity_name_files_no_re_hash_could_check(browser
         p.wait_for_selector("#ovRehash")
         assert p.locator("#ovRehash").inner_text() == (
             f"Last full re-hash: {day}, by the verify command: every file with an intake hash matched")
+
+
+MANIFEST_CHANGES = {
+    "differs": ("manifest.jsonl differs from its record", "differed from its record"),
+    "grew": ("manifest.jsonl grew past its record", "grew past its record"),
+}
+
+
+@pytest.mark.parametrize("state", list(MANIFEST_CHANGES))
+def test_the_header_line_and_integrity_warn_when_only_the_manifest_changed(browser, synthetic_case, state):  # noqa: F811
+    """A full re-hash whose only problem is manifest.jsonl against its record in the journal has no problem file, so the
+    header's line and Integrity's re-hash warn of the manifest and never say the re-hash matched, and Integrity's
+    manifest line says what the re-hash found."""
+    from glessner.cli import main
+
+    (synthetic_case.evidence / "DC01" / "a.txt").write_text("first", encoding="utf-8")
+    assert main(["intake", str(synthetic_case.folder)]) == 0
+    seq = json.loads((synthetic_case.folder / "journal.jsonl").read_bytes().splitlines()[-1])["seq"]
+    if state == "differs":   # every entry still reads alike
+        path = synthetic_case.manifest_path
+        path.write_bytes(path.read_bytes().replace(b'"method": ', b'"method":  '))
+    else:   # a stop between Add new evidence's replace and its record
+        (synthetic_case.evidence / "DC01" / "b.txt").write_text("second", encoding="utf-8")
+        add_new(synthetic_case)
+    assert main(["verify", str(synthetic_case.folder)]) == 1
+    last = json.loads(synthetic_case.verification_path.read_text().splitlines()[-1])
+    day, checked = last["at"][:10], last["files_checked"]
+    warning, found = MANIFEST_CHANGES[state]
+    for p in served_page(browser, synthetic_case, tab="overview", setup=no_tool_scan):
+        line = p.locator("#caseState")
+        title = line.get_attribute("title")
+        assert line.inner_text() == f"Open · {warning} · analyst cody"
+        assert line.locator(".warn").inner_text() == warning and "matched" not in title
+        # The newest check's sentence names what it found, which is no problem file
+        assert f"(manual full verification), listed {checked} file{'s' if checked > 1 else ''}: {warning}." in title
+        p.wait_for_selector("#ovRehash")
+        assert p.locator("#ovRehash").inner_text() == f"Last full re-hash: {day}, by the verify command: {warning}"
+        assert p.locator("#ovIntegrity #ovManifest.warn").inner_text() == (
+            f"manifest.jsonl: {found}, entry #{seq}, at the last full re-hash")
+
+
+def test_the_header_line_names_a_changed_evidence_file_and_the_manifest_together(browser, synthetic_case):  # noqa: F811
+    """A full re-hash that found a changed evidence file and manifest.jsonl differing from its record warns of both, in
+    the header's line and in the newest check's sentence of its hover."""
+    from glessner.cli import main
+
+    evidence = synthetic_case.evidence / "DC01" / "a.txt"
+    evidence.write_text("first", encoding="utf-8")
+    assert main(["intake", str(synthetic_case.folder)]) == 0
+    path = synthetic_case.manifest_path
+    path.write_bytes(path.read_bytes().replace(b'"method": ', b'"method":  '))
+    evidence.write_text("changed", encoding="utf-8")
+    assert main(["verify", str(synthetic_case.folder)]) == 1
+    warning = "manifest.jsonl differs from its record"
+    for p in served_page(browser, synthetic_case, tab="overview", setup=no_tool_scan):
+        line = p.locator("#caseState")
+        assert line.inner_text() == f"Open · evidence changed since intake: 1 file; {warning} · analyst cody"
+        assert line.locator(".warn").inner_text() == f"evidence changed since intake: 1 file; {warning}"
+        assert f"(manual full verification), listed 1 file: 1 problem; {warning}." in line.get_attribute("title")
+
+
+def test_the_header_line_and_integrity_warn_of_a_missing_manifest_the_journal_records(browser,  # noqa: F811
+                                                                                       synthetic_case):
+    """A missing manifest.jsonl that the journal records is a warning in the header's line, with the words to restore it
+    in its hover, and in Integrity's manifest line, never a case still waiting for intake, whatever the last full
+    re-hash found."""
+    from glessner.cli import main
+
+    (synthetic_case.evidence / "DC01" / "a.txt").write_text("first", encoding="utf-8")
+    assert main(["intake", str(synthetic_case.folder)]) == 0
+    seq = json.loads((synthetic_case.folder / "journal.jsonl").read_bytes().splitlines()[-1])["seq"]
+    assert main(["verify", str(synthetic_case.folder)]) == 0
+    synthetic_case.manifest_path.unlink()
+    for p in served_page(browser, synthetic_case, tab="overview", setup=no_tool_scan):
+        line = p.locator("#caseState")
+        assert line.inner_text() == "Open · manifest.jsonl is missing · analyst cody"
+        assert line.locator(".warn").inner_text() == "manifest.jsonl is missing"
+        assert (f"manifest.jsonl is missing, but the journal records it, entry #{seq}. Restore it from a copy of the "
+                "case.") in line.get_attribute("title")
+        p.wait_for_selector("#ovManifest")
+        assert p.locator("#ovIntegrity #ovManifest.warn").inner_text() == (
+            f"manifest.jsonl: missing, but the journal records it, entry #{seq}; restore it from a copy of the case")
+
+
+@pytest.mark.parametrize(("name", "warns"), [("no head recorded here", True), ("a break", True),
+                                             ("a first record from Add new evidence", False)])
+def test_the_header_line_warns_when_a_copy_s_record_is_one_its_source_could_not_vouch_for(browser, synthetic_case,  # noqa: F811
+                                                                                         tmp_path, name, warns):
+    """A copy whose full re-hash matched has a warning in the header's line from its first open, before it has made a
+    full re-hash of its own, and after it, when its manifest record is one its source couldn't vouch for: the source's
+    journal had a break, or no head of it was recorded on this computer. The hover gives the reasons' words. A source
+    whose first record came with Add new evidence is a note, in the hover only."""
+    from glessner.cli import main
+
+    copy, record = copy_naming_reasons(synthetic_case, tmp_path, name, verified=True)
+    for rehash in (None, "the copy's own"):
+        if rehash:
+            assert main(["verify", str(copy.folder)]) == 0
+        day = json.loads(copy.verification_path.read_text(encoding="utf-8").splitlines()[-1])["at"][:10]
+        matched = f"full re-hash matched on {day}"
+        for p in served_page(browser, copy, tab="overview", setup=no_tool_scan):
+            line = p.locator("#caseState")
+            assert unvouched_words(record) in line.get_attribute("title")
+            if warns:
+                warning = "manifest record: its source could not vouch for it"
+                assert line.inner_text() == f"Open · {matched}; {warning} · analyst {copy.settings.analyst}"
+                assert line.locator(".warn").inner_text() == warning
+            else:
+                assert line.inner_text() == f"Open · {matched} · analyst {copy.settings.analyst}"
+                assert line.locator(".warn").count() == 0
 
 
 def dc_log_event(case):

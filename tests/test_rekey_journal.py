@@ -38,17 +38,19 @@ def evtx_uids(case, n=3):
         con.close()
 
 
-def rekey(case, journal, pairs, **fields):
-    """What the upgrade leaves: the events under their new IDs, and the entry that maps the old ones."""
+def rekey(case, journal, pairs, formats=(4, 5), **fields):
+    """What the upgrade leaves: the events under their new IDs, and the entry that maps the old ones, an upgrade from
+    and to `formats`."""
     con = connect(case.db_path)
     try:
         for old, new in pairs.items():
             con.execute("UPDATE events SET event_uid = ? WHERE event_uid = ?", [new, old])
     finally:
         con.close()
-    # 3 to 4: the journal is chained, and only a later format's upgrade may carry a rekey after the chain starts
-    return journal.append("case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="Event IDs changed.",
-                          rekey={"pairs": pairs, **fields})
+    # After the chain starts, only a later format's upgrade carries a rekey, to a format above this build's format 4
+    from_format, to_format = formats
+    return journal.append("case_upgrade", who=SYSTEM, from_format=from_format, to_format=to_format,
+                          text="Event IDs changed.", rekey={"pairs": pairs, **fields})
 
 
 def test_every_action_says_which_of_its_fields_name_events():
@@ -195,8 +197,8 @@ def test_a_rekey_appended_between_a_reader_s_two_passes_is_read_through(syntheti
     writer.append("mark", targets=[a, z], value="malicious", note="")
     first_pass, raced = journal_module._rekeys, []
 
-    def racing(path, start, lines, chained):
-        found = first_pass(path, start, lines, chained)
+    def racing(path, start, lines, chained, *place):
+        found = first_pass(path, start, lines, chained, *place)
         if not raced:
             raced.append(True)
             rekey(synthetic_case, writer, {a: b})   # another writer's, between the two passes
@@ -236,7 +238,7 @@ def test_translation_is_by_place_in_the_file_and_rekeys_compose(synthetic_case):
         assert app.orphans == 1   # #4's a, which no event has since #3
 
     opened(first)
-    later = rekey(synthetic_case, journal, {b: c, z: a})["seq"]           # a is z's new ID here; the open added rules
+    later = rekey(synthetic_case, journal, {b: c, z: a}, (5, 6))["seq"]   # a is z's new ID here; the open added rules
     state = replay(journal.path)
     assert {u: m.value for u, m in state.marks.items()} == {c: "malicious", a: "authorized"}   # #5 after #4
     entries = read_entries(journal.path)

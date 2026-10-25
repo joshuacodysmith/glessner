@@ -1,6 +1,9 @@
 import os
 
-from glessner.tools import DetectedTool, detect, find_dotnet, load_registry, recommend, tool_env
+import pytest
+import yaml
+
+from glessner.tools import REGISTRY_DIR, DetectedTool, detect, find_dotnet, load_registry, recommend, tool_env
 
 
 def test_registry_loads_all_tools():
@@ -70,3 +73,27 @@ def test_builtin_tool_is_found_without_a_tools_folder():
 
     found = detect([load_registry()["event_xml"]], None)["event_xml"]
     assert (str(found.executable), found.version) == (sys.executable, build_id())   # the app's build
+
+
+def test_the_registry_names_the_tool_files_no_argument_names_and_how_each_set_is_named():
+    """Suricata needs neither: its arguments name its configuration and rule files, and its rules block names its set."""
+    specs = load_registry()
+    assert {s.id: s.tool_files for s in specs.values() if s.tool_files} == {
+        "hayabusa": ("rules", "config"), "evtxecmd": ("Maps",), "sqlecmd": ("Maps",), "recmd": ("Plugins",)}
+    assert {s.id: s.rules_label["kind"] for s in specs.values() if s.rules_label} == {
+        "hayabusa": "git", "evtxecmd": "count", "sqlecmd": "count", "recmd": "version_line"}
+    assert specs["suricata"].rules and specs["suricata"].rules_label is None
+
+
+@pytest.mark.parametrize("label", [
+    {"kind": "svn", "path": "Maps", "text": "Maps {value}"},   # a kind the registry doesn't know
+    {"kind": "count", "text": "Maps {value}"},                  # no path
+    {"kind": "count", "path": "Maps", "text": "Maps"},          # no {value} in its text
+    "count",
+])
+def test_a_rules_label_without_a_known_kind_a_path_and_a_value_is_refused(tmp_path, label):
+    entry = yaml.safe_load((REGISTRY_DIR / "evtxecmd.yaml").read_text(encoding="utf-8"))
+    entry["rules_label"] = label
+    (tmp_path / "evtxecmd.yaml").write_text(yaml.safe_dump(entry), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"evtxecmd\.yaml: rules_label needs a kind, one of \['git', 'count'"):
+        load_registry(tmp_path)

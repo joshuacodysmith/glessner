@@ -36,10 +36,24 @@ export function renderExportScope() {
 // Report and Exports each open with the Details band's look, so the column reads as two sections
 const sectionBand = (name) => el('h2', { class: 'band details' }, el('span', { class: 'name' }, name));
 
-// The column, drawn at once with its controls and filled from /api/exports_page, which every write reads again
-export function exportsColumn() {
+let newest = null;   // the newest column's state, which summaryDraft reads
+
+// The Summary's text when it isn't the summary as the column read or saved it, for the place a reload puts back; null
+// when nothing typed is unsaved. Until the column's first read answers, a draft it was given is still unsaved, with
+// what was typed in the box since.
+export function summaryDraft() {
+  if (!newest || !newest.summary.isConnected) return null;
+  if (!newest.loaded) return newest.draft === null ? null : newest.summary.value;
+  return newest.summary.value === newest.saved ? null : newest.summary.value;
+}
+
+// The column, drawn at once with its controls and filled from /api/exports_page, which every write reads again.
+// `summary` is a draft of the Summary's text, kept across a reload or a redraw of the page, which the box shows at once
+// in place of the saved one.
+export function exportsColumn({ summary = null } = {}) {
   const col = el('section', { class: 'exports-col' });
-  const fill = { counts: {}, files: el('div', { class: 'files-box' }), summary: null, loaded: false };
+  const fill = { counts: {}, files: el('div', { class: 'files-box' }), summary: null, loaded: false, saved: '', draft: summary };
+  newest = fill;
   const count = (name) => { fill.counts[name] = el('span', { class: 'ex-count' }, '…'); return fill.counts[name]; };
   const reload = async () => {
     let facts;
@@ -52,13 +66,16 @@ export function exportsColumn() {
       indicators: `${plural(facts.indicators, 'value')} from ${plural(facts.malicious, 'Malicious mark')}`,
       hosts: `${plural(facts.hosts, 'host')}: roles, names, IPs, offsets`,
       evidence: `re-hashed when written: ${plural(facts.evidence_files, 'file')}; the journal's head`,
-      method: `tools, versions, ${plural(facts.runs, 'run')}, and the build`,
+      method: `tools, versions, rule sets, ${plural(facts.runs, 'run')}, and the build`,
       marked: `${plural(facts.marked, 'marked event')}, ${facts.flagged.toLocaleString()} of them Malicious or Suspicious`,
       values: `${plural(facts.indicators, 'value')} from ${plural(facts.malicious, 'Malicious mark')}: IPs, domains, hashes, accounts, files, services, tasks`,
       entries: `${plural(facts.journal_entries, 'entry', 'entries')} in plain words`,
     };
     for (const [name, text] of Object.entries(texts)) fill.counts[name].textContent = text;
-    if (!fill.loaded) fill.summary.value = facts.summary;   // the analyst's draft is not overwritten by a later reload
+    if (!fill.loaded) {   // the analyst's text is not overwritten by a later reload
+      fill.saved = facts.summary;
+      if (fill.draft === null) fill.summary.value = facts.summary;
+    }
     fill.loaded = true;
     fill.files.replaceChildren(...writtenFiles(facts));
   };
@@ -80,6 +97,7 @@ export function exportsColumn() {
   col.append(...reportSection(count, fill, applied, filterBody, filtered, result, run),
              ...exportsSection(count, filtered, run),
              el('h3', { class: 'written-head' }, 'Written from this case'), fill.files);
+  if (summary !== null) fill.summary.value = summary;
   reload();
   return col;
 }
@@ -97,7 +115,7 @@ function reportSection(count, fill, applied, filterBody, filtered, result, run) 
   const save = button('Save summary', async () => {
     try {
       const res = await post('/api/setting', { name: 'report_summary', value: summary.value });
-      summary.value = res.value;
+      summary.value = fill.saved = res.value;
       reportAction(res.value ? 'Saved the report summary' : 'Cleared the report summary', res.server_ms);
       fill.counts.summary.textContent = res.value ? `written: ${plural(res.value.split(/\s+/).filter(Boolean).length, 'word')}`
         : 'empty: the report says so';

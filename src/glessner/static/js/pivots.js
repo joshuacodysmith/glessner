@@ -168,9 +168,10 @@ function renderShort(state) {
                                ui.caveat.textContent ? el('span', { class: 'cv' }, 'caveat') : null].filter(Boolean));
 }
 
-// A caveat's text, led by the word "Caveat:". An empty text leaves the div empty, which hides it.
+// A caveat's text, led by the word "Caveat:". An empty text leaves the div empty, which hides it. The text can name an
+// evidence path, the long path an 8.3 path stands for, so it goes in through el.
 function setCaveat(state, text) {
-  state.ui.caveat.replaceChildren(...(text ? [el('strong', {}, 'Caveat:'), ` ${text}`] : []));
+  state.ui.caveat.replaceChildren(...(text ? [el('strong', {}, 'Caveat:'), el('span', {}, ` ${text}`)] : []));
   renderShort(state);
 }
 

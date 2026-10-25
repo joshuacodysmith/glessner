@@ -19,7 +19,7 @@ import re
 import threading
 import time
 from collections import Counter
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Collection, Iterable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -29,7 +29,7 @@ from typing import NamedTuple
 import yaml
 
 from . import heads
-from .case import CASE_FILE, FIRST_CHAINED, JOURNAL_FILE, Case, ends_open
+from .case import CASE_FILE, CASE_FORMAT, FIRST_CHAINED, JOURNAL_FILE, Case, KeptAtFormat, ends_open
 from .parsers.common import normalize_ip
 from .tags import TagError, normalize_tag
 from .version import build_id
@@ -44,12 +44,13 @@ MARK_VALUES = ("unreviewed", "authorized", "suspicious", "malicious")
 # case_open and case_upgrade are the app's record of the builds that opened the case for work and of the format upgrades
 # they made; replay applies nothing from them. The app's other records of the chain are case_created, which
 # starts it, case_yaml, which records case.yaml's bytes, journal_recovered, a line end added or a torn line moved aside,
-# and chain_break, the analyst's choice to continue past a break.
+# and chain_break, the analyst's choice to continue past a break. manifest_recorded records manifest.jsonl's bytes as
+# intake, Add new evidence, or a copy of the case wrote them.
 ACTIONS = {"mark", "note", "host_role", "host_identity", "host_offset", "case_setting",
            "rule_add", "rule_change", "rule_remove", "suggestion_decision", "tag", "tag_suggestion",
            "undo", "note_retract", "host_split", "case_open", "case_upgrade",
            "case_created", "case_yaml", "journal_recovered", "chain_break",
-           "followup", "finding", "file_written"}
+           "followup", "finding", "file_written", "manifest_recorded"}
 # What an undo can reverse: the analysis entries. An undo is one entry holding its reversing
 # changes, each in the form of one of these actions, so a replay applies them as it would the originals. A host split
 # is undone from the Hosts panel instead, as an entry of its own, and a finding from the Findings page.
@@ -66,6 +67,19 @@ TITLE_MAX = 200
 FILE_KINDS = ("timeline", "findings_summary", "report", "audit_trail", "indicators")
 FILE_FORMATS = ("csv", "jsonl", "md")
 FILE_MARKS = ("all", "marked", "flagged")
+MANIFEST_VIA = ("intake", "add", "copy")   # what wrote the manifest a manifest_recorded entry records
+# Why a copy's record of manifest.jsonl comes with a warning, in the order the outputs word them: its source's journal
+# had a break, its head wasn't recorded on this computer, or its first record came with Add new evidence. Each is a
+# sentence with no final period, since the outputs join them to their own.
+UNVOUCHED_WORDS = {
+    "break": "The source's journal had a break, so it could not vouch for this record",
+    "no_head": "No head of the source's journal was recorded on this computer, so nothing showed that this record was "
+               "not added later",
+    "add": "The source's first record came with Add new evidence, so nothing shows that the lines before it are as intake "
+           "wrote them"}
+# The reasons whose record the source couldn't vouch for, which outputs warn of; a source's first record that came with
+# Add new evidence is a note
+UNVOUCHED_WARNS = ("break", "no_head")
 TAG_DECISIONS = ("dismissed", "restored")
 SYSTEM = "glessner"   # the 'who' for entries the app writes itself, such as built-in rules
 # Every name the app has written as its own 'who': journals from before the rename say triage-workbench and
@@ -85,7 +99,7 @@ ID_FIELDS: dict[str, tuple[str, ...]] = {
     "rule_remove": (), "host_split": (), "case_open": (), "case_upgrade": (),
     "case_created": (), "case_yaml": (), "journal_recovered": (), "chain_break": (),
     # A finding's `finding` is an entry number, not an event ID, so only its targets are read through a rekey
-    "followup": ("targets",), "finding": ("targets",), "file_written": (),
+    "followup": ("targets",), "finding": ("targets",), "file_written": (), "manifest_recorded": (),
 }
 EVENT_ID = re.compile(r"[0-9a-f]{32}")   # events.event_uid's form; a repeat's ordinal is inside the hash
 REKEYED = "ids_changed_at"   # what translate adds to an entry whose IDs it changed: the rekeys' entry numbers
@@ -172,6 +186,9 @@ class State:
     findings: dict[int, dict] = field(default_factory=dict)
     files: list[dict] = field(default_factory=list)
     decision_notes: dict[tuple[str, str], dict] = field(default_factory=dict)
+    # The chained records of manifest.jsonl in journal order, each {seq, at, who, sha256, bytes, lines, via},
+    # and a copy's unvouched reasons when it names any
+    manifests: list[dict] = field(default_factory=list)
     last_seq: int = 0
 
 
@@ -183,6 +200,8 @@ class Chain:
     nonblank: int = 0        # lines read that aren't blank, which a seal counts
     last: int = 0            # where the last line read starts
     chained: bool = False    # whether the chain's first line has been read
+    # Whether a chained line has been read that closes the place of REKEY_STEP's rekey for the lines after it (_past_step)
+    past_step: bool = False
     head: str = ZERO         # SHA-256 of the last chained line read, whatever it holds: the journal's head
     seq: int | None = None   # the number the chain is at; an unreadable line takes one
     entries: int = 0         # chained lines read
@@ -286,25 +305,79 @@ def _replayable(entry: dict) -> bool:
     return _number(entry.get("seq")) and all(isinstance(entry.get(k), str) for k in ("at", "who", "action"))
 
 
-def _rekey_ok(entry: dict, chained: bool) -> bool:
+# The one upgrade up to this build's format that carries a rekey of event IDs after the chain starts: the step from
+# format 3 to 4, which gives found output the IDs its path under the evidence folder makes (rekey.upgrade_format_4)
+REKEY_STEP = (3, 4)
+# The action words of the lines that close that step's place (_past_step), which the readers that scan a journal for its
+# rekeys or for that place parse a line for (_may_close)
+STEP_WORDS = (b'"case_created"', b'"case_upgrade"', b'"manifest_recorded"')
+
+
+def _may_close(raw: bytes) -> bool:
+    """Whether a line's bytes may be one that closes the step's place (_past_step), and so are parsed: they name one of
+    STEP_WORDS, or hold a backslash-u escape, which can spell any of them another way."""
+    return b"\\u" in raw or any(word in raw for word in STEP_WORDS)
+
+
+def _past_step(entry: dict | None) -> bool:
+    """Whether a chained line closes the place of REKEY_STEP's rekey for the lines after it: the step's own entry,
+    whatever it holds; a case_created that says the case began at format 4 or later (`case_format`); or a
+    manifest_recorded, which only a case at format 4 or later holds. `entry` is the line as every reader parses a chained
+    line (strict), None when it isn't one JSON object. A rekey that follows such a line can't be the step's."""
+    if entry is None:
+        return False
+    action = entry.get("action")
+    if action == "case_upgrade":
+        old, new = entry.get("from_format"), entry.get("to_format")
+        return _number(old) and _number(new) and (old, new) == REKEY_STEP
+    if action == "case_created":
+        return _number(entry.get("case_format")) and entry["case_format"] >= REKEY_STEP[1]
+    return action == "manifest_recorded"
+
+
+def _past_before(path: Path, at: int) -> bool:
+    """_past_step for the chained lines of the journal before byte `at`, read from the file's start as _read reads them."""
+    chained = past = False
+    with path.open("rb") as f:
+        while f.tell() < at and (line := f.readline()):
+            raw = line[:-1]
+            chained = chained or _chained(raw)
+            if chained and not past and _may_close(raw):
+                past = _past_step(strict(raw))
+    return past
+
+
+def _described(rekey: dict) -> bool:
+    """Whether a rekey describes its map as the step in REKEY_STEP writes it: the runs it read, its pairs as a map, and the
+    size and SHA-256 of the whole map, which holds at least its pairs."""
+    runs, pairs, size, digest = rekey.get("runs"), rekey.get("pairs"), rekey.get("map_size"), rekey.get("map_sha256")
+    return (isinstance(runs, dict) and bool(runs) and isinstance(pairs, dict) and _number(size) and size >= len(pairs)
+            and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None)
+
+
+def _rekey_ok(entry: dict, chained: bool, past: bool = False) -> bool:
     """Whether a rekey entry (is_rekey) is one a build of this format can have written. A rekey re-points every earlier
     entry's event IDs, so it is the one append that must not come from anyone. Before the chain starts, an unchained line
-    is format 2's step. Once it has, no unchained line is, and a chained one is a later format's upgrade, from a format
-    that has the chain to the next: no format 3 build writes one, and a chain of format 3 never holds a rekey to a format
-    at or below its own. `chained` is whether a chained line came before."""
+    is format 2's step. Once it has, no unchained line is, and a chained one is the step in REKEY_STEP with its map
+    described (_described) and before any line that closes its place (`past`, _past_step), or a later format's upgrade,
+    from a format that has the chain to one above CASE_FORMAT: no other step this build runs after the chain starts
+    carries one. `chained` is whether a chained line came before."""
     if "prev" not in entry:
         return not chained
     old, new = entry.get("from_format"), entry.get("to_format")
-    return _number(old) and _number(new) and old >= FIRST_CHAINED and new > old
+    if not (_number(old) and _number(new) and old >= FIRST_CHAINED):
+        return False
+    return new > max(old, CASE_FORMAT) or ((old, new) == REKEY_STEP and not past and _described(entry["rekey"]))
 
 
-def _rekey_break(entry: dict) -> tuple[str, str]:
+def _rekey_break(entry: dict, past: bool = False) -> tuple[str, str]:
     """The (kind, text) of a chained rekey that _rekey_ok refuses, or ("", "") for any other entry."""
-    if not is_rekey(entry) or _rekey_ok(entry, False):
+    if not is_rekey(entry) or _rekey_ok(entry, False, past):
         return "", ""
     return "rekey", (f"a rekey of event IDs, from format {entry.get('from_format')!r} to {entry.get('to_format')!r}, "
-                     "which no build of this format writes: only a later format's upgrade carries one after the chain "
-                     "starts")
+                     "which no build of this format writes: after the chain starts, only a later format's upgrade carries "
+                     "one, and the step from format 3 to 4 when it describes its map and comes before the case's "
+                     "format 4 entries and before any other step from 3 to 4")
 
 
 def _follows(entry: dict, chain: Chain, path: Path | None = None) -> bool:
@@ -312,7 +385,7 @@ def _follows(entry: dict, chain: Chain, path: Path | None = None) -> bool:
     rekey of event IDs no build of this format writes (_rekey_break), which would be a break once its line end is added.
     Before the chain's first line it is the entry that starts the chain (_starts, which reads the seal's bytes from
     `path`), so a first line missing only its LF is the chain's start as it would be with it."""
-    if "prev" not in entry or lacks(entry) or entry["prev"] != chain.head or _rekey_break(entry)[0]:
+    if "prev" not in entry or lacks(entry) or entry["prev"] != chain.head or _rekey_break(entry, chain.past_step)[0]:
         return False
     if chain.chained:
         return _number(chain.seq) and entry["seq"] == chain.seq + 1
@@ -355,7 +428,7 @@ def _link(path: Path, raw: bytes, chain: Chain, n: int) -> tuple[dict | None, st
         if problem := lacks(entry):
             return entry, "envelope", problem
         if _starts(path, entry, chain):
-            return entry, *_rekey_break(entry)
+            return entry, *_rekey_break(entry, chain.past_step)
         return entry, "chain_missing", (f"the chain must start with case_created at the top, or with a seal that matches "
                                         f"the {chain.offset:,} bytes before it")
     if not raw.strip():
@@ -374,7 +447,7 @@ def _link(path: Path, raw: bytes, chain: Chain, n: int) -> tuple[dict | None, st
                                "moved here")
     if _number(chain.seq) and entry["seq"] != chain.seq + 1:
         return entry, "seq", f"seq {entry['seq']} doesn't follow {chain.seq}"
-    return entry, *_rekey_break(entry)
+    return entry, *_rekey_break(entry, chain.past_step)
 
 
 def _unchained(path: Path, raw: bytes, n: int, f, *, stop: bool) -> dict | None:
@@ -435,7 +508,7 @@ def _read(path: Path, chain: Chain, *, format2: bool = True, skip: set[int] | No
     misses on a line already there, or for a caller that passes none, is a break and is not given, so a reader starts
     again at most once for each line. A rekey _apply can't take, which the first pass leaves out, is given as it is,
     for the state to leave out, and translates nothing."""
-    rekeys = _rekeys(path, chain.offset, chain.lines, chain.chained)
+    rekeys = _rekeys(path, chain.offset, chain.lines, chain.chained, chain.past_step)
     given = False
     with path.open("rb") as f:
         f.seek(chain.offset)
@@ -455,7 +528,7 @@ def _read(path: Path, chain: Chain, *, format2: bool = True, skip: set[int] | No
                     sealed = _seal_matches(path, parsed.get("sealed"), chain.offset, chain.nonblank)
             else:
                 parsed = entry = _unchained(path, raw, n, f, stop=format2)
-            if entry is not None and is_rekey(entry) and not _rekey_ok(entry, chain.chained):
+            if entry is not None and is_rekey(entry) and not _rekey_ok(entry, chain.chained, chain.past_step):
                 entry = None   # a rekey no build of this format wrote translates nothing; the case shows it as a break
             if skip and n in skip:
                 entry = None
@@ -485,6 +558,7 @@ def _read(path: Path, chain: Chain, *, format2: bool = True, skip: set[int] | No
                 chain.start = {"line": n, "seq": seq, "action": parsed.get("action")}
             chain.head = h
             chain.entries += 1
+            chain.past_step = chain.past_step or _past_step(parsed)
             if _number(seq):
                 chain.seq = seq
             elif _number(chain.seq):
@@ -504,9 +578,10 @@ class _Reread(Exception):
     writer appended it. The reader starts again from the first line, once for each such line."""
 
 
-def _rekeys(path: Path, start: int, lines: int, chained: bool) -> list[tuple[int, dict]]:
+def _rekeys(path: Path, start: int, lines: int, chained: bool, past: bool = False) -> list[tuple[int, dict]]:
     """The rekey entries from byte `start` on, which follows line `lines`, each with its line's number; `chained` is
-    whether a chained line came before. They must be the lines _read gives as rekeys, or the read starts again
+    whether a chained line came before, and `past` whether one that closes the place of REKEY_STEP's rekey did
+    (_past_step), which the scan keeps up as it reads. They must be the lines _read gives as rekeys, or the read starts again
     (_Reread) and then reports the rekey as a break, so each whole line is parsed as the read parses it: strictly once
     the chain has started or for a chained line, as format 2's reader parsed it otherwise, and the scan stops where the
     read stops. Only lines that name both words are parsed, lines with a \\u escape, which can spell either another
@@ -524,11 +599,13 @@ def _rekeys(path: Path, start: int, lines: int, chained: bool) -> list[tuple[int
                 break   # the read stops at the last LF, and before a last line holding 0x00
             lines += 1
             now = chained or _chained(raw)   # whatever its spelling of prev, as _read decides
-            if b"\\u" in raw or b"\0" in raw or (b'"rekey"' in raw and b'"case_upgrade"' in raw):
+            if (b"\\u" in raw or b"\0" in raw or (b'"rekey"' in raw and b'"case_upgrade"' in raw)
+                    or (now and not past and _may_close(raw))):
                 entry = strict(raw) if now else _format2(raw)
-                if (entry is not None and is_rekey(entry) and not (now and lacks(entry)) and _rekey_ok(entry, chained)
+                if (entry is not None and is_rekey(entry) and not (now and lacks(entry)) and _rekey_ok(entry, chained, past)
                         and _applies(entry)):
                     found.append((lines, entry))
+                past = past or (now and _past_step(entry))
             chained = now
     return found
 
@@ -695,9 +772,11 @@ class Journal:
         # Breaks found outside the read, under the lock: the newest line changed, the bytes after the last LF, and the
         # head recorded outside the case
         self.problems: list[dict] = []
-        # What the open found of the head recorded outside the case: {seq, at, after}, `after` counting the entries that
-        # follow it by action; None without a record
+        # What this object's first check found of the head recorded outside the case: {seq, at, after}, `after` counting
+        # the entries that follow it by action; None without a record. An upgrade step's entry moves the record before
+        # the open checks it again, so the open keeps the first check's count
         self.recorded: dict | None = None
+        self._record_checked = False   # whether this object has run that first check
         self.recovered: list[dict] = []   # the journal_recovered entries this object wrote
         self._opened = False   # whether this object has run the checks of an open for work
         self._case_yaml: str | None = None   # case.yaml's SHA-256 as the journal last recorded it
@@ -713,6 +792,11 @@ class Journal:
     def _read(self) -> tuple[int, int]:
         """The bytes and lines of the file the state holds."""
         return self.chain.offset, self.chain.lines
+
+    @property
+    def skipped_lines(self) -> frozenset[int]:
+        """The numbers of the lines replay couldn't apply, which the state leaves out, as a copy."""
+        return frozenset(self._skip)
 
     @property
     def breaks(self) -> list[dict]:
@@ -805,10 +889,10 @@ class Journal:
         work, by default a server's), `then`, such as the built-in rules, and the head record. On a break nothing is
         written, and read_only says why. A journal with no chained line is "chain missing": the open comes after the
         upgrade, which starts the chain, so its chained lines were removed. A first line cut just before its LF is the
-        chain (_started): _prepare ends it and records that."""
+        chain (started): _prepare ends it and records that."""
         with self.held():
             self._catch_up()
-            if not self._started():
+            if not self.started():
                 if not any(p["kind"] == "chain_missing" for p in self.problems):
                     self.problems.append(_break(None, None, "chain_missing", "the journal has no chained line, so its "
                                                                              "hash chain is missing"))
@@ -822,6 +906,35 @@ class Journal:
                 then()
             self._record_head()
 
+    def check_for_upgrade(self) -> bool:
+        """The checks an upgrade step from a format with the chain runs before its entry, or before its number when an
+        earlier run journaled the entry, under the held context: the lines added since this object's read, then an
+        append's checks (_prepare), which at this object's first are an open's, with what they write. KeptAtFormat when
+        the journal has no chain or a break puts it in read-only mode: the case stays at its format and opens read-only.
+        A lock that isn't free within LOCK_WAIT raises JournalError. Returns whether a line before the check closes the
+        place of REKEY_STEP's rekey (_past_step), after which the step's entry may not carry one."""
+        with self.held():
+            self._catch_up()
+            if not self.started():
+                raise KeptAtFormat(self.read_only or "The journal has no hash chain")
+            self._prepare()
+            if reason := self.read_only:
+                raise KeptAtFormat(reason)
+            return self.chain.past_step
+
+    def check_for_append(self) -> str:
+        """An append's checks, run ahead of it by a writer that must not change a file the append would then refuse to
+        record, such as Add new evidence's replace of manifest.jsonl: the lines added since this object's read, then
+        _prepare, which at this object's first are an open's, with what they write. Returns why the append would be
+        refused, or "". The caller holds the held context from here through its append, so no other writer can change
+        the answer."""
+        with self.held():
+            self._catch_up()
+            if not self.started():
+                return self.read_only or NO_CHAIN
+            self._prepare()
+            return self.read_only
+
     def record_break(self, reason: str, who: str | None = None) -> dict:
         """Continue with the break on record: a chain_break entry with the reason, the breaks, and a seal of
         every byte before it, chained to the line just before it, whatever that line holds. Nothing is repaired. Bytes
@@ -831,7 +944,7 @@ class Journal:
             raise JournalError("Continuing with the break on record needs a reason")
         with self.held():
             self._catch_up()
-            if not self._started():
+            if not self.started():
                 raise JournalError("The journal has no hash chain yet, so it has no break to put on record")
             self._prepare()
             if not self.read_only:
@@ -860,9 +973,9 @@ class Journal:
     def _append_locked(self, action: str, who: str | None, payload: dict, build: str | None = None) -> dict:
         """The write of one entry, inside the held context, which append and the open's own writers re-enter. A
         journal with no chained line is refused: only the upgrade's record writes there. A first line missing
-        only its LF is the chain, and _prepare ends it first (_started)."""
+        only its LF is the chain, and _prepare ends it first (started)."""
         self._catch_up()
-        if not self._started():
+        if not self.started():
             raise JournalError(self.read_only or NO_CHAIN)
         self._prepare()
         if reason := self.read_only:
@@ -879,9 +992,9 @@ class Journal:
 
     def append_unchained(self, action: str, who: str | None = None, **payload) -> dict:
         """Format 2's append, with no prev, build, or client, into a journal with no chained line: the upgrade's record
-        of format 2's step, the one line a format 3 build writes there. That step mends the bytes after the
-        last LF first (mend_unchained), so a journal that still ends without one is refused here: this line would join
-        or follow bytes the seal must cover whole."""
+        of format 2's step, the one line a build of format 3 or later writes there. That step mends the bytes after
+        the last LF first (mend_unchained), so a journal that still ends without one is refused here: this line would
+        join or follow bytes the seal must cover whole."""
         _validate(action, payload)
         entry = {"seq": 0, "at": "", "who": "", "action": action, **payload}
         line_bytes(entry)   # a lone surrogate or NaN is refused before the file is opened
@@ -967,7 +1080,7 @@ class Journal:
                                         f"the newest line, entry #{self.chain.seq}, changed or was removed after this "
                                         "app read it"))
 
-    def _started(self) -> bool:
+    def started(self) -> bool:
         """Whether the journal has a chain: its first chained line is read, or it is the unended last line and starts
         the chain (_follows), such as a seal or a case_created cut just before its LF, which the next open or append ends
         with the LF (_prepare). A line that fails the start rule is no chain. Writes nothing and changes no state, so
@@ -1015,9 +1128,13 @@ class Journal:
         is an earlier line: a forged entry left without its LF looks like a crash's, and must be counted like one with
         it. A record that names no line is a break: the newest entries were removed or changed, or the journal
         replaced, while the app was closed. `first` is the open's check; a later one, before a line end is
-        added or a torn line moved aside, only looks for that break and leaves what the open found."""
-        if first:
+        added or a torn line moved aside, only looks for that break and leaves what the open found. Integrity's count,
+        self.recorded, is this object's first such check's: an upgrade step's entry, written between that check and the
+        open's, moves the record past the entries the first one counted."""
+        counting = first and not self._record_checked
+        if counting:
             self.recorded = None
+            self._record_checked = True
         record = heads.read(self.path.parent)
         if record is None:
             return
@@ -1043,7 +1160,7 @@ class Journal:
             return
         if tail and (entry := strict(tail)) is not None:
             after[entry["action"]] += 1
-        if first:
+        if counting:
             self.recorded = {"seq": record["seq"], "at": record.get("at", ""), "after": dict(after)}
 
     def _record_case_yaml(self) -> None:
@@ -1119,9 +1236,9 @@ def seal_of(path: Path) -> dict:
 
 
 def has_chain(path: Path) -> bool:
-    """Whether the journal holds a chained line, by any JSON spelling of prev: the upgrade sealed it, or a format 3 build
-    made it. A last line missing its LF counts, so a seal cut just before its LF isn't sealed again; whether that line
-    starts the chain is the open's question (Journal._started)."""
+    """Whether the journal holds a chained line, by any JSON spelling of prev: the upgrade sealed it, or a build of
+    format 3 or later made it. A last line missing its LF counts, so a seal cut just before its LF isn't sealed again;
+    whether that line starts the chain is the open's question (Journal.started)."""
     with path.open("rb") as f:
         return any(_chained(line.rstrip(b"\n")) for line in f)
 
@@ -1341,20 +1458,22 @@ def mend_unchained(path: Path) -> list[dict]:
 
 
 def start_chain(case: Case, client: str = "cli", **payload) -> dict:
-    """A case's case_created entry, naming the case and case.yaml's SHA-256, and the head recorded outside the case.
-    In an empty journal it starts the chain: line 1 at byte 0, prev of 64 zeros, as create_case and a format 3
-    source's copy_case write it. A copy of an older source is sealed by its upgrade first (upgraded_copy in rekey.py),
-    and the entry then follows the seal, with no case_yaml before it, since it records case.yaml's SHA-256 itself.
-    `payload` adds copied_from for a copy."""
+    """A case's case_created entry, naming the case, the case format it has now (`case_format`), and case.yaml's SHA-256,
+    and the head recorded outside the case. In an empty journal it starts the chain: line 1 at byte 0, prev of 64 zeros,
+    as create_case and the copy_case of a source with the chain write it. A copy of an older source is sealed by its
+    upgrade first (upgraded_copy in rekey.py), and the entry then follows the seal, with no case_yaml before it, since
+    it records case.yaml's SHA-256 itself. In both, the entries of the upgrade steps from a format with the chain
+    follow it, and a case that began at format 4 has none from 3 to 4 (_past_step). `payload` adds copied_from for a
+    copy."""
     journal = Journal(case, client)
     s = case.settings
     with journal.held():
         journal._catch_up()
         fields = {"name": s.name, "created_utc": s.created_utc, "analyst": s.analyst, "evidence_path": s.evidence_path,
-                  "case_yaml": _sha256((case.folder / CASE_FILE).read_bytes()), **payload}
+                  "case_yaml": _sha256((case.folder / CASE_FILE).read_bytes()), "case_format": s.case_format, **payload}
         _validate("case_created", fields)
         if journal.path.stat().st_size:
-            if not journal._started():   # a seal cut just before its LF is the chain: the append ends it first
+            if not journal.started():   # a seal cut just before its LF is the chain: the append ends it first
                 raise JournalError(f"{journal.path} isn't empty and has no hash chain, so the chain can't start in it")
             journal._case_yaml = fields["case_yaml"]   # recorded by this entry, so the open's check adds no case_yaml
             return journal._append_locked("case_created", SYSTEM, fields)
@@ -1403,9 +1522,15 @@ class Check:
     tail_bytes: int = 0
     problems: list[dict] = field(default_factory=list)   # each reason the result isn't "consistent", as _break gives
     files: list[tuple[int, int, str]] = field(default_factory=list)   # each file_written entry's (line, seq, sha256)
+    # Each chained manifest_recorded entry whose payload is whole, in journal order, as State.manifests holds it, with
+    # its line
+    manifests: list[dict] = field(default_factory=list)
     recovered: list[dict] = field(default_factory=list)   # the journal_recovered entries
     expected: tuple[int, int] | None = None   # the expected head's (line, seq), when it is a chained line
     after: dict[str, int] = field(default_factory=dict)   # entries after the expected head, by action
+    # Each side file an entry names, by name, with its size and modification time (side_stamp) as the check found them
+    # before it read the file; what a kept result depends on, besides the journal itself
+    sides: dict[str, tuple[int, int] | None] = field(default_factory=dict)
 
     @property
     def breaks(self) -> list[dict]:
@@ -1444,6 +1569,8 @@ def check(path: Path, expect: str | None = None, *, keep: bool = False, skip: Co
                 line, action = result.chain.lines + 1, entry["action"]
                 if action == "file_written":
                     result.files.append((line, entry["seq"], entry.get("sha256")))
+                elif action == "manifest_recorded" and manifest_ok(entry):
+                    result.manifests.append({"line": line, **manifest_of(entry)})
                 elif action == "journal_recovered":
                     result.recovered.append(entry)
                 if result.expected:
@@ -1469,7 +1596,7 @@ def check(path: Path, expect: str | None = None, *, keep: bool = False, skip: Co
         problems.insert(0, _break(None, None, "line_endings", "every line ends in CR LF: the line endings were "
                                                               "converted, such as by a copy through a tool that "
                                                               "changes them"))
-    problems += _side_problems(path.parent, sides)
+    problems += _side_problems(path.parent, sides, result.sides)
     if tail and _writing(path):
         result.tail = "writing"
     elif tail:
@@ -1478,6 +1605,8 @@ def check(path: Path, expect: str | None = None, *, keep: bool = False, skip: Co
             line = chain.lines + 1
             if entry["action"] == "file_written":
                 result.files.append((line, entry["seq"], entry.get("sha256")))
+            elif entry["action"] == "manifest_recorded" and manifest_ok(entry):
+                result.manifests.append({"line": line, **manifest_of(entry)})
             if result.expected:
                 after[entry["action"]] += 1
             elif result.head == expect:
@@ -1500,15 +1629,27 @@ def check(path: Path, expect: str | None = None, *, keep: bool = False, skip: Co
     return result
 
 
-def _side_problems(folder: Path, sides: list[tuple[int, dict]]) -> list[dict]:
+def side_stamp(folder: Path, name: str) -> tuple[int, int] | None:
+    """A side file's size and modification time, or None when it can't be read or isn't there."""
+    try:
+        stat = (folder / name).stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _side_problems(folder: Path, sides: list[tuple[int, dict]], stamps: dict | None = None) -> list[dict]:
     """Each side file an entry names (a journal_recovered's, a seal's `recovered`) that is missing from the case folder or
     doesn't hold the length and SHA-256 the entry recorded, which the chain covers, so replacing one would otherwise go
-    unnoticed. Only a name of the side files' form is read, never a path from the journal."""
+    unnoticed. Only a name of the side files' form is read, never a path from the journal. Each file's side_stamp, taken
+    before it is read, goes into `stamps` by name."""
     out = []
     for seq, one in sides:
         name = one.get("saved_as")
         if not (isinstance(name, str) and SIDE_FILE.fullmatch(name)):
             continue
+        if stamps is not None:
+            stamps[name] = side_stamp(folder, name)
         try:
             data = (folder / name).read_bytes()
         except OSError:
@@ -1529,6 +1670,91 @@ def entries(path: Path) -> list[dict]:
             return [entry for entry, _ in _read(path, Chain(), restarted=restarted)]
         except _Reread:
             continue
+
+
+def analyst(entry: dict) -> str:
+    """Who made an entry, as the trail, the report, and the overview list it: its `who` as written when that is a string,
+    "" when it has none, else the JSON text of what it holds. Format 2's reader gives a line as written, so a line under the
+    seal can hold a list, an object, a number, or null there."""
+    who = entry.get("who", "")
+    return who if isinstance(who, str) else json.dumps(who)
+
+
+def last_action(path: Path) -> dict | None:
+    """The journal's newest entry by someone, as entries() gives it, read from the file's end rather than by parsing every
+    line. The app's own entries, such as the build each new build journals when it opens the case, are left to the audit
+    trail and Integrity: they answer no "where was I". The case format upgrades' rekeys it passes on the way are exactly
+    those that follow the entry, so it is read through them, in file order, as every other reader reads it: through each
+    rekey the shared reader gives that _apply can take (_applies). A `who` that is not a string is someone's, as the audit
+    trail reads it."""
+    start = None   # where the chain starts (_chain_start), found the first time a line that names no prev needs it
+    with path.open("rb") as f:
+        size = f.seek(0, 2)
+        back = min(size, 65_536)
+        while True:
+            f.seek(size - back)
+            # As the shared reader reads: up to the last LF, and before a last line holding 0x00. Either is a write in
+            # progress, or a crash's
+            *lines, torn = f.read(back).split(b"\n")
+            end = size - len(torn) - 1   # where the newest whole line ends, at its LF
+            if lines and not torn and b"\0" in lines[-1]:
+                end -= len(lines.pop()) + 1
+            if back < size:
+                lines = lines[1:]   # the first may start mid-line
+            rekeys = []   # the rekeys passed that the shared reader applies, newest first
+            for line in reversed(lines):
+                at = end - len(line)   # where the line starts
+                end = at - 1           # where the line before it ends, at its LF
+                if not line.strip():
+                    continue
+                # A line is chained when it names prev, or when a chained line comes before it, as _read decides; an
+                # unchained line is parsed as format 2 read it
+                entry = strict(line)
+                chained = entry is not None and "prev" in entry
+                if not chained:
+                    start = _chain_start(path) if start is None else start
+                    chained = at > start
+                    entry = entry if chained else _format2(line)
+                # The step's rekey stands only before the lines that close its place, which only a read from the file's
+                # start knows
+                step = chained and entry is not None and is_rekey(entry) and (
+                    entry.get("from_format"), entry.get("to_format")) == REKEY_STEP
+                if not _given(entry, chained, step and _past_before(path, at)):
+                    continue
+                who = entry.get("who")
+                if not (isinstance(who, str) and who in APP_NAMES):
+                    return translate(entry, rekeys[::-1]) if rekeys else entry
+                if is_rekey(entry) and _applies(entry):
+                    rekeys.append(entry)
+            if back == size:
+                return None
+            back = min(size, back * 4)   # long lines, such as a mark of many events, or several build entries
+
+
+def _given(entry: dict | None, chained: bool, past: bool = False) -> bool:
+    """Whether the shared reader (_read) gives a line's entry, parsed as it parses the line, or None when that parse
+    failed. A chained line's entry must have an envelope replay can read, complete when it names prev (lacks), and no
+    entry may be a rekey that no build of this format writes (_rekey_ok). `chained` is whether the line is chained: it
+    names prev, or a chained line comes before it. _rekey_ok reads that only for an entry that names no prev, which is
+    chained only when a chained line comes before it. `past` is whether a line before it closes the place of the step's
+    rekey (_past_step)."""
+    if entry is None:
+        return False
+    if chained and (not _replayable(entry) or ("prev" in entry and lacks(entry))):
+        return False
+    return not is_rekey(entry) or _rekey_ok(entry, chained, past)
+
+
+def _chain_start(path: Path) -> int:
+    """Where the journal's first chained line starts (_chained), or its size when no line is chained: a line that starts
+    after it is chained, as the shared reader reads it."""
+    at = 0
+    with path.open("rb") as f:
+        for line in f:
+            if _chained(line.removesuffix(b"\n")):
+                break
+            at += len(line)
+    return at
 
 
 def replay(path: Path) -> State:
@@ -1657,15 +1883,28 @@ def referenced_ids(path: Path) -> References:
 def upgrade_recorder(journal: Journal):
     """case.upgrade's record: each step's case_upgrade entry, the app's own, with the fields the step gives,
     picked by the format it brings the case to: to format 2 or below, an unchained line,
-    as format 2's step wrote it; to format 3, the seal, the chain's first line; later, an ordinary chained entry. Each
-    runs inside the step, in the held context the seal step still holds, which is re-entrant in its thread."""
-    def record(old: int, new: int, fields: dict) -> dict:
+    as format 2's step wrote it; to format 3, the seal, the chain's first line; later, an ordinary chained entry, after
+    the checks of Journal.check_for_upgrade, so a journal with no chain or with a break raises KeptAtFormat and keeps the
+    case at its format. A later step whose entry is journaled already (fields None) gets the same checks and no entry,
+    so they run on `journal`, which at the server's open is the open's own: it keeps the first count of the entries
+    after the recorded head, and what the checks write names its client. An earlier step journaled already gets
+    nothing. Each runs inside the step, in the held context the seal step still holds, which is re-entrant in its
+    thread. The record's `check` runs the same checks on their own, for a step that changes the case before its entry
+    (case.check_journal)."""
+    def record(old: int, new: int, fields: dict | None) -> dict | None:
+        if new > FIRST_CHAINED:
+            with journal.held():
+                journal.check_for_upgrade()
+                if fields is None:
+                    return None
+                return journal.append("case_upgrade", who=SYSTEM, from_format=old, to_format=new, **fields)
+        if fields is None:
+            return None
         payload = {"from_format": old, "to_format": new, **fields}
         if new <= 2:
             return journal.append_unchained("case_upgrade", who=SYSTEM, **payload)
-        if new == 3:
-            return journal.seal(payload)
-        return journal.append("case_upgrade", who=SYSTEM, **payload)
+        return journal.seal(payload)
+    record.check = journal.check_for_upgrade
     return record
 
 
@@ -1808,6 +2047,10 @@ def _validate(action: str, payload: dict) -> None:
         _validate_finding(payload)
     elif action == "file_written":
         _validate_file(payload)
+    elif action == "manifest_recorded" and not manifest_ok(payload):
+        raise JournalError(f"manifest_recorded needs manifest.jsonl's 'sha256', its 'bytes' and 'lines', each an "
+                           f"integer from 0, and 'via', one of {MANIFEST_VIA}; a copy's may add 'unvouched', a list of "
+                           f"reasons from {tuple(UNVOUCHED_WORDS)}")
     elif action == "undo":
         if not isinstance(payload.get("undoes"), int) or payload.get("correction") != "accident":
             raise JournalError("undo needs the 'undoes' entry number and correction: accident")
@@ -1861,6 +2104,8 @@ def _validate(action: str, payload: dict) -> None:
                 and _hex(payload.get("case_yaml"))):
             raise JournalError("case_created needs 'name', 'created_utc', 'analyst', 'evidence_path', and case.yaml's "
                                "SHA-256 in 'case_yaml'")
+        if "case_format" in payload and not (_number(payload["case_format"]) and payload["case_format"] >= 1):
+            raise JournalError("case_created's 'case_format' is the case format, an integer from 1")
         source = payload.get("copied_from", {})
         if not (isinstance(source, dict) and isinstance(source.get("folder", ""), str)):
             raise JournalError("a copy's 'copied_from' names its source 'folder'")
@@ -1955,6 +2200,45 @@ def _validate_file(payload: dict) -> None:
     if ("journal_head" in payload) != ("head_seq" in payload) or (
             "journal_head" in payload and not (_hex(payload["journal_head"]) and _number(payload["head_seq"]))):
         raise JournalError("a file that prints a head records it in 'journal_head' with its entry's 'head_seq'")
+
+
+def manifest_ok(payload: dict) -> bool:
+    """Whether a manifest_recorded payload is whole: a SHA-256, the bytes and the lines that aren't blank, each an
+    integer from 0, what wrote the manifest, and, for a copy's record, if it has `unvouched`, a list of the reasons in
+    UNVOUCHED_WORDS, each once."""
+    return (_hex(payload.get("sha256")) and all(_number(payload.get(k)) and payload[k] >= 0 for k in ("bytes", "lines"))
+            and payload.get("via") in MANIFEST_VIA and ("unvouched" not in payload or _reasons(payload)))
+
+
+def _reasons(payload: dict) -> bool:
+    reasons = payload["unvouched"]
+    return (payload.get("via") == "copy" and isinstance(reasons, list) and bool(reasons)
+            and all(isinstance(r, str) and r in UNVOUCHED_WORDS for r in reasons) and len(set(reasons)) == len(reasons))
+
+
+def manifest_of(entry: dict) -> dict:
+    """A manifest_recorded entry as State.manifests and Check.manifests keep it."""
+    kept = {k: entry[k] for k in ("seq", "at", "who", "sha256", "bytes", "lines", "via")}
+    return {**kept, "unvouched": list(entry["unvouched"])} if "unvouched" in entry else kept
+
+
+def unvouched_sentences(reasons: Iterable[str]) -> str:
+    """The sentences for `reasons` (UNVOUCHED_WORDS), in their order and joined by '. ', with no final period; '' for
+    none."""
+    return ". ".join(words for reason, words in UNVOUCHED_WORDS.items() if reason in reasons)
+
+
+def unvouched_words(record: dict) -> str:
+    """The sentences for the reasons a copy's record names, or a check's line records for it (unvouched_sentences); ''
+    for a record that names none, or whose `unvouched` is not a list."""
+    reasons = record.get("unvouched")
+    return unvouched_sentences(reasons) if isinstance(reasons, list) else ""
+
+
+def unvouched_warns(reasons: Iterable[str]) -> bool:
+    """Whether one of `reasons` is a warning (UNVOUCHED_WARNS): the source's journal had a break, or no head of it was
+    recorded on this computer. Add new evidence's note is not."""
+    return any(reason in UNVOUCHED_WARNS for reason in reasons)
 
 
 def _sealed(sealed) -> bool:
@@ -2073,6 +2357,11 @@ def _apply(state: State, entry: dict) -> None:
     elif action == "file_written":
         # the scope and filters stay, so the Findings page words a file as the trail does (audit.file_words)
         state.files.append({k: entry.get(k) for k in ("seq", "at", "who", "path", "kind", "rows", "sha256", "scope", "filters")})
+    elif action == "manifest_recorded":
+        if not manifest_ok(entry):
+            raise ValueError("a manifest record names the manifest's SHA-256, bytes, lines, and what wrote it")
+        if "prev" in entry:   # only the chain records the manifest
+            state.manifests.append(manifest_of(entry))
     elif action == "undo":   # each reversing change applies as its own action would, under the undo's number
         for change in entry["changes"]:
             if isinstance(change, dict) and change.get("action") == "undo":   # the writer never nests one; a forged

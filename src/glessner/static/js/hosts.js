@@ -1,8 +1,8 @@
 import { clockCell, refocus, renderClockSwitch } from './clock.js';
 import { $, api, EITHER_END_PIVOT, el, fmtAt, KEY_LABEL, PIVOTS, plural, post, ROLES, S, setStatus } from './core.js';
 import { refreshCounts } from './counts.js';
-import { fetchView } from './data.js';
-import { artifactName, button, loadDetails } from './event_page.js';
+import { fetchView, fitTitle } from './data.js';
+import { artifactName, button, focusedPageAction, loadDetails, pageAnswered, settleRedraw, showingPage } from './event_page.js';
 import { applyFilter, filterCount, openItemMenu, renderFilterState, toggleFilterPanel } from './filters.js';
 import { reloadLanes } from './lanes.js';
 import { menuItem } from './quick_menu.js';
@@ -46,6 +46,10 @@ export function guessBadge(row) {
   return null;
 }
 
+// A value typed beside a host is an IP address when it is four dotted numbers or holds a colon, as IPv6 does. Any other
+// value is a name: dc1.ad is a name, though each of its characters could be part of an IPv6 address.
+const isAddress = (value) => /^\d{1,3}(\.\d{1,3}){3}$/.test(value) || value.includes(':');
+
 export function renderHosts() {
   renderSplits();
   const conflicts = new Set(S.meta.identity_conflicts || []);
@@ -75,7 +79,7 @@ export function renderHosts() {
     add.addEventListener('keydown', (ev) => {
       if (ev.key !== 'Enter' || !add.value.trim()) return;
       const value = add.value.trim();
-      hostEdit({ host: h.host, op: /^[0-9a-fA-F:.]+$/.test(value) && /[.:]/.test(value) ? 'add_ip' : 'add_name', value });
+      hostEdit({ host: h.host, op: isAddress(value) ? 'add_ip' : 'add_name', value });
     });
     const offset = el('input', { type: 'number', step: '0.001', value: String(h.offset_seconds || 0), style: 'width: 7em',
                                  title: 'Seconds to add to this host\'s event times, for example after finding clock drift' });
@@ -98,7 +102,36 @@ export function openHost(name) {
   setTimeout(() => row.classList.remove('flash'), 1600);
 }
 
-export async function applyHosts(res) {
+// Counts the range reads asked for. A read can answer after a later change's read, and written, it would put back the
+// range from before that change.
+let rangeTurn = 0;
+
+// The case's range and Fit case's, read again; the error, when the read failed. fit_range reads every event, so only a
+// change that moves times asks for it. A read that a later one has replaced writes nothing and reports no error.
+async function rereadRange() {
+  const turn = ++rangeTurn;
+  try {
+    const { start, end, fit } = await api('/api/meta');
+    if (turn !== rangeTurn) return null;
+    Object.assign(S.meta, { start, end, fit });
+    fitTitle();
+    return null;
+  } catch (err) { return turn === rangeTurn ? err : null; }
+}
+
+// Apply a host change's answer: the hosts, the lanes, the window's data, the counts, and the Event page of the event in
+// focus, whose time and clock note follow an offset. The change is written once the server has answered, so a reload
+// that fails doesn't fail it: the rest still follows, and the status line says what didn't reload. `done` is
+// focusedPageAction() from before the change was asked for. Once the timeline has redrawn, the Event page of the event
+// in focus reloads while the panel shows it and no page has been asked for since, as it may have read the time from
+// before the change. The page the change was asked from counts from when the change was asked (pageAction); a page
+// drawn while the change was out counts from when it drew (pageAnswered), whether it was asked for before the change,
+// left and opened again, or another event's page. A page asked for since keeps the panel, and one still loading
+// reloads as it draws. `moved` says the change moved times, as an offset, a split, or its undo does, since the new
+// hosts don't take the old host's offset: then the case's range and Fit case's move with them, and To investigate,
+// which lists the events in adjusted time order, draws again when it is on screen. Returns what didn't reload, for the
+// status line, or ''.
+export async function applyHosts(res, done, { moved = false } = {}) {
   S.meta.hosts = res.hosts;
   S.meta.outside_sources = res.outside_sources;
   S.meta.identity_conflicts = res.identity_conflicts;
@@ -108,20 +141,35 @@ export async function applyHosts(res) {
   S.meta.kept = res.kept;
   renderClockSwitch();
   if (!$('hostsPanel').hidden) renderHosts();
-  await reloadLanes();
+  const range = moved ? rereadRange() : null;
+  let lanes = null;
+  try { await reloadLanes(); } catch (err) { lanes = err; }
+  const stale = await range;   // the view asks what lies outside Fit case's range, so it waits for the range
   await fetchView();
   refreshCounts();
-  if (S.focus && $('details').dataset.page === 'event') await loadDetails(S.focus);   // its time and clock note follow the offset
+  // The reload is awaited here, not left to the helper, so a control focused after an alignment is on the page it draws
+  const unchanged = done(false);   // the page the change was asked from, with no page asked for since
+  const page = `event:${S.focus}`;
+  if (S.focus && (unchanged || pageAnswered(page, false)) && showingPage(page)) await settleRedraw(() => loadDetails(S.focus));
+  if (moved) pageAnswered('investigate');   // the worklist lists the events in their adjusted time order
+  const warning = lanes ? `The hosts changed, but the timeline didn't reload: ${lanes.message}`
+    : stale ? `The hosts changed, but the case's range didn't reload: ${stale.message}` : '';
+  if (warning) setStatus(warning);
+  return warning;
 }
 
 export async function hostEdit(body) {
-  try { await applyHosts(await post('/api/host', body)); }
-  catch (err) { setStatus(`Host change failed: ${err.message}`); }
+  const done = focusedPageAction();
+  let res;
+  try { res = await post('/api/host', body); } catch (err) { setStatus(`Host change failed: ${err.message}`); return; }
+  await applyHosts(res, done, { moved: 'offset_seconds' in body });
 }
 
 export async function confirmRoles(names) {
-  try { await applyHosts(await post('/api/host', { confirm_hosts: names })); }
-  catch (err) { setStatus(`Confirm failed: ${err.message}`); }
+  const done = focusedPageAction();
+  let res;
+  try { res = await post('/api/host', { confirm_hosts: names }); } catch (err) { setStatus(`Confirm failed: ${err.message}`); return; }
+  await applyHosts(res, done);
 }
 
 // ---------- splitting a host by recorded computer ----------
@@ -266,10 +314,12 @@ function stays(host, s) {
 }
 
 // A split, its undo, or a keep. A View value or Sources rule naming a host that's gone would match nothing, and a
-// Show only on it would hide everything, so they go; the filter is registered again either way, since a split drops
-// the case's saved searches, which a View value can hold. `target` gives the control to focus once the panel is drawn
-// again, since the clicked one is gone.
+// Show only on it would hide everything, so they go. The filter is registered again whenever one is in force or a rule
+// went: a split drops the case's saved searches, which a View value can hold, and a filter whose last rule went would
+// still name the host that's gone. `target` gives the control to focus once the panel is drawn again, since the
+// clicked one is gone.
 async function changeSplit(body, done, target) {
+  const settle = focusedPageAction();
   let res;
   try { res = await post('/api/host', body); }
   catch (err) { setStatus(`Host change failed: ${err.message}`); return; }
@@ -281,10 +331,13 @@ async function changeSplit(body, done, target) {
     S.filter[kind] = S.filter[kind].filter((p) => !gone(p));
   }
   S.sources = null;   // its hosts and files are by lane
-  await applyHosts(res);
-  if (filterCount() || S.viewSpec) await applyFilter(); else renderFilterState();
-  if (!$('filterPanel').hidden) await toggleFilterPanel(true);   // counts the sources again, by the new lanes
-  setStatus(done + (dropped ? `; ${plural(dropped, 'filter value')} naming a host that's gone came off` : ''));
+  let warning = await applyHosts(res, settle, { moved: !('keep_host' in body) });
+  try {
+    if (S.filterId || dropped || filterCount() || S.viewSpec) await applyFilter(); else renderFilterState();
+    if (!$('filterPanel').hidden) await toggleFilterPanel(true);   // counts the sources again, by the new lanes
+  } catch (err) { if (!warning) warning = `The hosts changed, but the timeline didn't reload: ${err.message}`; }
+  setStatus(done + (dropped ? `; ${plural(dropped, 'filter value')} naming a host that's gone came off` : '') +
+            (warning ? `. ${warning}` : ''));
   refocus(target);
 }
 

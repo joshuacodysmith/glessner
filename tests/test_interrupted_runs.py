@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from chain_fixtures import format3_case
 from test_cli_refusals import held
 
 from glessner import cli, toolbox
@@ -163,3 +164,18 @@ def test_close_interrupted_returns_what_it_marked_when_a_record_cannot_be_writte
     closed = toolbox.close_interrupted(case)
     assert [r.host for r in closed] == writes == ["HOST1"]
     assert statuses(case) == {"HOST1": "failed", "HOST2": "ok", "HOST3": "running"}
+
+
+def test_close_interrupted_keeps_a_tool_check_and_writes_no_format_4_key_below_format_4(synthetic_case):
+    """The mark rewrites the record: in a format 4 case its tool_check, which this build doesn't fill, stays as it was,
+    and in a case below format 4 the record keeps the shape the builds of its format read."""
+    check = {"manifest": "tools.json", "files": {"EvtxECmd.exe": "matches"}, "found": [1, None, "x"]}
+    _, path = started(synthetic_case, "HOST1")
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "tool_check": check}), encoding="utf-8")
+    assert [r.host for r in toolbox.close_interrupted(synthetic_case)] == ["HOST1"]
+    assert json.loads(path.read_text(encoding="utf-8"))["tool_check"] == check
+    below = format3_case(synthetic_case)
+    _, path = started(below, "HOST2")
+    assert [r.host for r in toolbox.close_interrupted(below)] == ["HOST2"]
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["status"] == "failed" and not {"tool_files", "rows_skipped", "tool_check"} & set(saved)

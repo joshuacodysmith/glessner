@@ -415,6 +415,8 @@ def _checker_cases():
         "a rekey of format 2 after the chain, lacking its LF": (add(marks, "case_upgrade", who=SYSTEM, from_format=2,
                                                                     to_format=3, text="x", rekey={"pairs": {}})[:-1],
                                                                 None, 1),
+        "a manifest record": (add(marks, "manifest_recorded", sha256=sha(b"manifest"), bytes=8, lines=1, via="intake"),
+                              None, 0),
     }
 
 
@@ -427,6 +429,19 @@ def test_the_checker_agrees_with_the_app(case, name):
     path = journal_of(case)
     path.write_bytes(data)
     assert agree(path, expect) == (code == 0)
+
+
+def test_the_full_check_lists_each_whole_manifest_record_with_its_line(case):
+    """The full check lists the chained manifest_recorded entries whose payload is whole, with their lines, a last one
+    missing only its LF among them, so verify needs no Journal object; one whose payload isn't whole is left out."""
+    path = journal_of(case)
+    record = {"sha256": sha(b"manifest"), "bytes": 8, "lines": 1, "via": "intake"}
+    data = add(chained(MARKS), "manifest_recorded", **record)
+    data = add(data, "manifest_recorded", **{**record, "via": "upload"})
+    path.write_bytes(add(data, "manifest_recorded", **{**record, "via": "add"})[:-1])
+    found = check(path)
+    assert [(m["line"], m["seq"], m["via"], m["bytes"]) for m in found.manifests] == [(6, 6, "intake", 8), (8, 8, "add", 8)]
+    assert found.tail == "missing_lf"
 
 
 def _position(result, data: bytes, expect: str | None) -> bool:
@@ -765,8 +780,9 @@ def test_a_killed_holder_s_lock_is_taken_within_the_wait(chained_case, byte):
 def test_a_lock_held_past_the_wait_refuses_and_writes_nothing(chained_case, monkeypatch, byte):
     """Another process holds byte 0, as a writer does, or the gate, as a waiting writer does, past the wait: the append
     refuses within it and writes nothing. It tries the gate every LOCK_RETRY seconds and, once it holds the gate, byte 0
-    every LOCK_TURN_RETRY. The refusal leaves journal.lock closed, and once the holder is gone the next append goes
-    through, so it kept no lock. Only byte 0 is a write in progress to the check."""
+    every LOCK_TURN_RETRY: the intervals it passes to _wait_for and the sleeps it takes both show it. The refusal
+    leaves journal.lock closed, and once the holder is gone the next append goes through, so it kept no lock. Only
+    byte 0 is a write in progress to the check."""
     assert jm.LOCK_WAIT == 10
     monkeypatch.setattr(jm, "LOCK_WAIT", 1.0)   # the wait, shortened for the test
     waits, wait_for = [], jm._wait_for
@@ -776,6 +792,12 @@ def test_a_lock_held_past_the_wait_refuses_and_writes_nothing(chained_case, monk
         wait_for(fd, at, deadline, retry)
 
     monkeypatch.setattr(jm, "_wait_for", recorded)
+    sleeps, real_sleep = [], time.sleep   # the real sleep, taken before the patch below replaces it
+
+    def recorded_sleep(seconds):
+        sleeps.append(seconds)
+        real_sleep(seconds)   # a recorder that returned at once would turn the wait into a spin
+
     path = journal_of(chained_case)
     before = path.read_bytes()
     holder = _holder(chained_case, byte)
@@ -784,14 +806,18 @@ def test_a_lock_held_past_the_wait_refuses_and_writes_nothing(chained_case, monk
     try:
         assert jm._writing(path) is (byte == WRITER)
         started = time.monotonic()
-        with pytest.raises(JournalError, match="Another Glessner process is writing"):
+        with pytest.raises(JournalError, match="Another Glessner process is writing"), monkeypatch.context() as patch:
+            patch.setattr(jm.time, "sleep", recorded_sleep)   # time.sleep for the whole process, so around the append only
             Journal(chained_case).append("note", target=UID, text="refused")
         assert 0.9 < time.monotonic() - started < 5
         assert path.read_bytes() == before
+        retry = jm.LOCK_TURN_RETRY if byte == WRITER else jm.LOCK_RETRY
         if byte == WRITER:
             assert waits == [(GATE, jm.LOCK_RETRY), (WRITER, jm.LOCK_TURN_RETRY)]
         else:
             assert waits == [(GATE, jm.LOCK_RETRY)]
+        # An empty list would pass a check of every sleep, and sleeps that took no time would fill the wait with them
+        assert sleeps and all(seconds == retry for seconds in sleeps) and len(sleeps) <= 2 * jm.LOCK_WAIT / retry
         holder.stdin.close()   # the holder exits and closes its handle
         assert holder.wait(30) == 0
     finally:
@@ -854,7 +880,7 @@ def test_the_held_context_is_re_entrant_in_its_thread_only(chained_case):
 # Remap
 
 def _rekey_line(data: bytes, raw_extra: bytes = b"") -> bytes:
-    entry = envelope(0, head(data), "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="IDs changed.",
+    entry = envelope(0, head(data), "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="IDs changed.",
                      rekey={"pairs": {UID: NEW}})
     entry["seq"] = json.loads(lines(data)[-1])["seq"] + 1
     raw = line_bytes(entry)[:-1]
@@ -1016,8 +1042,8 @@ def test_a_forged_entry_after_the_recorded_head_is_counted_with_or_without_its_l
 def test_a_rekey_no_build_of_this_format_wrote_translates_nothing(case):
     """A line without prev appended after the chain is a break, and its rekey must not re-point the
     earlier entries' event IDs in the state the read-only page shows. The same for a chained rekey no build of this
-    format writes (a format at or below the chain's own, or a seal that carries one). A later format's rekey, from
-    format 3 to 4, still translates."""
+    format writes (a format at or below this build's own, or a seal that carries one). A later format's rekey, from
+    format 4 to 5, still translates."""
     base = chained([MARKS[0]])
     pairs = {"pairs": {UID: NEW}}
     before = unchained(note(1))
@@ -1026,6 +1052,8 @@ def test_a_rekey_no_build_of_this_format_wrote_translates_nothing(case):
                                                          "from_format": 1, "to_format": 2, "text": "x", "rekey": pairs}),
                                        "no_prev"),
         "chained, format 3 to 3": (add(base, "case_upgrade", who=SYSTEM, from_format=3, to_format=3, text="x",
+                                       rekey=pairs), "rekey"),
+        "chained, format 3 to 4": (add(base, "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
                                        rekey=pairs), "rekey"),
         "chained, format 1 to 2": (add(base, "case_upgrade", who=SYSTEM, from_format=1, to_format=2, text="x",
                                        rekey=pairs), "rekey"),
@@ -1040,7 +1068,7 @@ def test_a_rekey_no_build_of_this_format_wrote_translates_nothing(case):
         for state in (j.state, replay(path)):
             assert (set(state.marks) | set(state.notes)) == {UID} and not state.rekeys, name
         assert not agree(path), name
-    path.write_bytes(add(base, "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x", rekey=pairs))
+    path.write_bytes(add(base, "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x", rekey=pairs))
     assert agree(path) and set(replay(path).marks) == {NEW}
 
 
@@ -1053,11 +1081,11 @@ def test_the_rekey_pre_scan_takes_the_lines_the_read_takes_however_they_are_spel
              "rekey": {"pairs": {UID: NEW}}}
     escaped = unchained(rekey).replace(b'"case_upgrade"', b'"case_upgrad\\u0065"')
     repeated = unchained(rekey).replace(b'"text": "x"', b'"text": "x", "text": "y"').replace(b"}}}", b'}, "prev": 1}}')
-    chained_escaped = add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+    chained_escaped = add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                           rekey={"pairs": {UID: NEW}}).replace(b'"case_upgrade"', b'"case_upgrad\\u0065"')
     cases = {"escaped, before the chain": unchained(note(1)) + escaped + unchained(note(3)),
              "repeated key, before the chain": unchained(note(1)) + repeated + unchained(note(3)),
-             "escaped, chained, from format 3 to 4": chained_escaped}
+             "escaped, chained, from format 4 to 5": chained_escaped}
     for name, data in cases.items():
         path = tmp_path / f"{len(name)}.jsonl"
         path.write_bytes(data)
@@ -1070,7 +1098,7 @@ def test_the_rekey_pre_scan_takes_the_lines_the_read_takes_however_they_are_spel
         assert NEW in (set(state.marks) | set(state.notes)) and len(state.rekeys) == 1, name
     # The read stops at the last LF, so a rekey on a last line without one translates nothing until its LF is added
     path = tmp_path / "unended.jsonl"
-    path.write_bytes(add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+    path.write_bytes(add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                          rekey={"pairs": {UID: NEW}})[:-1])
     state = replay(path)
     assert set(state.marks) == {UID} and not state.rekeys
@@ -1093,7 +1121,7 @@ def test_a_rekey_line_with_a_wrong_prev_and_an_incomplete_envelope_is_a_break_to
     has no client or an empty at, is an envelope break to the app's readers and the checker alike. It translates
     nothing, and every reader returns."""
     path = journal_of(case)
-    rekey = envelope(3, "1" * 64, "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+    rekey = envelope(3, "1" * 64, "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                      rekey={"pairs": {UID: NEW}}, **{lacking: value})
     data = chained([MARKS[0]]) + line_bytes(rekey)
     path.write_bytes(data)
@@ -1115,7 +1143,7 @@ def test_a_format_2_rekey_line_strict_parsing_refuses_is_a_rekey_to_the_pre_scan
     """Before the chain, a line that names prev but repeats a key is read as format 2 read it, whatever its envelope
     lacks, so the pre-scan takes it as a rekey just as the read does, and no reader restarts forever."""
     rekey = (b'{"seq": 2, "prev": "x", "prev": "y", "at": "", "who": "glessner", "action": "case_upgrade", '
-             b'"from_format": 3, "to_format": 4, "text": "x", "rekey": {"pairs": {"' + UID.encode() + b'": "'
+             b'"from_format": 4, "to_format": 5, "text": "x", "rekey": {"pairs": {"' + UID.encode() + b'": "'
              + NEW.encode() + b'"}}}\n')
     path = journal_of(case)
     path.write_bytes(chained([MARKS[0]], before=unchained(note(1)) + rekey + unchained(note(3, OTHER))))
@@ -1182,7 +1210,7 @@ def test_a_rekey_line_the_state_leaves_out_translates_nothing_and_the_rekey_afte
         path.write_bytes(chained([MARKS[0]], before=before))
         rekey_line = max(skipped) + 1
         journal = _returns("Journal", Journal, case)
-        assert journal._skip == skipped and not journal.breaks, name
+        assert journal.skipped_lines == skipped and not journal.breaks, name
         assert set(journal.state.notes) == {NEW} and [r["seq"] for r in journal.state.rekeys] == [rekey_line], name
         trail, _ = journal.full_check(keep=True)
         assert {e["target"] for e in trail.entries if e["action"] == "note"} == {NEW}, name
@@ -1196,7 +1224,7 @@ def test_a_rekey_the_pre_scan_misses_restarts_a_read_once_then_is_a_break(case, 
     from the first line once, and the restarted read applies it. One the pre-scan still misses after the restart is a
     break that translates nothing, so no reader restarts forever."""
     path = journal_of(case)
-    data = add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+    data = add(chained([MARKS[0]]), "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                rekey={"pairs": {UID: NEW}})
     path.write_bytes(data)
     scan, scans = jm._rekeys, []
@@ -1239,6 +1267,8 @@ def test_the_last_action_reads_through_only_the_rekeys_the_shared_reader_applies
         "chained, format 1 to 2": (add(base, "case_upgrade", who=SYSTEM, from_format=1, to_format=2, text="x",
                                        rekey=pairs), UID),
         "chained, format 3 to 4": (add(base, "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+                                       rekey=pairs), UID),
+        "chained, format 4 to 5": (add(base, "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                                        rekey=pairs), NEW),
         "format 2's, before the seal": (chained([], unchained(note(1), {**unchained_rekey, "seq": 2})), NEW),
     }
@@ -1303,7 +1333,7 @@ def test_a_chain_break_or_a_rekey_after_the_recorded_head_gets_a_sentence_of_its
     data = path.read_bytes()
     sealed = {"lines": len(lines(data)), "bytes": len(data), "sha256": sha(data)}
     cases = {"chain_break": add(data, "chain_break", reason="x", breaks=[], sealed=sealed),
-             "case_upgrade": add(data, "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+             "case_upgrade": add(data, "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                                  rekey={"pairs": {UID: NEW}})}
     for action, changed in cases.items():
         path.write_bytes(changed)
@@ -1562,8 +1592,9 @@ def test_a_whole_unchained_line_replay_cannot_apply_stops_replay_as_format_2_did
 
 def test_a_prev_spelled_with_an_escape_starts_the_chain_for_every_app_reader(case):
     """JSON reads "\\u0070rev" as the key prev, and the checker reads parsed keys, so every app reader takes the line
-    as chained, not as format 1's or 2's: the shared reader, has_chain, the upgrade, which seals nothing over it, and
-    parse_line, which refuses it as strictly as a line holding `"prev"` when it repeats a key."""
+    as chained, not as format 1's or 2's: the shared reader, has_chain, the upgrade, which seals nothing over it and
+    writes only the 3 to 4 entry after the open's case_yaml, and parse_line, which refuses it as strictly as a line
+    holding `"prev"` when it repeats a key."""
     first = envelope(1, ZERO, "case_created", who="glessner", **created())
     data = add(spelled(first), "mark", targets=[UID], value="suspicious")
     path = journal_of(case)
@@ -1578,7 +1609,11 @@ def test_a_prev_spelled_with_an_escape_starts_the_chain_for_every_app_reader(cas
     # The upgrade of a format 2 case that holds such a line takes the chain as started and seals nothing
     as_format(case.folder, 2, data)
     upgraded(open_case(case.folder))
-    assert path.read_bytes() == data and open_case(case.folder).settings.case_format == 3
+    after = path.read_bytes()
+    assert after.startswith(data) and open_case(case.folder).settings.case_format == 4
+    written = [json.loads(line) for line in after[len(data):].splitlines()]
+    assert [(e["action"], e.get("from_format"), e.get("to_format")) for e in written] == [
+        ("case_yaml", None, None), ("case_upgrade", 3, 4)]
 
 
 def test_the_rekey_pre_scan_starts_the_chain_where_the_read_does_when_prev_is_spelled_with_an_escape(tmp_path):
@@ -1603,11 +1638,11 @@ def test_the_rekey_pre_scan_starts_the_chain_where_the_read_does_when_prev_is_sp
 
 @pytest.mark.parametrize("pairs", [[1], "abc", 5, True])
 def test_a_rekey_whose_maps_are_no_maps_translates_nothing_and_opens(case, pairs):
-    """A case_upgrade whose `pairs` or `unplaced` is a list, a string, or a number passes the chain (a 3 to 4 line
+    """A case_upgrade whose `pairs` or `unplaced` is a list, a string, or a number passes the chain (a 4 to 5 line
     after the head is no break). It translates nothing, the case opens, `verify --journal` doesn't crash, and every
     reader of the maps gets an empty one."""
     path = journal_of(case)
-    path.write_bytes(add(chained(MARKS[:2]), "case_upgrade", who=SYSTEM, from_format=3, to_format=4, text="x",
+    path.write_bytes(add(chained(MARKS[:2]), "case_upgrade", who=SYSTEM, from_format=4, to_format=5, text="x",
                          rekey={"pairs": pairs, "unplaced": pairs}))
     assert agree(path)
     journal = Journal(case)
@@ -1652,7 +1687,7 @@ def test_many_changed_lines_open_after_one_rebuild(case, monkeypatch):
     reset = Journal._reset
     monkeypatch.setattr(Journal, "_reset", lambda self: (resets.append(1), reset(self))[1])
     journal = Journal(case)
-    assert len(resets) <= 2 and len(journal._skip) == 1100
+    assert len(resets) <= 2 and len(journal.skipped_lines) == 1100
     assert not journal.read_only and set(journal.state.marks) == {UID}
     assert [n["text"] for n in journal.state.notes[OTHER]] == ["after"]
     assert len(check(path, keep=True).entries) == 1103 and set(replay(path).marks) == {UID}
@@ -1719,5 +1754,5 @@ def test_integrity_counts_a_skipped_line_after_the_recorded_head(case):
     heads.write(case.folder, 3, head(base), build_id())
     journal = Journal(case)
     journal.open_for_work()
-    assert journal._skip == {4} and not journal.read_only
+    assert journal.skipped_lines == {4} and not journal.read_only
     assert journal.recorded["seq"] == 3 and journal.recorded["after"] == {"mark": 1}

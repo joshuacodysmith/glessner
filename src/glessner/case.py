@@ -34,14 +34,23 @@ SUBFOLDERS = ("runs", "exports")   # suggestion rules live in the journal, not i
 # the journal, or the manifest changes shape; open_case refuses a case of a higher one. A setting added to case.yaml
 # doesn't raise it, since open_case also refuses, by name, a setting it doesn't read. Format 2 changed event IDs:
 # rekey.py's upgrade journals the old IDs' new ones. Format 3 chains the journal: each line names the SHA-256 of the
-# one before it, and the upgrade seals the unchained lines.
-CASE_FORMAT = 3
+# one before it, and the upgrade seals the unchained lines. Format 4's upgrade journals the step and, for output found
+# in the evidence that was loaded under a linked evidence path, gives its events the IDs of the path under the evidence
+# folder, so a build of an earlier format refuses the case before it reads what format 4 records.
+CASE_FORMAT = 4
 FIRST_CHAINED = 3   # the first format whose journal has a hash chain
 NOT_IN_FILE_NAMES = '<>:"|?*'   # the printable characters Windows refuses in a file's or folder's name
 
 
 class CaseError(Exception):
     """Raised when a case cannot be created or opened safely."""
+
+
+class KeptAtFormat(Exception):
+    """Raised inside an upgrade step from a format with the chain, by the journal's checks before the step's entry or
+    before the number of a step journaled already, when the journal has no chain or a break puts it in read-only mode.
+    upgrade() keeps the case at the format it reached, without writing case.yaml, and the open then finds the same
+    break. It is not a CaseError, which the command line prints as an error."""
 
 
 @dataclass(frozen=True)
@@ -188,8 +197,9 @@ def copy_case(source: Case, folder: Path, name: str, analyst: str, client: str =
     For a clean pass over a case that was already worked, such as a second analyst's blind review: no
     marks, tags, notes, rules, or settings carry over. The verification history and saved import mappings do. Tool
     output is copied rather than run again, so the copy needs a rebuild to load it (the copy-case command does both).
-    A copy of a format 3 source starts its journal with case_created naming the source and its head; an older source's
-    copy keeps the source's format, so its journal stays empty until its upgrade seals it and case_created follows
+    A copy of a source whose format has the chain starts its journal with case_created naming the source and its head;
+    an older source's copy keeps the source's format, so its journal stays empty until its upgrade seals it and
+    case_created follows. In both, the entries of the upgrade steps from a format with the chain follow case_created
     (rekey.upgraded_copy). As create_case does, it removes the journal head record that an earlier case in the same
     folder path left outside the folder as it makes the folder, and a record that can't be removed is a CaseError.
     """
@@ -358,14 +368,24 @@ def _chain(case: Case) -> AbstractContextManager[dict | None]:
     return upgrade_chain(case)
 
 
+def _format_4(case: Case) -> AbstractContextManager[dict | None]:
+    """Format 3 to 4: one chained entry, which rekeys found output that was loaded under a linked evidence path and
+    otherwise says only that nothing changed. In rekey.py beside the earlier steps, since it shares their hold on the
+    events database."""
+    from .rekey import upgrade_format_4
+
+    return upgrade_format_4(case)
+
+
 # The steps that bring a case of an older format up to CASE_FORMAT, by the format each starts from:
 # UPGRADES[n] changes a format n case into format n + 1. It is a context manager, entered with the case, that gives the
 # fields of the case_upgrade entry saying what it changed, at least the sentence in `text`, or None when an earlier run
 # of it had journaled them already, before a crash kept case.yaml from taking the next number. It can hold what it needs
 # until upgrade has journaled the entry and written the number, such as rekey.py's connection to the events database,
 # and a failure inside it changes neither. The server runs the steps when it opens a case for work, and the commands
-# that load events run them first, so a step must be safe to run again.
-UPGRADES: dict[int, Callable[[Case], AbstractContextManager[dict | None]]] = {1: _rekey, 2: _chain}
+# that load events run them first, so a step must be safe to run again. For a step from a format with the chain,
+# upgrade's record raises KeptAtFormat when the journal is read-only, and the case stays at the format it is at.
+UPGRADES: dict[int, Callable[[Case], AbstractContextManager[dict | None]]] = {1: _rekey, 2: _chain, 3: _format_4}
 
 
 # Where the upgrade running in this thread reports its stages, set by upgrade() while its steps run: report(stage, done,
@@ -380,33 +400,53 @@ def report_stage(stage: str, done: int = 0, total: int = 0) -> None:
         report(stage, done, total)
 
 
-def upgrade(case: Case, record: Callable[[int, int, dict], object],
-            report: Callable[[str, int, int], None] | None = None) -> Case:
-    """The case brought up to CASE_FORMAT, one UPGRADES step at a time; record(from, to, fields) journals each step's
-    case_upgrade entry with its fields, and case.yaml then takes the step's number, both inside the step. report(stage,
-    done, total), when given, gets each stage a step reports (report_stage), for the start page's open."""
-    token = _stage_report.set(report)
+# The journal checks the upgrade running in this thread makes before a step's entry, set by upgrade() from its record
+_journal_check: ContextVar[Callable[[], bool] | None] = ContextVar("upgrade_journal_check", default=None)
+
+
+def check_journal() -> bool:
+    """A step that changes the case before its entry is journaled calls this first. A journal with no chain or with a break
+    keeps the case at its format, as the record's own checks would after the change (KeptAtFormat), so the step changes
+    nothing. Returns whether the journal already holds a line that closes the place of the rekey from format 3 to 4
+    (journal.check_for_upgrade); False when the upgrade's record offers no check."""
+    check = _journal_check.get()
+    return bool(check and check())
+
+
+def upgrade(case: Case, record: Callable[[int, int, dict | None], object],
+            report: Callable[[str, int, int], None] | None = None, until: int | None = None) -> Case:
+    """The case brought up to `until`, CASE_FORMAT unless given, one UPGRADES step at a time; record(from, to, fields)
+    journals each step's case_upgrade entry with its fields, and case.yaml then takes the step's number, both inside the
+    step. For a step journaled already, fields is None, and record writes no entry but runs any checks the entry would
+    have followed. A record that finds the journal read-only (KeptAtFormat) ends the upgrade with the case at the format
+    it reached, case.yaml unchanged. report(stage, done, total), when given, gets each stage a step reports
+    (report_stage), for the start page's open. A record with a `check` attribute (journal.upgrade_recorder's) lets a step
+    run the journal's checks ahead of its changes (check_journal)."""
+    token, checking = _stage_report.set(report), _journal_check.set(getattr(record, "check", None))
     try:
-        return _upgrade(case, record)
+        return _upgrade(case, record, CASE_FORMAT if until is None else until)
     finally:
+        _journal_check.reset(checking)
         _stage_report.reset(token)
 
 
-def _upgrade(case: Case, record: Callable[[int, int, dict], object]) -> Case:
-    while case.settings.case_format < CASE_FORMAT:
+def _upgrade(case: Case, record: Callable[[int, int, dict | None], object], until: int) -> Case:
+    while case.settings.case_format < until:
         start = case.settings.case_format
         if start not in UPGRADES:
             raise CaseError(f"This build of glessner ({build_id()}) has no upgrade from case format {start}.")
-        with UPGRADES[start](case) as fields:
-            if fields is not None:   # None: journaled already, by a run of the step that stopped before case.yaml
-                record(start, start + 1, fields)
-            case = Case(case.folder, replace(case.settings, case_format=start + 1))
-            try:
-                _write_settings(case.folder, case.settings)
-            except OSError as exc:   # the old case.yaml stays; the next open finishes the step, which is journaled
-                raise CaseError(f"The upgrade of {case.settings.name} stopped before {CASE_FILE} took the new format "
-                                f"({exc}). {CASE_FILE} is as it was; close any program that has it open, then open the "
-                                "case again, which finishes the upgrade.") from exc
+        try:
+            with UPGRADES[start](case) as fields:
+                record(start, start + 1, fields)   # None: journaled already, by a run that stopped before case.yaml
+                case = Case(case.folder, replace(case.settings, case_format=start + 1))
+                try:
+                    _write_settings(case.folder, case.settings)
+                except OSError as exc:   # the old case.yaml stays; the next open finishes the step, which is journaled
+                    raise CaseError(f"The upgrade of {case.settings.name} stopped before {CASE_FILE} took the new "
+                                    f"format ({exc}). {CASE_FILE} is as it was; close any program that has it open, "
+                                    "then open the case again, which finishes the upgrade.") from exc
+        except KeptAtFormat:   # raised by the record, so case.yaml and `case` keep the format reached
+            return case
     return case
 
 

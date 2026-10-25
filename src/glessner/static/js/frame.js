@@ -138,11 +138,38 @@ function setupCaseMenu() {
   item('casesButton', () => { location.href = '/start'; });
 }
 
+// A full check's verdict on manifest.jsonl against its record in the journal (intake.manifest_state), or '' when it
+// matched, had no record, or compared none
+export function manifestWarning(check) {
+  return { grew: 'manifest.jsonl grew past its record',
+           differs: 'manifest.jsonl differs from its record' }[check?.manifest?.state] || '';
+}
+
+// A copy's manifest record that its source couldn't vouch for, from the case state's manifest_record (the journal's first
+// record, as Integrity reads it), as a warning when the source's journal had a break or no head of it was recorded on
+// this computer (journal.UNVOUCHED_WARNS), or '' when the record names no such reason. A first record from Add new
+// evidence is a note, in the hover only.
+export function unvouchedWarning(st) {
+  return st?.manifest_record?.warn ? 'manifest record: its source could not vouch for it' : '';
+}
+
+// What a full check that didn't match found: its problems and the manifest's verdict. A mismatch with neither is a
+// line of verification.jsonl this build didn't write, said as such.
+export function mismatchFound(check) {
+  const found = [check.problems ? plural(check.problems, 'problem') : '', manifestWarning(check)].filter(Boolean);
+  return found.join('; ') || 'a mismatch';
+}
+
 // The line under the case's name: open or closed, the evidence against intake, and the analyst. The evidence part
 // reads every check verification.jsonl records (intake.evidence_checks): each run re-hashes the files it read, and the
 // report, verify, and a close re-hash all. A problem stays until a later full re-hash matches, and a close
 // shows beside it, never in its place. A file a check couldn't read is counted apart from a changed one, since no hash
 // was compared, and a line of the log that can't be read is a warning on any state, since it may have held a problem.
+// The newest full re-hash's verdict on manifest.jsonl against its record is a warning of its own, and a full re-hash
+// that found only that is never called matched. The reasons a copy's manifest record names, that its source couldn't
+// vouch for it, come from the journal, so they show before the copy's own first full re-hash: they warn when the source
+// had a break or no head recorded, and are in the hover whatever they are. A missing manifest.jsonl that the journal
+// records is a warning too, not a case still waiting for intake.
 export function renderCaseState(st) {
   if (!st) return;
   const day = (iso) => String(iso || '').slice(0, 10);
@@ -159,13 +186,14 @@ export function renderCaseState(st) {
       (st.added_files ? `, and ${st.added_files.toLocaleString()} added later` : '') +
       (st.unreadable ? `; ${plural(st.unreadable, 'file')} intake could not read` : '') +
       (st.unlisted ? `; ${plural(st.unlisted, 'folder')} intake could not list` : '') + '.'
-    : 'No intake manifest: the evidence was not hashed.';
+    : st.manifest_missing || 'No intake manifest: the evidence was not hashed.';
   const evidence = document.createElement('span');
   if (!st.intake) {
-    evidence.append('no intake manifest yet');
+    evidence.append(st.manifest_missing ? warn('manifest.jsonl is missing') : 'no intake manifest yet');
   } else if (ev.files) {
     const found = [ev.changed_files ? `evidence changed since intake: ${plural(ev.changed_files, 'file')}` : '',
-                   ev.not_reread ? `${plural(ev.not_reread, 'evidence file')} could not be re-read` : ''];
+                   ev.not_reread ? `${plural(ev.not_reread, 'evidence file')} could not be re-read` : '',
+                   manifestWarning(ev.last_full)];
     evidence.append(warn(found.filter(Boolean).join('; ')));
     title += ` Found by the evidence checks since the last full re-hash that matched, the newest on ${day(ev.found_at)}: ` +
              `${ev.problems.slice(0, 10).join('; ')}${ev.problems.length > 10 ? `; and ${ev.problems.length - 10} more` : ''}.`;
@@ -173,12 +201,17 @@ export function renderCaseState(st) {
       title += ' A check that could not read a file, as when another program holds it open, compared no hash; a full ' +
                're-hash that matches, such as the verify command\'s, clears it.';
     }
-  } else if (ev.last_full) {
+  } else if (ev.last_full?.result === 'ok') {
     // A file intake couldn't read has no hash, so no re-hash checked it, nor the files of a folder it couldn't list,
     // which are counted as a folder since how many there are is unknown. The line says so, as its hover does.
     evidence.append(`full re-hash matched on ${day(ev.last_full.at)}`);
     if (st.unreadable) evidence.append('; ', warn(`${plural(st.unreadable, 'file')} unverified`));
     if (st.unlisted) evidence.append('; ', warn(`${plural(st.unlisted, 'folder')} unverified`));
+  } else if (ev.last_full) {
+    // A mismatch with no problem file: manifest.jsonl against its record
+    const found = mismatchFound(ev.last_full);
+    evidence.append(warn(found));
+    title += ` The full re-hash of ${day(ev.last_full.at)} found ${found}.`;
   } else {
     evidence.append(ev.newest ? "runs' evidence checks matched; no full re-hash yet" : 'evidence not re-checked since intake');
   }
@@ -188,11 +221,13 @@ export function renderCaseState(st) {
     title += ` ${plural(n, 'line')} of verification.jsonl could not be read, so any problem ` +
              `${n === 1 ? 'it holds' : 'they hold'} is not counted here.`;
   }
+  if (st.intake && unvouchedWarning(st)) evidence.append('; ', warn(unvouchedWarning(st)));
+  if (st.intake && st.manifest_record?.text) title += ` Manifest record: ${st.manifest_record.text}.`;
   parts.push(evidence);
   if (ev.newest) {
     const n = ev.newest;
     title += ` The newest check, ${n.at} (${n.reason || 'no reason given'}), listed ${plural(n.files_checked, 'file')}: ` +
-             `${n.result === 'ok' ? 'every readable one matched' : plural(n.problems, 'problem')}.`;
+             `${n.result === 'ok' ? 'every readable one matched' : mismatchFound(n)}.`;
   }
   if (S.meta.analyst) parts.push(document.createTextNode(`analyst ${S.meta.analyst}`));
   // "Journal changed" in red, only while the chain is broken; otherwise the line is unchanged

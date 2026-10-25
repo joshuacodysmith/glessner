@@ -10,7 +10,7 @@ const recommended = Object.fromEntries(
 // The browser globals the page uses. A module that starts using another one fails no-undef until it's added here.
 const browser = Object.fromEntries(
   [
-    "AbortController", "CSS", "Event", "Node", "NodeFilter", "ResizeObserver", "URLSearchParams", "clearInterval", "clearTimeout", "document", "fetch",
+    "AbortController", "CSS", "Event", "MutationObserver", "Node", "NodeFilter", "ResizeObserver", "URLSearchParams", "clearInterval", "clearTimeout", "document", "fetch",
     "getComputedStyle", "localStorage", "location", "navigator", "performance", "requestAnimationFrame", "sessionStorage",
     "setInterval", "setTimeout", "structuredClone", "window",
   ].map((name) => [name, "readonly"]),

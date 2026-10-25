@@ -1,4 +1,4 @@
-"""Check a Glessner journal of case format 3: python -I check_journal.py journal.jsonl [HEAD] [--file FILE]
+"""Check a Glessner journal of case format 3 or later: python -I check_journal.py journal.jsonl [HEAD] [--file FILE]
 
 Exit 0 only when the chain starts at byte 0 with case_created, or with a seal that matches every byte before it; each
 later line names the line before it and carries the whole envelope; nothing follows the last line end (a last line
@@ -20,6 +20,7 @@ import sys
 
 ZERO = "0" * 64
 FIRST_CHAINED = 3   # the first case format whose journal has the chain
+CASE_FORMAT = 4     # the case format this script checks up to; only the step from 3 to 4 carries a rekey to it
 SIDE_FILE = re.compile(r"journal_torn_[^\\/]+\.bin")
 
 
@@ -82,17 +83,44 @@ def recoveries(entry):
     return []
 
 
-def foreign_rekey(entry):
+def described(rekey):
+    """Whether a rekey describes its map as the step from format 3 to 4 writes it: the runs it read, and the size and
+    SHA-256 of the whole map, which holds at least its pairs."""
+    runs, size, digest = rekey.get("runs"), rekey.get("map_size"), rekey.get("map_sha256")
+    pairs = rekey.get("pairs")
+    return (isinstance(runs, dict) and bool(runs) and number(size) and isinstance(pairs, dict) and size >= len(pairs)
+            and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None)
+
+
+def closes(entry):
+    """Whether a chained line closes the place of the step from format 3 to 4 for a rekey in the lines after it: the
+    step's own entry, whatever it holds; a case_created that says the case began at format 4 or later (case_format); or a
+    manifest_recorded, which only a case at format 4 or later holds."""
+    if entry is None:
+        return False
+    action = entry.get("action")
+    if action == "case_upgrade":
+        old, new = entry.get("from_format"), entry.get("to_format")
+        return number(old) and number(new) and (old, new) == (3, 4)
+    if action == "case_created":
+        return number(entry.get("case_format")) and entry["case_format"] >= 4
+    return action == "manifest_recorded"
+
+
+def foreign_rekey(entry, past=False):
     """Why a rekey entry of event IDs can't be one a build of this format wrote, or None. A rekey re-points every earlier
     entry's IDs. Once the chain has started, only a later format's upgrade carries one: chained, from a format that has
-    the chain to a higher one."""
+    the chain to one above CASE_FORMAT; and the step from format 3 to 4, when it describes its map and no line before it
+    closes its place (`past`, closes)."""
     if not isinstance(entry.get("rekey"), dict) or entry.get("action") != "case_upgrade":
         return None
     old, new = entry.get("from_format"), entry.get("to_format")
-    if number(old) and number(new) and old >= FIRST_CHAINED and new > old:
+    if number(old) and number(new) and old >= FIRST_CHAINED and (
+            new > max(old, CASE_FORMAT) or ((old, new) == (3, 4) and not past and described(entry["rekey"]))):
         return None
-    return (f"a rekey of event IDs, from format {old!r} to {new!r}, which no build of this format writes: only a later "
-            f"format's upgrade carries one after the chain starts")
+    return (f"a rekey of event IDs, from format {old!r} to {new!r}, which no build of this format writes: after the "
+            "chain starts, only a later format's upgrade carries one, and the step from format 3 to 4 when it describes "
+            "its map and comes before the case's format 4 entries and before any other step from 3 to 4")
 
 
 def side_files(folder, named):
@@ -130,11 +158,11 @@ def starts(entry, data, start, lines):
     return entry["action"] == "case_upgrade" and seal_matches(entry, data, start, lines)
 
 
-def tail_follows(entry, data, head, seq, chained, start, lines):
+def tail_follows(entry, data, head, seq, chained, start, lines, past):
     """Whether the last line, which no LF ends, is whole and the chain's next line, or, before any chained line, its
     start: the app adds the line end at its next write. The same rule as a line with its end, and no rekey of event IDs
     a build of this format doesn't write."""
-    if entry.get("prev") != head or lacks(entry) or foreign_rekey(entry):
+    if entry.get("prev") != head or lacks(entry) or foreign_rekey(entry, past):
         return False
     return (number(seq) and entry["seq"] == seq + 1) if chained else starts(entry, data, start, lines)
 
@@ -170,6 +198,7 @@ def check(path, expect=None, file=None):
     heads, records = {}, []                          # hash -> (line, seq); file_written entries as (line, seq, sha256)
     named = []                                       # side files entries name, as (seq, what the entry recorded)
     head, seq, start, lines, chained, crlf = ZERO, None, 0, 0, False, 0
+    past = False                                     # a chained line has closed the step from 3 to 4's place (closes)
     body = data[:end].split(b"\n")[:-1]
     for n, line in enumerate(body, 1):
         entry = parse(line)
@@ -196,7 +225,7 @@ def check(path, expect=None, file=None):
             problem = f"prev doesn't match line {n - 1}, which changed, or a line was removed, inserted, or moved here"
         else:
             problem = (None if seq is None or entry["seq"] == seq + 1
-                       else f"seq {entry['seq']} doesn't follow {seq}") or foreign_rekey(entry)
+                       else f"seq {entry['seq']} doesn't follow {seq}") or foreign_rekey(entry, past)
         if problem:
             problems.append(f"line {n}: {problem}")
         if entry is not None and entry.get("action") == "chain_break":
@@ -208,6 +237,7 @@ def check(path, expect=None, file=None):
         if entry is not None and not lacks(entry):
             named.extend(recoveries(entry))
         head = hashlib.sha256(line).hexdigest()      # the next line must name this one, whatever it holds
+        past = past or closes(entry)
         if entry is not None and number(entry.get("seq")):
             seq = entry["seq"]
             heads[head] = (n, seq)
@@ -217,7 +247,7 @@ def check(path, expect=None, file=None):
         start += len(line) + 1
     tail = data[end:]
     entry = None if b"\0" in tail else parse(tail)
-    follows = entry is not None and tail_follows(entry, data, head, seq, chained, start, lines)
+    follows = entry is not None and tail_follows(entry, data, head, seq, chained, start, lines, past)
     if not chained and not follows:   # a first line missing only its LF is the chain's start
         problems.append("no chained line: the chain is missing, or this is a journal of format 1 or 2, which has none")
     if crlf and crlf == data[:end].count(b"\n"):
@@ -261,7 +291,7 @@ def check(path, expect=None, file=None):
 
 
 if __name__ == "__main__":
-    args = argparse.ArgumentParser(description="Check a Glessner journal of case format 3.")
+    args = argparse.ArgumentParser(description="Check a Glessner journal of case format 3 or later.")
     args.add_argument("journal")
     args.add_argument("head", nargs="?", help="a head recorded outside the case")
     args.add_argument("--file", help="a file the case wrote, which must be recorded at or before HEAD")

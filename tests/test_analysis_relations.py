@@ -704,3 +704,245 @@ def test_every_logon_resolves_whatever_its_hosts_offset(synthetic_case):
                        "WHERE source = 'from-dc01'").fetchone()[0] == from_dc01
     assert outside_sources(con) == ["194.61.24.102"]
     con.close()
+
+
+def test_a_logon_from_an_address_that_is_not_remote_links_by_its_workstation_name(synthetic_case, tmp_path):
+    """A 4624 whose source address isn't a real one (loopback, link-local, or unspecified, IPv4 or IPv6) and resolves
+    to no host links from the host its WorkstationName names, an RDP logon as a network one, and a rule reads that host
+    as its source_host. A real address never falls back to the name, so a name can't hide an outside source: a routable
+    IPv6 address, which no host's Tcpip values give, stays an outside source, and so does an outside IPv4 address whose
+    logon names the target, as RDP logons often do, or a collected host. Logons with no address, or one that resolves,
+    link as before. Read through the EvtxECmd parser, so each address is stored in the parsers' form:
+    ::ffff:10.42.85.115 as DESKTOP's own."""
+    from test_parsers import EVIDENCE, EVTX_COLUMNS, security_row, write_csv
+
+    from glessner.parsers import PARSERS, ParseContext
+
+    sources = {   # record: (IpAddress, WorkstationName)
+        1: ("fe80::1a2b:3c4d:5e6f:7a8b", "DESKTOP-SDN1RPT"),
+        2: ("127.0.0.1", "DESKTOP-SDN1RPT"),
+        3: ("::1", "desktop-sdn1rpt"),
+        4: ("169.254.10.20", "DESKTOP-SDN1RPT"),
+        5: ("0.0.0.0", "DESKTOP-SDN1RPT"),
+        6: ("fd00::5", "DESKTOP-SDN1RPT"),
+        7: ("203.0.113.7", "CITADEL-DC01"),
+        8: ("203.0.113.8", "DESKTOP-SDN1RPT"),
+        9: ("-", "DESKTOP-SDN1RPT.C137.local"),   # a name the other records don't write
+        10: ("::ffff:10.42.85.115", "WS09"),
+        11: ("fe80::99", "WS09"),           # a name no host has
+        12: ("fe80::98", "CITADEL-DC01"),   # DC01's own name: a host logging on to itself draws nothing
+        13: ("fe80::77", "CITADEL-DC01"),   # an address typed for DESKTOP resolves first
+        14: ("127.0.0.1", "DESKTOP-SDN1RPT"),
+        15: ("::1", "CITADEL-DC01"),
+    }
+    rdp = {14, 15}   # type 10; the others are type 3
+    log = DC01_LOGS + "Security-Fallback.evtx"
+    write_csv(tmp_path / "evtxecmd.csv", EVTX_COLUMNS, [
+        security_row(record, 4624, "Successful logon", {"TargetUserName": "mortysmith", "TargetDomainName": "C137",
+                                                        "LogonType": "10" if record in rdp else "3", "IpAddress": ip,
+                                                        "WorkstationName": name},
+                     SourceFile=log, Computer="CITADEL-DC01.C137.local", TimeCreated=f"2020-09-19 04:00:{record:02d}.0000000")
+        for record, (ip, name) in sources.items()])
+    events = list(PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE)))
+    load(synthetic_case.db_path, events, host="DC01", tool="evtxecmd", tool_version="t", run_id="fallback",
+         replaces_sources=[], staging_dir=synthetic_case.folder)
+    journal = Journal(synthetic_case)
+    journal.append("rule_add", id="from-desktop", text=FROM_DESKTOP)
+    journal.append("host_identity", host="DESKTOP", op="add_ip", value="fe80::77")
+    con, _, _ = open_case(synthetic_case)
+    fallback = "e.source_file LIKE '%Security-Fallback.evtx'"
+    links = {record: (source, target, via, outside) for record, source, target, via, outside in con.execute(
+        "SELECT e.record_id, l.source_host, l.target_host, l.via, l.outside FROM logon_links l "
+        f"JOIN events e ON e.event_uid = l.event_uid WHERE {fallback}").fetchall()}
+    by_name = ("DESKTOP", "DC01", "name", False)
+    assert links == {1: by_name, 2: by_name, 3: by_name, 4: by_name, 5: by_name,
+                     6: ("fd00::5", "DC01", "ip", True), 7: ("203.0.113.7", "DC01", "ip", True),
+                     8: ("203.0.113.8", "DC01", "ip", True), 9: by_name, 10: ("DESKTOP", "DC01", "ip", False),
+                     13: ("DESKTOP", "DC01", "ip", False), 14: by_name}
+    assert outside_sources(con) == ["194.61.24.102", "203.0.113.7", "203.0.113.8", "fd00::5"]
+    suggested_records = {record for (record,) in con.execute(
+        f"SELECT e.record_id FROM suggestions s JOIN events e ON e.event_uid = s.event_uid "
+        f"WHERE s.source = 'from-desktop' AND {fallback}").fetchall()}
+    assert suggested_records == {1, 2, 3, 4, 5, 9, 10, 13, 14}
+    con.close()
+
+
+def test_a_host_whose_address_logs_on_under_another_machines_name_needs_review(synthetic_case):
+    """A host owning an address that 4624 type 3 logons came from under another machine's WorkstationName, such as a
+    laptop's old home lease that an uncollected machine held during the incident, gets a review note per address with
+    the count and the names. The host's own names, in any letter case or as a full name, its address written as the
+    name, the 15-character NetBIOS form of a longer name, a blank or "-" name, a type 10 logon, which can record the
+    target's own name, and a failed logon don't count. The logons still link from the host that owns the address. An
+    address two hosts claim resolves to neither, so it gets only the note that says so."""
+    from dataclasses import replace
+
+    from conftest import logon
+
+    hive = "LAPTOP01/Windows/System32/config/SYSTEM"
+    load(synthetic_case.db_path,
+         [registry(hive, "ROOT\\ControlSet001\\Control\\ComputerName\\ComputerName", "ComputerName", "LAPTOP01"),
+          registry(hive, "ROOT\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces\\{2}", "DhcpIPAddress",
+                   "192.168.1.23")],
+         host="LAPTOP01", tool="recmd", tool_version="t", run_id="laptop", replaces_sources=[hive],
+         staging_dir=synthetic_case.folder)
+    fin_log = "FIN/Windows/System32/winevt/Logs/Security.evtx"   # its names come from its event logs alone
+    load(synthetic_case.db_path, [logon(T0, 1, fin_log, code="4634", computer="FINANCE-WORKSTATION01.corp.local")],
+         host="FIN", tool="evtxecmd", tool_version="t", run_id="fin", replaces_sources=[fin_log],
+         staging_dir=synthetic_case.folder)
+    journal = Journal(synthetic_case)
+    for ip in ("10.42.85.116", "10.42.85.117"):
+        journal.append("host_identity", host="DESKTOP", op="add_ip", value=ip)
+    journal.append("host_identity", host="FIN", op="add_ip", value="10.42.85.200")
+    at = lambda i: T0 + (2000 + i) * SEC
+    archive = "DC01/Windows/System32/winevt/Logs/Archive-Security.evtx"
+    sources = [
+        *[("3", "192.168.1.23", "ATTACKER-PC")] * 3,
+        ("3", "192.168.1.23", "laptop01.corp.local"),   # its own name
+        ("3", "192.168.1.23", "192.168.1.23"),          # its own address
+        ("3", "192.168.1.23", ""),
+        ("3", "192.168.1.23", "-"),
+        ("10", "192.168.1.23", "CITADEL-DC01"),          # RDP, naming the target
+        ("3", "10.42.85.10", "CITADEL-DC01"),            # DC01 to itself, by its own name
+        ("3", "10.42.85.115", "DESKTOP"),                # DESKTOP's lane name
+        *[("3", "10.42.85.115", "WS07")] * 2,
+        ("3", "10.42.85.115", "WS08"),
+        ("3", "10.42.85.116", "WS09"),
+        *[("3", "10.42.85.117", name) for name in ("WS10", "WS11", "WS12", "WS13", "WS13")],
+        ("3", "10.42.85.200", "FINANCE-WORKSTA"),        # FIN's NetBIOS name
+        ("3", "10.42.85.200", "FINANCE-WORKST2"),
+    ]
+    logons = [logon(at(i), 400 + i, archive, user="u", ltype=ltype, ip=ip, ws=ws)
+              for i, (ltype, ip, ws) in enumerate(sources)]
+    failed = logon(at(len(sources)), 400 + len(sources), archive, user="u", code="4625", ip="192.168.1.23",
+                   ws="ATTACKER-PC")
+    load(synthetic_case.db_path, [*logons, replace(failed, logon_type="3")],   # EvtxECmd gives a 4625 its logon type
+         host="DC01", tool="evtxecmd", tool_version="t", run_id="names", replaces_sources=[archive],
+         staging_dir=synthetic_case.folder)
+    con, _, identity = open_case(synthetic_case)
+    hosts = identity.hosts
+    assert hosts["LAPTOP01"].review == ["Role not confirmed", "3 logons from 192.168.1.23 name ATTACKER-PC, not this host"]
+    desktop_notes = ["3 logons from 10.42.85.115 name WS07 and WS08, not this host",
+                     "1 logon from 10.42.85.116 names WS09, not this host",
+                     "5 logons from 10.42.85.117 name WS13, WS10, WS11, and 1 other, not this host"]
+    assert hosts["DESKTOP"].review == ["Role not confirmed", *desktop_notes]
+    assert hosts["FIN"].review == ["Role not confirmed", "1 logon from 10.42.85.200 names FINANCE-WORKST2, not this host"]
+    assert hosts["DC01"].review == ["Role not confirmed"]
+    assert [(link.source, link.target, link.via) for link in links_in(con, at(0), at(3))] == [("LAPTOP01", "DC01", "ip")] * 3
+
+    Journal(synthetic_case).append("host_identity", host="DESKTOP", op="add_ip", value="192.168.1.23")
+    hosts = build_identity(con, Journal(synthetic_case).state).hosts
+    assert hosts["LAPTOP01"].review == ["Role not confirmed", "192.168.1.23 is also claimed by DESKTOP"]
+    assert hosts["DESKTOP"].review == ["Role not confirmed", "192.168.1.23 is also claimed by LAPTOP01", *desktop_notes]
+    con.close()
+
+
+@pytest.mark.parametrize("kind", ["untimed", "imported"])
+def test_a_logon_that_draws_no_link_adds_no_name_to_the_review_note(synthetic_case, kind):
+    """The note counts the logons that link from the host owning the address: EvtxECmd's 4624s with a time. A 4624
+    with no time, or one imported from another log, such as a SIEM's export of the same logons, draws no link, so the
+    names it records aren't counted, though its source address resolves to the host."""
+    from dataclasses import replace
+
+    from conftest import logon
+
+    hive = "LAPTOP01/Windows/System32/config/SYSTEM"
+    load(synthetic_case.db_path,
+         [registry(hive, "ROOT\\ControlSet001\\Control\\ComputerName\\ComputerName", "ComputerName", "LAPTOP01"),
+          registry(hive, "ROOT\\ControlSet001\\Services\\Tcpip\\Parameters\\Interfaces\\{2}", "DhcpIPAddress",
+                   "192.168.1.23")],
+         host="LAPTOP01", tool="recmd", tool_version="t", run_id="laptop", replaces_sources=[hive],
+         staging_dir=synthetic_case.folder)
+    at = lambda i: T0 + (2000 + i) * SEC
+    archive = "DC01/Windows/System32/winevt/Logs/Archive-Security.evtx"
+    linked = [logon(at(i), 400 + i, archive, user="u", ltype="3", ip="192.168.1.23", ws="ATTACKER-PC") for i in range(3)]
+    load(synthetic_case.db_path, linked, host="DC01", tool="evtxecmd", tool_version="t", run_id="names",
+         replaces_sources=[archive], staging_dir=synthetic_case.folder)
+    if kind == "untimed":
+        source, tool = "DC01/Windows/System32/winevt/Logs/Untimed-Security.evtx", "evtxecmd"
+        unlinked = [logon(None, 500, source, user="u", ltype="3", ip="192.168.1.23", ws="OTHER-PC")]
+    else:
+        source, tool = "SIEM/logons.jsonl", "import"
+        unlinked = [replace(logon(at(i), 500 + i, source, user="u", ltype="3", ip="192.168.1.23", ws="OTHER-PC"),
+                            artifact="siem_logons") for i in range(2)]
+    load(synthetic_case.db_path, unlinked, host="DC01", tool=tool, tool_version="t", run_id=kind,
+         replaces_sources=[source], staging_dir=synthetic_case.folder)
+    con, _, identity = open_case(synthetic_case)
+    assert identity.hosts["LAPTOP01"].review == ["Role not confirmed",
+                                                 "3 logons from 192.168.1.23 name ATTACKER-PC, not this host"]
+    assert con.execute("SELECT count(*) FROM logon_links WHERE source_host = 'LAPTOP01'").fetchone()[0] == 3
+    con.close()
+
+
+def test_registry_paths_match_whatever_their_letter_case(synthetic_case):
+    """Windows compares key names without case, and a hive can write them in lower case, such as `services`. Such a
+    host still gets its name, address, role, release, and zone, and Same service name still reaches a Sysmon key
+    under `services`."""
+    from glessner.events import Event
+    from glessner.timezones import host_timezones
+
+    system, software = "WS03/Windows/System32/config/SYSTEM", "WS03/Windows/System32/config/SOFTWARE"
+    zone = "ROOT\\ControlSet001\\control\\timezoneinformation"
+    load(synthetic_case.db_path, [
+        registry(system, "ROOT\\ControlSet001\\control\\computername\\computername", "ComputerName", "FILESRV03"),
+        registry(system, "ROOT\\ControlSet001\\services\\Tcpip\\Parameters\\Interfaces\\{3}", "DhcpIPAddress",
+                 "10.20.30.40"),
+        registry(system, "ROOT\\ControlSet001\\control\\productoptions", "ProductType", "ServerNT"),
+        registry(system, zone, "TimeZoneKeyName", "Pacific Standard Time"),
+        registry(system, zone, "Bias", "480"),
+        *[registry(software, "ROOT\\Microsoft\\windows nt\\currentversion", name, value)
+          for name, value in WINDOWS_10.items()]],
+         host="WS03", tool="recmd", tool_version="t", run_id="lower", replaces_sources=[], staging_dir=synthetic_case.folder)
+    sysmon = [Event(ts_us=T0 + (3000 + i) * SEC, ts_desc="Event Recorded", artifact="evtx",
+                    source_file="DC01/Sysmon.evtx", source_record=str(i), record_id=i, message="13", event_code="13",
+                    event_provider="Microsoft-Windows-Sysmon", log_channel="Microsoft-Windows-Sysmon/Operational",
+                    registry_path=f"HKLM\\System\\CurrentControlSet\\{services}\\WinUpdSvc\\ImagePath")
+              for i, services in enumerate(("services", "Services"))]
+    load(synthetic_case.db_path, sysmon, host="DC01", tool="evtxecmd", tool_version="t", run_id="sysmon",
+         replaces_sources=[], staging_dir=synthetic_case.folder)
+    con, _, identity = open_case(synthetic_case)
+    ws = identity.hosts["WS03"]
+    assert (ws.names, ws.ips) == (["FILESRV03"], ["10.20.30.40"])
+    assert identity.resolve_ip("10.20.30.40") == identity.resolve_name("FILESRV03") == "WS03"
+    assert (ws.guessed_role, ws.role_reason) == ("Servers", "The SYSTEM hive records its product type as ServerNT")
+    assert ws.os["display"] == "Windows 10 Enterprise Evaluation, version 2004, build 19041.264"
+    assert (host_timezones(con)["WS03"]["windows"], ws.timezone["bias_minutes"]) == ("Pacific Standard Time", 480)
+    keys = [uid for (uid,) in con.execute("SELECT event_uid FROM events WHERE source_file = 'DC01/Sysmon.evtx' "
+                                          "ORDER BY record_id").fetchall()]
+    for key in keys:
+        assert sorted(e["uid"] for e in related(con, key, "service_name")["events"]) == sorted(keys)
+    con.close()
+
+
+@pytest.mark.parametrize("written, windows, iana", [
+    ("Eastern Standard Time ard Time", "Eastern Standard Time", "America/New_York"),
+    ("Pacific Standard Time\x00me", "Pacific Standard Time", "America/Los_Angeles"),
+    ("Central Standard Time (Mexico) xico)", "Central Standard Time (Mexico)", "America/Mexico_City"),
+    ("Tokyo Standard Time", "Tokyo Standard Time", "Asia/Tokyo"),
+    ("Central Standard Time (Mexico)", "Central Standard Time (Mexico)", "America/Mexico_City"),
+    ("Mid-Atlantic Standard Time", "Mid-Atlantic Standard Time", ""),
+], ids=["no null", "null", "parentheses", "as written", "as written, its leading words a zone", "no zone"])
+def test_a_zone_name_written_with_bytes_after_its_null_reads_as_its_zone(synthetic_case, written, windows, iana):
+    """RECmd can write TimeZoneKeyName with what followed the value's terminating null, as "Eastern Standard Time ard
+    Time", which names no zone. The name is read up to the null, or, where the null isn't kept, as its longest run of
+    leading words that names a Windows zone, so the host's zone keeps its daylight saving rules. A name that names a
+    zone as written keeps all its words, and one that no run of words matches keeps its text, with the host's bias as
+    a fixed offset."""
+    import sys
+
+    from glessner.timezones import host_timezones, resolve_zone
+
+    if sys.platform != "win32" and "\x00" not in written:
+        pytest.skip("the zone names are looked up in the ICU that ships with Windows")
+    zone = "ROOT\\ControlSet001\\Control\\TimeZoneInformation"
+    hive = "DESKTOP/Windows/System32/config/SYSTEM"
+    load(synthetic_case.db_path, [registry(hive, zone, "TimeZoneKeyName", written), registry(hive, zone, "Bias", "300")],
+         host="DESKTOP", tool="recmd", tool_version="t", run_id="zone", replaces_sources=[], staging_dir=synthetic_case.folder)
+    con, _, _ = open_case(synthetic_case)
+    zones = host_timezones(con)
+    assert zones["DESKTOP"]["windows"] == windows
+    if sys.platform == "win32":
+        assert zones["DESKTOP"]["iana"] == iana
+        label = (f"DESKTOP's zone, {windows} ({iana})" if iana
+                 else "DESKTOP's fixed offset UTC-05:00, without daylight saving")
+        assert resolve_zone("host:DESKTOP", zones)["label"] == label
+    con.close()

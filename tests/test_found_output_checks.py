@@ -3,14 +3,17 @@
 import dataclasses
 import json
 
+from chain_fixtures import format3_case
 from conftest import junction
+from test_runner import eve_lines
 from test_tool_outputs import SBE_COLUMNS, write_rows
 
 from glessner import runner as runner_module
-from glessner.case import create_case
+from glessner.case import create_case, open_case
 from glessner.events import connect
 from glessner.intake import add_new, intake
-from glessner.runner import LEFT_OUT, UNHASHED_NOTE, load_found_output, read_runs, rebuild, run_problems
+from glessner.rekey import upgraded
+from glessner.runner import LEFT_OUT, UNLISTED_NOTE, load_found_output, read_runs, rebuild, run_problems
 from glessner.toolbox import run_and_load
 
 CSV = "HOST/Modules/FileFolderAccess/alice_UsrClass.csv"
@@ -138,7 +141,7 @@ def test_a_rebuild_loads_found_output_unchecked_when_its_messages_file_is_not_in
     rebuild(case)
     (saved,) = read_runs(case)
     assert saved.loaded_rows == 1
-    assert LEFT_OUT not in saved.notes[-1] and MESSAGES in saved.notes[-1] and UNHASHED_NOTE in saved.notes[-1]
+    assert LEFT_OUT not in saved.notes[-1] and MESSAGES in saved.notes[-1] and UNLISTED_NOTE in saved.notes[-1]
     assert source_files(case) == [HIVE.replace("\\", "/")]
 
 
@@ -188,3 +191,39 @@ def test_a_rebuild_leaves_out_found_sbecmd_output_whose_messages_file_changed_si
     (saved,) = read_runs(case)
     assert saved.loaded_rows == 0
     assert LEFT_OUT in saved.notes[-1] and f"{MESSAGES}: SHA-256 changed" in saved.notes[-1]
+
+
+def test_a_load_of_found_output_records_what_its_parser_skipped_once_the_case_is_at_format_4(tmp_path):
+    """An EVE file found in the evidence, whose last line was cut short, and an SBECmd CSV, whose parser counts nothing.
+    A case below format 4 keeps run.json in the shape the builds of its format read."""
+    evidence = tmp_path / "evidence"
+    (evidence / "SENSOR").mkdir(parents=True)
+    (evidence / "SENSOR" / "eve.json").write_text(eve_lines([1000, 1001]) + '{"timestamp": "2024', encoding="utf-8")
+    write_rows(evidence / CSV, SBE_COLUMNS, [BAG])
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    saved = lambda record: json.loads((case.runs_folder / record.run_id / "run.json").read_text(encoding="utf-8"))
+    below = format3_case(case)
+    for record in (load_found_output(below, "suricata", "suricata_eve", "SENSOR", ["SENSOR/eve.json"]),
+                   load_found_output(below, "sbecmd", "sbecmd_csv", "HOST", [CSV])):
+        assert (record.status, record.rows_skipped) == ("ok", None)
+        assert not {"tool_files", "rows_skipped", "tool_check"} & set(saved(record))
+    at_4 = upgraded(open_case(case.folder))
+    eve = load_found_output(at_4, "suricata", "suricata_eve", "SENSOR", ["SENSOR/eve.json"])
+    assert (eve.status, eve.loaded_rows, eve.rows_skipped, saved(eve)["rows_skipped"]) == ("ok", 2, 1, 1)
+    bags = load_found_output(at_4, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (bags.status, bags.rows_skipped) == ("ok", None) and "rows_skipped" not in saved(bags)
+    assert "tool_files" not in saved(eve) and "tool_files" not in saved(bags)   # no tool ran
+
+
+def test_a_load_of_several_found_files_records_the_sum_of_what_its_parser_skipped(tmp_path):
+    """A found-output group loads all of a host's files in one run. Each EVE file here ends in a line cut short."""
+    evidence = tmp_path / "evidence"
+    for folder, ids in (("a", [1000, 1001]), ("b", [1002])):
+        (evidence / "SENSOR" / folder).mkdir(parents=True)
+        (evidence / "SENSOR" / folder / "eve.json").write_text(eve_lines(ids) + '{"timestamp": "2024', encoding="utf-8")
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    eve = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["SENSOR/a/eve.json", "SENSOR/b/eve.json"])
+    saved = json.loads((case.runs_folder / eve.run_id / "run.json").read_text(encoding="utf-8"))
+    assert (eve.status, eve.loaded_rows, eve.rows_skipped, saved["rows_skipped"]) == ("ok", 3, 2, 2)

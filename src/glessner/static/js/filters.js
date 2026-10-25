@@ -1,4 +1,4 @@
-import { $, api, el, HINTS, panelBand, plural, post, S, setStatus, syncPanelButtons } from './core.js';
+import { $, api, el, HINTS, panelBand, plural, post, S, setStatus, showControls, syncPanelButtons } from './core.js';
 import { fetchView, scheduleFetch } from './data.js';
 import { button } from './event_page.js';
 import { renderExportScope } from './exports.js';
@@ -110,12 +110,18 @@ export function renderFilterState() {
   renderStateLine();
 }
 
+// The filter ID that S.shown's counts answer for, null with none
+let shownFor = null;
+
 // What the current filter shows per source file, and per channel within it, from the server; without a filter
-// everything shows. An answer for a filter that has changed since it was asked is dropped: the panel's boxes come from
-// these counts, so it would show the earlier filter's choices, and a click on a box would act on them.
+// everything shows. The panel's boxes come from these counts, so until the filter in force has its own, the boxes wait
+// (renderFilterPanel): drawn from an earlier filter's, they would show its choices, and a click on a box would act on
+// them. An answer for a filter that has changed since it was asked is dropped, and a failed read leaves the boxes
+// waiting until the next change or read.
 export async function refreshShown() {
-  if ($('filterPanel').hidden || !S.filterId) { S.shown = null; renderFilterPanel(); return; }
+  if ($('filterPanel').hidden || !S.filterId) { S.shown = null; shownFor = null; renderFilterPanel(); return; }
   const asked = S.filterId;
+  renderFilterPanel();   // a panel opened again after a change made while it was closed waits too
   try {
     const res = await api(`/api/shown?filter=${asked}`);
     if (asked !== S.filterId) return;
@@ -125,6 +131,7 @@ export async function refreshShown() {
       S.shown.set(key, (S.shown.get(key) || 0) + n);
       if (channel) S.shown.set(`${key}\t${channel}`, n);
     }
+    shownFor = asked;
   } catch (err) { setStatus(err.message); return; }
   renderFilterPanel();
 }
@@ -139,10 +146,12 @@ export function canShow(p) {
 }
 
 // A checkbox for a pred, from how many of its events show: checked when all, part-checked when some.
-// A click shows everything it covers when it can, and otherwise hides it.
+// A click shows everything it covers when it can, and otherwise hides it. With `shown` null, while the filter's counts
+// are still to come, the box is disabled and unchecked.
 export function filterBox(p, shown, total) {
-  const all = shown >= total;
   const box = el('input', { type: 'checkbox', 'aria-label': `Show ${describePred(p)}` });
+  if (shown == null) { box.disabled = true; return box; }
+  const all = shown >= total;
   box.checked = shown > 0;
   box.indeterminate = shown > 0 && !all;
   box.addEventListener('change', () => { S.filterApplying = setShown(p, !all && canShow(p)); });   // menus wait on this
@@ -198,16 +207,19 @@ export function buildFilterPanel() {
   });
 }
 
+// A row of the panel. `shown` is null while the filter's counts are still to come: the row's count reads "…".
 export function filterRow(p, depth, label, shown, total, { node = '', title = '', info = false } = {}) {
   const open = node && (S.fpOpen.has(node) || !!S.fpQuery);
   const tw = node ? button(open ? '▾' : '▸', () => { S.fpOpen.has(node) ? S.fpOpen.delete(node) : S.fpOpen.add(node); renderFilterPanel(); },
                            { class: 'tw', 'aria-label': `Show or hide what is in ${label}` }) : el('span');
-  const hidden = p && shown < total;
+  const counted = shown != null;
+  const hidden = p && counted && shown < total;
+  const waiting = [title, 'Counting what the filter shows.'].filter(Boolean).join('. ');
   return el('div', { class: `frow d${depth}${info ? ' info' : ''}${hidden && !shown ? ' off' : ''}`,
                      ...(p ? { 'data-pred': JSON.stringify(p) } : {}), ...(node ? { 'data-node': node } : {}),
-                     title: p ? rowTitle(p, shown, total, title) : title },
+                     title: !p ? title : counted ? rowTitle(p, shown, total, title) : waiting },
             tw, p ? filterBox(p, shown, total) : el('span'), el('span', { class: 'name' }, label),
-            el('span', { class: 'n' }, total == null ? '' : countText(shown, total)));
+            el('span', { class: 'n' }, total == null ? '' : counted ? countText(shown, total) : '…'));
 }
 
 export function renderFilterPanel() {
@@ -218,7 +230,10 @@ export function renderFilterPanel() {
                  ...S.filter.show.map((p) => [`Showing ${describePred(p)}`, () => removeRule('show', p)])];
   $('fpChips').replaceChildren(...(chips.length ? chips.map(([text, remove]) => el('span', { class: 'fchip' }, text,
     button('×', remove, { 'aria-label': `Remove the filter: ${text}` }))) : [el('span', { class: 'muted' }, 'Nothing is hidden.')]));
-  // Shown counts per file, summed up to types and hosts. Without a filter, everything shows.
+  // Shown counts per file, summed up to types and hosts. Without a filter, everything shows. While a filter is in force
+  // and its counts are still to come, no row's count is known, and each box waits for them.
+  const waiting = !!S.filterId && shownFor !== S.filterId;
+  const known = (n) => (waiting ? null : n);
   const shownOf = (h, a, f, channel) => {
     if (!S.shown) return channel ? channel.count : f.count;
     const key = fileKey(h, a.tool, a.artifact, f.file);
@@ -240,7 +255,7 @@ export function renderFilterPanel() {
   for (const t of S.sources.types) {
     const node = `t:${t.tool}:${t.artifact}`;
     types.push(filterRow({ tool: t.tool, artifact: t.artifact }, 0, `${t.artifact} (${toolName(t.tool)} ${t.versions.join(', ')})`,
-                         typeShown.get(`${t.tool}:${t.artifact}`) ?? t.count, t.count, { node }));
+                         known(typeShown.get(`${t.tool}:${t.artifact}`) ?? t.count), t.count, { node }));
     if (S.fpOpen.has(node)) for (const r of t.runs) types.push(filterRow(null, 1, `run ${r.run}, ${r.host}`, r.count, r.count, { info: true, title: r.run }));
   }
   const hb = S.sources.hayabusa;
@@ -248,26 +263,27 @@ export function renderFilterPanel() {
   $('fpTypes').replaceChildren(...types);
   const q = S.fpQuery, tree = [];
   for (const h of S.sources.hosts) {
-    const match = (f) => !q || f.file.toLowerCase().includes(q);
+    // A file is found by its name as recorded or as the tree shows it, with each bidi control as [U+XXXX]
+    const match = (f) => !q || f.file.toLowerCase().includes(q) || showControls(f.file).toLowerCase().includes(q);
     const arts = h.artifacts.map((a) => ({ ...a, shownFiles: a.files.filter(match) })).filter((a) => a.shownFiles.length);
     if (!arts.length) continue;
     const hn = `h:${h.host}`;
-    tree.push(filterRow({ host: h.host }, 0, h.host, hostShown.get(h.host), h.count, { node: hn }));
+    tree.push(filterRow({ host: h.host }, 0, h.host, known(hostShown.get(h.host)), h.count, { node: hn }));
     if (!(S.fpOpen.has(hn) || q)) continue;
     for (const a of arts) {
       const an = `a:${h.host}:${a.artifact}`;
       const ap = { host: h.host, tool: a.tool, artifact: a.artifact };
       tree.push(filterRow(ap, 1, `${a.artifact}, ${plural(a.files.length, 'file')}`,
-                          artShown.get(`${h.host}:${a.tool}:${a.artifact}`), a.count, { node: an }));
+                          known(artShown.get(`${h.host}:${a.tool}:${a.artifact}`)), a.count, { node: an }));
       if (!(S.fpOpen.has(an) || q)) continue;
       const all = S.fpAll.has(an) || q;
       for (const f of (all ? a.shownFiles : a.shownFiles.slice(0, 50))) {
         // A file of several channels, such as a capture's Suricata record types, opens to them
         const fn = f.channels ? `f:${h.host}:${f.file}` : '';
         const fp = { ...ap, file: f.file };
-        tree.push(filterRow(fp, 2, f.file.split('/').pop(), shownOf(h.host, a, f), f.count, { title: f.file, node: fn }));
+        tree.push(filterRow(fp, 2, f.file.split('/').pop(), known(shownOf(h.host, a, f)), f.count, { title: f.file, node: fn }));
         if (!fn || !(S.fpOpen.has(fn) || q)) continue;
-        for (const c of f.channels) tree.push(filterRow({ ...fp, channel: c.channel }, 3, c.channel, shownOf(h.host, a, f, c), c.count));
+        for (const c of f.channels) tree.push(filterRow({ ...fp, channel: c.channel }, 3, c.channel, known(shownOf(h.host, a, f, c)), c.count));
       }
       if (!all && a.shownFiles.length > 50) {
         tree.push(el('div', { class: 'frow d2 info' }, el('span'), el('span'),

@@ -45,5 +45,36 @@ jobs:
       - name: Run the linters
         run: uv run --no-sync python scripts/lint.py
 
+      # Each outgoing TCP connection takes a local port from Windows' dynamic range, 16,384 ports by default, and the side
+      # that closes a connection first keeps its port for 2 minutes after. When Windows can't give a socket a port or
+      # buffer space, the browser reports net::ERR_NO_BUFFER_SPACE. The tests use 127.0.0.1 only. The runner is
+      # discarded after the job, so the IPv4 range is widened here. The step fails unless the range in effect is the
+      # wider one, and it logs the range and the ports Windows excludes from it, for a failure to be read against. Only
+      # here does the range take in the app's preferred port, 47613 (server.PREFERRED_PORT); the tests that bind that
+      # port set one of their own.
+      - name: Widen the dynamic port range
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          netsh interface ipv4 set dynamicport tcp start=10000 num=55536
+          $range = netsh interface ipv4 show dynamicport tcp store=active | Out-String
+          $range
+          if ($range -notmatch 'Start Port\s*:\s*10000\s' -or $range -notmatch 'Number of Ports\s*:\s*55536\s') {
+            throw 'The dynamic port range in effect is not 10000 to 65535.'
+          }
+          netsh interface ipv4 show excludedportrange protocol=tcp
+
+      # The browser tests drive the runner's Microsoft Edge. With GLESSNER_REQUIRE_BROWSER set, a runner image without Edge
+      # fails them, where otherwise each would be skipped and the job would pass.
       - name: Run the test suite
+        env:
+          GLESSNER_REQUIRE_BROWSER: "1"
         run: uv run --no-sync pytest -ra
+
+      # The runner's TCP sockets by state, and the Tcpip events Windows logs when a port range runs out (4227 and 4231),
+      # to tell a range that ran out from a socket refused for another reason.
+      - name: Show the TCP state after a failure
+        if: failure()
+        run: |
+          Get-NetTCPConnection | Group-Object State | Sort-Object Count -Descending | Format-Table Name, Count
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Tcpip'; Id = 4227, 4231 } -MaxEvents 20 `
+            -ErrorAction SilentlyContinue | Format-List TimeCreated, Id, Message

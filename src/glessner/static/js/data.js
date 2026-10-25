@@ -6,10 +6,14 @@ import { viewNote } from './view.js';
 
 // ---------- data ----------
 
+// The window the timeline is going to: while the window moves, the motion's end, so a fetch asked for during the motion,
+// such as Logon links toggled, is for the window the motion ends on and not one it passes through.
+const targetView = () => (S.anim ? S.anim.view : S.view);
+
 export function scheduleFetch() {
   clearTimeout(S.timer);
   S.timer = setTimeout(fetchView, 120);
-  awaitWindow(S.view);
+  awaitWindow(targetView());
 }
 
 const sameWindow = (a, b) => !!a && !!b && a.start === b.start && a.end === b.end;
@@ -27,7 +31,7 @@ function awaitWindow(view) {
 // a 2-million-event case. A window asked for meanwhile is fetched when the current request
 // returns, and the windows passed over in between are skipped.
 export let viewRequest = null, nextView = null;
-export function fetchView(view = S.view) {
+export function fetchView(view = targetView()) {
   awaitWindow(view);
   if (!viewRequest) {
     viewRequest = loadView(view).finally(() => { viewRequest = null; });
@@ -49,7 +53,9 @@ export async function loadView(view) {
               `&limit=${S.meta.event_threshold}${filterParam()}${fitInView(view) ? '&outside=1' : ''}`;
   try {
     const data = await api(url);
-    if (nextView) return;   // a newer window is on its way, so this one is already out of date
+    // Another window on its way makes this one out of date. The same window asked for again, as after a change to what
+    // the view carries, is shown meanwhile: dropped, a motion to it would end on the data from before it.
+    if (nextView && !sameWindow(nextView.view, view)) return;
     const loaded = { data, fetchMs: performance.now() - t0, span_s: (end - start) / 1e6, view };
     if (S.anim && S.anim.view === view) { S.anim.loaded = loaded; return; }   // shown when the motion ends
     showData(loaded);

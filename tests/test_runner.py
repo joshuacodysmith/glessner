@@ -1,17 +1,20 @@
 """Runner behavior, using a small Python script as a stand-in forensic tool."""
 
+import hashlib
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from chain_fixtures import format3_case
 from conftest import junction
 
 from glessner.case import create_case
 from glessner.intake import add_new, intake
 from glessner.long_paths import long_path
 from glessner.runner import RunError, plan_runs, read_runs, run
-from glessner.tools import DetectedTool, ToolOption, ToolSpec
+from glessner.tools import DetectedTool, ToolOption, ToolSpec, folder_sha256
 
 FAKE_TOOL = """
 import json, os, pathlib, sys, time
@@ -61,9 +64,7 @@ def case(tmp_path):
 def run_mode(case, tool, mode, host="DC01"):
     (plan,) = plan_runs(case, tool, [host])
     # The fake tool reads its mode from the last argument, which comes from the {value} placeholder.
-    spec = tool.spec
-    patched = DetectedTool(ToolSpec(**{**spec.__dict__, "args": spec.args[:-1] + (mode,)}), tool.executable, tool.version,
-                           tool.dotnet_root)
+    patched = replace(tool, spec=replace(tool.spec, args=tool.spec.args[:-1] + (mode,)))
     return run(case, plan.__class__(patched, plan.host, plan.inputs))
 
 
@@ -817,3 +818,94 @@ def test_found_output_a_check_cannot_re_read_is_not_called_changed(tmp_path, mon
     assert job.error == ""
     assert [(r["host"], r["status"], r["evidence"]) for r in job.results] == [("WS01", "failed", "unreadable"),
                                                                               ("WS02", "failed", "unreadable")]
+
+
+FORMAT_4_KEYS = {"tool_files", "rows_skipped", "tool_check"}
+
+
+def saved_record(case, record) -> dict:
+    return json.loads((case.runs_folder / record.run_id / "run.json").read_text(encoding="utf-8"))
+
+
+def git_rules(folder: Path, commit: str) -> dict:
+    """A rules checkout at `commit`, and a registry rules_label that names it, as Hayabusa's names its rules folder."""
+    (folder / ".git").mkdir(parents=True, exist_ok=True)
+    (folder / ".git" / "HEAD").write_text(f"{commit}\n", encoding="utf-8")
+    return {"kind": "git", "path": str(folder), "text": "Fake rules {value}"}
+
+
+def test_a_run_records_the_sha_256_of_its_tool_s_files(case, tmp_path):
+    """The fake tool is the Python executable, given a script outside its folder, so it records the executable alone."""
+    exe = Path(sys.executable)
+    record = run_mode(case, fake_spec(tmp_path), "ok")
+    saved = saved_record(case, record)
+    assert record.status == "ok" and saved["tool_files"] == {exe.name: hashlib.sha256(exe.read_bytes()).hexdigest()}
+    assert saved["rules"] == "" and not {"rows_skipped", "tool_check"} & set(saved)   # no set, no parser, no check
+
+
+def test_a_builtin_tool_s_run_records_an_empty_set_of_tool_files(case, tmp_path):
+    """The app's own Python runs a builtin tool, so it has no files of its own; an empty set, not none, says the run
+    was made at format 4."""
+    record = run_mode(case, with_spec(fake_spec(tmp_path), builtin=True), "ok")
+    assert record.status == "ok" and saved_record(case, record)["tool_files"] == {}
+
+
+def test_a_run_notes_each_link_its_tool_files_leave_out(case, tmp_path, monkeypatch):
+    """A folder's hash skips the links in it, as intake skips them, but the tool may read through one."""
+    from glessner import runner
+
+    def hashed(tool, argv, links):
+        links += ["rules/shared -> D:\\Rules", "Maps/more -> D:\\Maps"]
+        return {}
+
+    monkeypatch.setattr(runner, "tool_files", hashed)
+    record = run_mode(case, fake_spec(tmp_path), "ok")
+    note = ("The SHA-256s recorded for Fake's files don't cover what 2 links in its folder point to, which Fake may "
+            "read: rules/shared -> D:\\Rules; Maps/more -> D:\\Maps.")
+    assert record.status == "ok" and note in saved_record(case, record)["notes"]
+    monkeypatch.setattr(runner, "tool_files", lambda tool, argv, links: {})
+    assert not any("SHA-256s" in n for n in run_mode(case, fake_spec(tmp_path), "ok").notes)
+
+
+def test_a_run_records_its_rule_set_as_it_is_when_the_tool_starts(case, tmp_path):
+    """Detection, which the server keeps, names the set too, but the rules may be updated after it."""
+    from glessner.tools import rules_label
+
+    tool = with_spec(fake_spec(tmp_path), rules_label=git_rules(tmp_path / "rules", "1" * 40))
+    detected = replace(tool, rules=rules_label(tool.spec, tool.executable))
+    files = folder_sha256(tmp_path / "rules")[:8]
+    assert detected.rules == f"Fake rules 1111111, files {files}"
+    git_rules(tmp_path / "rules", "2" * 40)   # an update of the rules after detection
+    record = run_mode(case, detected, "ok")
+    updated = f"Fake rules 2222222, files {files}"
+    assert (record.status, record.rules, saved_record(case, record)["rules"]) == ("ok", updated, updated)
+
+
+def test_a_run_whose_tool_file_cannot_be_read_is_refused_naming_it_before_anything_is_made(case, tmp_path, monkeypatch):
+    """The read is refused once the file is open, as a lock or antivirus refuses one, with an error that names no
+    file."""
+    def refuse(f, digest):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(hashlib, "file_digest", refuse)
+    with pytest.raises(RunError) as refused:
+        run_mode(case, fake_spec(tmp_path), "ok")
+    assert str(refused.value).startswith("Fake wasn't run on DC01: ") and "Permission denied" in str(refused.value)
+    assert f"{Path(sys.executable).name}'" in str(refused.value)
+    assert list(case.runs_folder.iterdir()) == []
+
+
+def test_a_run_in_a_case_below_format_4_records_none_of_format_4_s_keys(case, tmp_path):
+    """A case still at format 3, as one whose journal is read-only stays, is read by the builds of that format, which
+    refuse a run.json key they don't know. A run there records its rule set as those builds do, which for a tool named
+    by its rules_label, such as Hayabusa, is none, and records no tool files. The same run in a format 4 case records
+    both."""
+    tool = with_spec(fake_spec(tmp_path), rules_label=git_rules(tmp_path / "rules", "1" * 40))
+    named = f"Fake rules 1111111, files {folder_sha256(tmp_path / 'rules')[:8]}"
+    detected = replace(tool, rules=named)   # as detection names it
+    at_4 = run_mode(case, detected, "ok")
+    assert at_4.rules == named and "tool_files" in saved_record(case, at_4)
+    below = format3_case(case)
+    record = run_mode(below, detected, "ok")
+    assert (record.status, record.rules, record.tool_files) == ("ok", "", None)
+    assert not FORMAT_4_KEYS & set(saved_record(below, record))

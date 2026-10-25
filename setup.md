@@ -140,6 +140,8 @@ Remove-Item $zip
 
 The zip holds Hayabusa's rules. Updating them with `hayabusa update-rules` needs network access, and that step is yours to run.
 
+A zip install's rules folder isn't a Git checkout, so from case format 4 Glessner names the rule set of each Hayabusa run `Hayabusa rules` plus the first 8 hex digits of the rules folder's SHA-256, such as `Hayabusa rules a1b2c3d4`. A rules folder that is a Git checkout is named by the first 7 digits of its commit and the first 8 of the folder's SHA-256, such as `Hayabusa rules fffbdd1, files 7c30c465`. A file you edit, add, or remove in the rules folder, `rules\config` included, changes the 8 digits, so an edited checkout reads differently from an unedited one at the same commit. Each run also records the SHA-256 of the `rules` and `config` folders.
+
 ## 6. Npcap, Suricata, and the ET Open rule set
 
 Suricata reads packet captures. Its Windows build loads Npcap's `wpcap.dll` even to read capture files, so install Npcap first.
@@ -186,7 +188,7 @@ Suricata reads packet captures. Its Windows build loads Npcap's `wpcap.dll` even
    uv run python scripts\suricata_rules.py C:\Tools\suricata-8.0.7\et-open C:\Tools\suricata-8.0.7\PFiles\Suricata
    ```
 
-Without the rule file, Suricata still writes its network records, and raises no alerts. To refresh the rules, run steps 3 and 4 again. Each Suricata run records the rule set's version.
+Without the rule file, Suricata still writes its network records, and raises no alerts. To refresh the rules, run steps 3 and 4 again. Each Suricata run records the rule set's version. From case format 4, each run also records the SHA-256 of the rule file, the version file, and the other files its command line names in Suricata's folder.
 
 ## 7. Check the setup
 

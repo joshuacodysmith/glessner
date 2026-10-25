@@ -2275,7 +2275,16 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A System 104 records the account that cleared the log but no logon ID. When the Security log was cleared too, its 1102 records the logon.",
+     "when": {
+      "event_code": "104",
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [],
    "also": "Codes 1102 and 104 occur in 10 other channels on Szechuan that aren't log clears, so this kind matches the channel and provider too. Where 104 is written is uncertain (low confidence).",
    "measured": "No Security 1102 and no System 104. Code 1102 occurs in 3 other channels (16 events) and 104 in 7 (41)."
@@ -2491,7 +2500,15 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A Sysmon 3 event records no logon ID. The logon is on the Sysmon 1 event that started the process.",
+     "when": {
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "process",
@@ -2576,7 +2593,15 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A Sysmon 11 event records no logon ID. The logon is on the Sysmon 1 event that started the process.",
+     "when": {
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "process",
@@ -2659,7 +2684,15 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A Sysmon 7 event records no logon ID. The logon is on the Sysmon 1 event that started the process.",
+     "when": {
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "process",
@@ -2740,7 +2773,15 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A Sysmon 8 event records no logon ID. The logon is on the Sysmon 1 event that started the source process.",
+     "when": {
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "process",
@@ -2823,7 +2864,15 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "session",
+     "reason": "A Sysmon 10 event records no logon ID. The logon is on the Sysmon 1 event that started the source process.",
+     "when": {
+      "logon_id": ""
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "process",
@@ -2958,7 +3007,23 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "file",
+     "reason": "A 4660 doesn't name the object it deleted. The 4656 or 4663 from the same process with the same handle ID names it.",
+     "when": {
+      "event_code": "4660",
+      "file_path": ""
+     }
+    },
+    {
+     "pivot": "file",
+     "reason": "The object isn't a file, so this event is keyed on the process that accessed it.",
+     "when": {
+      "file_path": ""
+     }
+    }
+   ],
    "later": []
   },
   {
@@ -4601,7 +4666,40 @@
      ]
     }
    ],
-   "not_offered": [],
+   "not_offered": [
+    {
+     "pivot": "hash",
+     "reason": "A Suricata http record carries no file hash. Its hash, when Suricata records one, is on the fileinfo record of the same flow, which Same flow reaches.",
+     "when": {
+      "artifact": "suricata",
+      "log_channel": "http"
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "The app reads no file name from a Suricata http record's URL. The name is on the fileinfo record of the same flow, which Same flow reaches.",
+     "when": {
+      "artifact": "suricata",
+      "log_channel": "http"
+     }
+    },
+    {
+     "pivot": "hash",
+     "reason": "A Zeek http record carries no file hash. Its hash, when Zeek records one, is on Zeek's files record of the transfer.",
+     "when": {
+      "artifact": "zeek",
+      "log_channel": "http"
+     }
+    },
+    {
+     "pivot": "file_name",
+     "reason": "The app reads no file name from a Zeek http record's URI or its file name fields. Zeek's files record of the transfer names the file only when the sender named it in a Content-Disposition header.",
+     "when": {
+      "artifact": "zeek",
+      "log_channel": "http"
+     }
+    }
+   ],
    "later": [
     {
      "pivot": "host_at_address",

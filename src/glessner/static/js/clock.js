@@ -1,7 +1,7 @@
 import { $, api, el, fmtMs, plural, post, S, setStatus } from './core.js';
-import { animateView, cancelAnimation, fitTitle } from './data.js';
+import { animateView, cancelAnimation } from './data.js';
 import { draw } from './draw.js';
-import { button, loadDetails } from './event_page.js';
+import { button, focusedPageAction, loadDetails } from './event_page.js';
 import { filterParam } from './filters.js';
 import { applyHosts, hostInfo } from './hosts.js';
 import { renderStateLine } from './state_line.js';
@@ -69,16 +69,12 @@ export async function alignClocks(to, host = null, target = null) {
   const keep = S.focusEvent && S.focusEvent.uid === S.focus && S.focusEvent.recorded != null ? S.focusEvent : null;
   const was = keep ? offsetOf(keep.host) : 0;
   const at = keep ? keep.recorded / 1000 + was * 1000 : null;   // where it's drawn now, in ms
+  const done = focusedPageAction();
   setAligning(true);
   try {
-    const res = await post('/api/host', host ? { align: to, host } : { align: to });
-    // The case's range moves with the offsets, and Fit case with it. The hosts change even if this fails.
-    let stale = null;
-    const meta = await api('/api/meta').catch((err) => { stale = err; return null; });
-    if (meta) {
-      Object.assign(S.meta, meta);
-      fitTitle();
-    }
+    let res;
+    try { res = await post('/api/host', host ? { align: to, host } : { align: to }); }
+    catch (err) { setStatus(`Clock alignment failed: ${err.message}`); return; }
     // The Event page's event stays where it is on screen, so its pair in the capture comes to meet it. The shift is
     // this post's own, from its answer.
     const now = keep ? (res.hosts.find((h) => h.host === keep.host) || {}).offset_seconds || 0 : 0;
@@ -87,11 +83,9 @@ export async function alignClocks(to, host = null, target = null) {
       cancelAnimation();
       S.view = { start: S.view.start + shift, end: S.view.end + shift };
     }
-    await applyHosts(res);
-    if (stale) setStatus(`The clocks changed, but the case's range didn't reload: ${stale.message}`);
+    await applyHosts(res, done, { moved: true });   // the case's range moves with the offsets, and Fit case with it
     refocus(target);
-  } catch (err) { setStatus(`Clock alignment failed: ${err.message}`); }
-  finally { setAligning(false); }
+  } finally { setAligning(false); }
 }
 
 // The skew in a readable unit for a lane flag: +1 h for 3,599.5 s, +12 min, +42 s, +0.6 s. The exact figure is in

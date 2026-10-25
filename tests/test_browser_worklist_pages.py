@@ -3,12 +3,13 @@ Accept all and Reject all refuse a source larger than one decision can name, bef
 come a page at a time. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke does, and are
 skipped without it."""
 
+import json
 import re
 
 import pytest
 from conftest import SEC, T0
 from test_browser_investigate import COUNTED, INVESTIGATE, open_worklist, page_post, uid_at
-from test_browser_smoke import browser, served_page  # noqa: F401
+from test_browser_smoke import RECORD_REQUESTS, asked, browser, case_menu, refused_with, served_page, wait_held  # noqa: F401
 
 from glessner import server
 from glessner.server import api_mark, api_rule
@@ -142,3 +143,273 @@ def test_a_mark_changed_since_the_first_page_was_read_lists_the_marked_events_ag
         assert p.locator("#status").inner_text() == CHANGED
         more = p.locator("#details .inv-more").get_by_role("button")
         assert (more.inner_text() if more.count() else None) == next_page
+
+
+NEXT = "/api/investigate?offset"
+FOUR = (0, 60, 62, 874)   # seconds after T0 of the events the tests below mark: DC01's first three, then DESKTOP's
+
+
+def mark_four(uids):
+    """A setup that marks the events at FOUR Suspicious and keeps their IDs by second in `uids`."""
+    def setup(app):
+        for seconds in FOUR:
+            uids[seconds] = uid_at(app, T0 + seconds * SEC)
+        api_mark(app, {"uids": list(uids.values()), "value": "suspicious"})
+    return setup
+
+
+def listed_uids(p):
+    return p.evaluate("() => [...document.querySelectorAll('#details ul.worklist li.rel-row')].map((row) => row.dataset.uid)")
+
+
+def taken_all(p, prefix):
+    """Wait until the page's code has finished with the answer of each request it made under `prefix`."""
+    p.wait_for_function("""(prefix) => {
+        const made = window.__asked.filter((path) => path.startsWith(prefix)).length;
+        return made > 0 && window.__taken.filter((path) => path.startsWith(prefix)).length === made;
+    }""", arg=prefix)
+
+
+def test_an_offset_edited_between_two_pages_lists_the_marked_events_again(browser, synthetic_case, monkeypatch):  # noqa: F811
+    """A host's clock offset moves its events in the list's time order without changing how many there are, so the total
+    that Show the next compares stays as it was. The page reads the marked events again instead of adding a page that
+    repeats one listed and skips another, and goes on from the new order, listing each event once."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 2)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        assert listed_uids(p) == [uids[0], uids[60]]
+        page_post(p, "/api/host", {"host": "DESKTOP", "offset_seconds": -3600})   # DESKTOP's event now comes first
+        p.get_by_role("button", name="Show the next 2").click()
+        p.wait_for_function("(want) => document.getElementById('status').textContent === want"
+                            " || document.querySelectorAll('#details ul.worklist li.rel-row').length > 2", arg=CHANGED)
+        assert p.locator("#status").inner_text() == CHANGED
+        p.wait_for_function(LISTED_UIDS, arg=[uids[874], uids[0]])
+        p.get_by_role("button", name="Show the next 2").click()
+        p.wait_for_function(LISTED_UIDS, arg=[uids[874], uids[0], uids[60], uids[62]])
+        assert p.locator("#details .inv-more button").count() == 0
+        assert p.locator("#details .inv-section input[type='search']").get_attribute("placeholder") == "Find in this list"
+
+
+def times_listed(p):
+    return p.locator("#details ul.worklist li.rel-row .rel-time").all_inner_texts()
+
+
+def test_an_offset_edited_between_two_pages_that_keeps_the_order_lists_the_marked_events_again(
+        browser, synthetic_case, monkeypatch):  # noqa: F811
+    """DC01's offset moves its events an hour earlier and leaves them ahead of DESKTOP's, so no event changes place and the
+    total stays. The rows listed carry the old times, and the page that follows would carry the new, which puts a row from
+    after the edit among rows from before it. The page reads the list again instead, and its button still offers the rest."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 2)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        before = times_listed(p)
+        p.evaluate(RECORD_REQUESTS)
+        page_post(p, "/api/host", {"host": "DC01", "offset_seconds": -3600})
+        p.get_by_role("button", name="Show the next 2").click()
+        p.wait_for_function("(old) => JSON.stringify([...document.querySelectorAll('#details ul.worklist li.rel-row .rel-time')]"
+                            ".map((cell) => cell.textContent)) !== JSON.stringify(old)", arg=before)
+        assert p.locator("#status").inner_text() == CHANGED
+        assert listed_uids(p) == [uids[0], uids[60]]
+        assert all(new != old for new, old in zip(times_listed(p), before, strict=True))
+        assert p.get_by_role("button", name="Show the next 2").count() == 1
+        assert asked(p, "/api/investigate") == [f"{NEXT}=2", "/api/investigate"]
+
+
+def list_the_four(p, uids):
+    """Open To investigate with a page of one event and press Show the next until all four marked events are listed."""
+    open_worklist(p)
+    for n in range(2, len(FOUR) + 1):
+        p.get_by_role("button", name="Show the next 1").click()
+        p.wait_for_function(LISTED_UIDS, arg=[uids[s] for s in FOUR[:n]])
+    assert p.locator("#details .inv-more button").count() == 0
+
+
+def test_a_list_read_again_over_several_pages_starts_over_when_the_order_changes_between_them(
+        browser, synthetic_case, monkeypatch):  # noqa: F811
+    """A tick draws the page again with the rows that were on it, which takes a request for each page. With the third
+    request held, another tab edits a host's clock offset, so the page that answers is of another order than the first
+    two. The read starts over, and the list holds each marked event once, the first of them the one that moved, and does
+    not take itself for complete while an event is missing."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        list_the_four(p, uids)
+        p.evaluate(RECORD_REQUESTS)
+        held = []
+        hold = lambda url: url.endswith(f"{NEXT}=2")
+        p.route(hold, lambda route: held.append(route))  # noqa: B023
+        p.locator("#details li.rel-row input.inv-tick").first.check()
+        wait_held(p, held)
+        page_post(p, "/api/host", {"host": "DESKTOP", "offset_seconds": -3600})
+        for route in held:
+            route.continue_()
+        p.unroute(hold)
+        p.wait_for_function(LISTED_UIDS, arg=[uids[874], uids[0], uids[60], uids[62]])
+        assert p.locator("#details .inv-more button").count() == 0
+        assert p.locator("#details .inv-section input[type='search']").get_attribute("placeholder") == "Find in this list"
+        assert asked(p, "/api/investigate") == ["/api/investigate", f"{NEXT}=1", f"{NEXT}=2",
+                                                "/api/investigate", f"{NEXT}=1", f"{NEXT}=2", f"{NEXT}=3"]
+
+
+@pytest.mark.parametrize(("field", "value"), [("order", "another"), ("total", 5)])
+def test_a_list_read_again_whose_marked_events_keep_changing_lists_the_rows_read_before_the_change_and_a_button_for_the_rest(
+        browser, synthetic_case, monkeypatch, field, value):  # noqa: F811
+    """When the third page and every later one names another order, or another total, than the first two, the read
+    starts over a few times and then keeps the two rows it read in one order, with the button for the rest. The page does
+    not call a list complete that holds only some of the marked events, and the button reads on once the answers agree."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        list_the_four(p, uids)
+        p.evaluate(RECORD_REQUESTS)
+
+        def another_order(route):
+            body = route.fetch().json()
+            body[field] = value
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(body))
+
+        differ = lambda url: url.endswith((f"{NEXT}=2", f"{NEXT}=3"))
+        p.route(differ, another_order)
+        p.locator("#details li.rel-row input.inv-tick").first.check()
+        p.wait_for_function("() => document.querySelector('#details .meter-words')?.textContent === '1 of 4 followed up'")
+        p.wait_for_function(LISTED_UIDS, arg=[uids[0], uids[60]])
+        p.unroute(differ)
+        assert asked(p, "/api/investigate") == ["/api/investigate", f"{NEXT}=1", f"{NEXT}=2"] * 3
+        assert p.locator("#details .inv-section input[type='search']").get_attribute("placeholder") == "Find in the 2 listed"
+        for n in (3, 4):
+            p.get_by_role("button", name="Show the next 1").click()
+            p.wait_for_function(LISTED_UIDS, arg=[uids[s] for s in FOUR[:n]])
+
+
+def test_a_list_read_again_adds_only_the_events_a_later_page_does_not_repeat(browser, synthetic_case, monkeypatch):  # noqa: F811
+    """An answer holding an event the read has taken already adds the others once, so each offset after it counts the
+    events taken and not the rows answered, and the list that results holds each marked event once."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        list_the_four(p, uids)
+        p.evaluate(RECORD_REQUESTS)
+        # The first two events answer the request for the second one
+        overlap = lambda url: url.endswith(f"{NEXT}=1")
+        p.route(overlap, lambda route: route.fulfill(
+            response=route.fetch(url=route.request.url.replace("offset=1", "offset=0&limit=2"))))
+        p.locator("#details li.rel-row input.inv-tick").first.check()
+        p.wait_for_function("() => document.querySelector('#details .meter-words')?.textContent === '1 of 4 followed up'")
+        p.wait_for_function(LISTED_UIDS, arg=[uids[s] for s in FOUR])
+        p.unroute(overlap)
+        assert asked(p, NEXT) == [f"{NEXT}=1", f"{NEXT}=2", f"{NEXT}=3"]
+        assert p.locator("#details .inv-more button").count() == 0
+
+
+def test_a_host_offset_edited_in_the_hosts_panel_lists_the_marked_events_again(browser, synthetic_case):  # noqa: F811
+    """With To investigate on screen, an offset typed in the Hosts panel redraws it in the new time order, as it redraws
+    the Event page, so the list does not keep the order from before the edit."""
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        assert listed_uids(p) == [uids[s] for s in FOUR]
+        case_menu(p, "hostsButton")
+        offset = p.locator("#hostsTable tr[data-host='DESKTOP'] input[type=number]")
+        offset.fill("-3600")
+        offset.press("Enter")
+        p.wait_for_function(LISTED_UIDS, arg=[uids[874], uids[0], uids[60], uids[62]])
+
+
+@pytest.mark.parametrize("act", [
+    pytest.param(lambda button: button.evaluate("(b) => { b.click(); b.click(); }"), id="two clicks"),
+    pytest.param(lambda button: button.dblclick(), id="a double click"),
+])
+def test_a_second_click_on_show_the_next_waits_for_the_first_answer(browser, synthetic_case, monkeypatch, act):  # noqa: F811
+    """With the first page's answer held, a second click sends no second request: the offset would be the same, both
+    answers would add the same page, and the offset after them would skip the page between. The list holds each event
+    once, the find box counts the events listed, and the next request asks for the offset after them."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        p.wait_for_function(COUNTED)
+        p.evaluate(RECORD_REQUESTS)
+        held = []
+        hold = lambda url: NEXT in url
+        p.route(hold, lambda route: held.append(route))  # noqa: B023
+        act(p.get_by_role("button", name="Show the next 1"))
+        wait_held(p, held)
+        assert asked(p, NEXT) == [f"{NEXT}=1"]
+        for route in held:
+            route.continue_()
+        p.unroute(hold)
+        taken_all(p, NEXT)
+        p.wait_for_function(COUNTED)
+        assert listed_uids(p) == [uids[0], uids[60]]
+        assert p.locator("#details .inv-section input[type='search']").get_attribute("placeholder") == "Find in the 2 listed"
+        p.get_by_role("button", name="Show the next 1").click()
+        taken_all(p, NEXT)
+        assert asked(p, NEXT) == [f"{NEXT}=1", f"{NEXT}=2"]
+        assert listed_uids(p) == [uids[0], uids[60], uids[62]]
+        p.get_by_role("button", name="Show the next 1").click()
+        taken_all(p, NEXT)
+        assert listed_uids(p) == [uids[s] for s in FOUR]
+        assert p.locator("#details .inv-more button").count() == 0
+
+
+def test_show_the_next_answers_a_click_again_after_its_request_fails(browser, synthetic_case, monkeypatch):  # noqa: F811
+    """The wait for an answer ends when the request fails: the status line gives the error, the button stays, and a click
+    after the server answers again lists the page."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 2)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        refuse = lambda url: NEXT in url
+        p.route(refuse, refused_with("the next page failed"))
+        more = p.get_by_role("button", name="Show the next 2")
+        more.click()
+        p.wait_for_function("() => document.getElementById('status').textContent === 'the next page failed'")
+        p.unroute(refuse)
+        p.errors[:] = [e for e in p.errors if "/api/investigate" not in e]   # that refusal was the point
+        assert more.is_enabled()
+        more.click()
+        p.wait_for_function(LISTED_UIDS, arg=[uids[s] for s in FOUR])
+
+
+def test_a_page_that_repeats_a_listed_event_adds_only_the_events_not_listed(browser, synthetic_case, monkeypatch):  # noqa: F811
+    """An answer holding an event the list shows already, as when an order changed without the page learning of it, adds
+    the others once, and the next request asks for the offset after the events listed, not after the answer's rows."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        p.evaluate(RECORD_REQUESTS)
+        # The first two events answer the request for the second one
+        overlap = lambda url: url.endswith(f"{NEXT}=1")
+        p.route(overlap, lambda route: route.fulfill(
+            response=route.fetch(url=route.request.url.replace("offset=1", "offset=0&limit=2"))))
+        p.get_by_role("button", name="Show the next 1").click()
+        taken_all(p, NEXT)
+        assert listed_uids(p) == [uids[0], uids[60]]
+        p.unroute(overlap)
+        p.wait_for_function(COUNTED)
+        p.get_by_role("button", name="Show the next 1").click()
+        taken_all(p, NEXT)
+        assert listed_uids(p) == [uids[0], uids[60], uids[62]]
+        assert asked(p, NEXT)[-1] == f"{NEXT}=2"
+
+
+def test_a_page_of_events_all_listed_already_lists_the_marked_events_again(browser, synthetic_case, monkeypatch):  # noqa: F811
+    """An answer with nothing the list does not show adds no rows and would leave the button asking for the same offset
+    again, so the page reads the marked events again and says so."""
+    monkeypatch.setattr(server, "WORKLIST_PAGE", 1)
+    uids = {}
+    for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
+        open_worklist(p)
+        again = lambda url: url.endswith(f"{NEXT}=1")
+        p.route(again, lambda route: route.fulfill(
+            response=route.fetch(url=route.request.url.replace("offset=1", "offset=0"))))
+        p.get_by_role("button", name="Show the next 1").click()
+        p.wait_for_function("(want) => document.getElementById('status').textContent === want", arg=CHANGED)
+        p.unroute(again)
+        p.wait_for_function(COUNTED)
+        assert listed_uids(p) == [uids[0]]
+        p.get_by_role("button", name="Show the next 1").click()
+        p.wait_for_function(LISTED_UIDS, arg=[uids[0], uids[60]])

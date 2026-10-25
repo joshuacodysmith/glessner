@@ -7,7 +7,7 @@
 import { $, api, codePrefix, el, fmtUs, marked, plural, reportAction, S, setHighlight, setStatus } from './core.js';
 import { animateView } from './data.js';
 import { draw } from './draw.js';
-import { button, claimDetails, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, pageAction, pageRead, setPage, settleRedraw, showingPage } from './event_page.js';
 import { filterParam } from './filters.js';
 import { markableList, stickUnder } from './pages.js';
 import { addViewValue, describeValue, viewToggle } from './view.js';
@@ -116,6 +116,7 @@ export async function showSearch(q, quiet = false) {
   const page = { key: `search:${q}`, title: `Search: ${q}`, reopen: () => showSearch(q) };
   // A search that answers after the analyst asked for an event or another page draws nothing.
   const latest = claimDetails();
+  const drew = pageRead();
   let res;
   try { res = await api(`/api/search?q=${encodeURIComponent(q)}${filterParam()}`); }
   catch (err) {
@@ -129,8 +130,13 @@ export async function showSearch(q, quiet = false) {
   S.related = new Set(res.uids || res.events.map((e) => e.uid));   // every match stands out on the timeline
   draw();
   render(q, res, page);
+  drew(page.key, () => showSearch(q, quiet));
   if (!quiet) reportAction(`Search: ${plural(res.total, 'matching event')}`, res.server_ms);
 }
+
+// A mark from one of a search's lists draws the search again quietly once it is written, unless a page was asked for
+// meanwhile; `done` is the one markableList passes
+const redrawAfterMark = (q) => (done) => { if (done(false)) settleRedraw(() => showSearch(q, true)); };
 
 const zoomTo = (a, b) => {
   const pad = (b - a) / 1000 * 0.05 + 1000;
@@ -185,8 +191,9 @@ function render(q, res, page) {
   // find's words added, over every match
   const find = { page: page.key, name: 'results', covers: 'The count and the timeline still cover',
                  listed: res.limited ? res.events.length : null, total: res.total, searchAll: (text) => run(`${q} ${text}`) };
-  const { buttons, list, find: finder } = markableList(res.events, checked, rerender, () => showSearch(q, true), {
-    label: row, highlight: marked, offsets: false, via: true, hiddenTag: 'hidden by the View', find });
+  const again = () => showSearch(q, true);
+  const { buttons, list, find: finder } = markableList(res.events, checked, rerender, redrawAfterMark(q), {
+    label: row, highlight: marked, offsets: false, via: true, hiddenTag: 'hidden by the View', find, afterTag: again });
   const hidden = S.viewSpec ? res.events.filter((e) => !e.shown).length : 0;
   const span = res.total ? `, ${fmtUs(res.first).slice(0, 19)} to ${fmtUs(res.last).slice(0, 19)} UTC` : '';
   const core = res.core;
@@ -208,8 +215,9 @@ function render(q, res, page) {
     ? [el('p', { class: 'muted', id: 'searchHiddenWhy' }, `The View shows only events ${res.view_terms.join('; or ')}. ` +
           'The rows marked "hidden by the View" meet none of that.', ' ',
         button('Show the hidden matches on the timeline', async () => {
+          const done = pageAction(page.key);
           await addViewValue({ search: res.query });   // this search only: the View's other terms stay as they were
-          if (showingPage(page.key)) showSearch(q);
+          done();
         }, { id: 'searchShowHidden', title: 'Add this search to the View, so its matches show on the timeline; Remove this search from view filter undoes it' }))] : [];
   stickUnder(list, head);
   const adds = forgivingLine(res, page, rerender);
@@ -292,7 +300,8 @@ function byNameLink(rules, head) {
 function byName(res, checked, rerender, q) {
   if (!res.by_name) return [];
   const rules = res.by_name.map((rule) => {
-    const { list } = markableList(rule.events, checked, rerender, () => showSearch(q, true), { offsets: false, via: true });
+    const { list } = markableList(rule.events, checked, rerender, redrawAfterMark(q),
+                                  { offsets: false, via: true, afterTag: () => showSearch(q, true) });
     const outside = rule.count - rule.in_results;
     return el('div', { class: 'by-rule' },
       el('p', {}, 'the Hayabusa rule ', el('b', {}, rule.title), rule.level ? ` (${rule.level})` : '', ' hit ',

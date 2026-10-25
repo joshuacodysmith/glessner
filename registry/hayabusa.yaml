@@ -8,6 +8,9 @@ detect:
   version: {args: ["help"], regex: 'Hayabusa v(\d+\.\d+\.\d+)'}
 handles: [evtx]
 input: host_dir
+# Hayabusa reads only files named *.evtx in the folder it is given, while intake identifies an event log by its
+# signature, so a renamed one is an input the tool never opens. The runner notes the files a run leaves out.
+selects: ["*.evtx"]
 run:
   # -p verbose adds EvtxFile, -b writes full channel and level names, -O writes UTC ISO-8601,
   # -w skips the question wizard, -Q skips error log files.
@@ -19,5 +22,10 @@ options:
     label: Minimum rule level (informational, low, medium, high, critical)
     args: ["-m", "{value}"]
 outputs: [hayabusa.csv]
+# Its rules and config folders, which no argument names: a run records their SHA-256, and names the rule set by the
+# commit the rules checkout is at and the first digits of the rules folder's hash, so edited rules read differently, or
+# by the folder's hash alone where there is no checkout, such as one from a release zip.
+tool_files: [rules, config]
+rules_label: {kind: git, path: rules, text: "Hayabusa rules {value}"}
 parser: hayabusa_csv
 notes: Output quotes attacker command lines and encoded payloads that antivirus quarantines. Rule updates (update-rules) need network access and are the analyst's step.

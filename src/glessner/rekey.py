@@ -1,6 +1,8 @@
-"""The case format upgrades: 1 to 2, the event IDs that the Amcache, SRUM, Suricata, and SQLECmd key rules changed, and
-2 to 3, the seal that starts the journal's hash chain (upgrade_chain, at the end of this module). The two share the
-hold on the events database (_held_database), which each enters on its own.
+"""The case format upgrades: 1 to 2, the event IDs that the Amcache, SRUM, Suricata, and SQLECmd key rules changed;
+2 to 3, the seal that starts the journal's hash chain (upgrade_chain, near the end of this module); and 3 to 4, which
+journals itself and, for output found in the evidence that was loaded while case.yaml named the evidence through a link,
+the IDs its events took (upgrade_format_4). The three share the hold on the events database (_held_database), which each
+enters on its own.
 
 Format 1 to 2 has ten steps, which the comments below cite by number: (1) hold the events database; (2) when the
 journal already holds the step's entry, repair the rows a crash left, in place of steps 3 to 10; (3) group the runs by
@@ -24,9 +26,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 
 import duckdb
@@ -35,10 +37,13 @@ from . import case as cases
 from . import heads
 from .accounts import AFFECTS_SQL, key_sql, name_sids
 from .case import JOURNAL_FILE, Case, CaseError, report_stage, upgrade, write_atomically
-from .events import EventIds, connect, transaction
+from .events import EventIds, connect, id_table, names_by_root, transaction
 from .hashes import HASHES_SQL
+from .intake import counted_record, record_at_head, records_manifest
 from .journal import (
     REPLAY_ERRORS,
+    SYSTEM,
+    UNVOUCHED_WORDS,
     Journal,
     JournalError,
     check,
@@ -55,11 +60,14 @@ from .journal import (
     unchained_tail,
     upgrade_recorder,
 )
+from .long_paths import long_path
 from .parsers import FORMER_RULES, PARSERS
+from .parsers.common import evidence_relative
 from .runner import (
     IMPORT,
     RunRecord,
     _write_record,
+    evidence_root_name,
     latest_runs,
     parse_context,
     read_runs,
@@ -81,6 +89,10 @@ UPGRADING = "Upgrading the case format"   # the start of every stage the step re
 # The format 3 step's runs to pin and each one's result, for a run of the step after a crash (_pin_runs). Removed once
 # the seal is journaled.
 PINNED_FILE = "upgrade_pinned_runs.json"
+# The format 4 step's runs of found output whose events take new IDs, each with the old ID of every event and its new one,
+# written before the step deletes a row and read by a run of the step after a stop (_remap_found_output). Removed once
+# the entry is journaled.
+RENAMED_FILE = "upgrade_renamed_ids.json"
 
 
 @dataclass
@@ -117,7 +129,7 @@ def upgrade_ids(case: Case) -> Iterator[dict | None]:
     with _held_database(case) as con:
         recovered = _mend(case)
         runs = read_runs(case)
-        if _journaled(case):
+        if _journaled(case, 1, 2):
             if loaded:
                 _repair(case, con, runs)
             yield None
@@ -203,20 +215,30 @@ def _undeletable(path: Path) -> Callable[[], None] | None:
     return lambda: kernel32.CloseHandle(handle)
 
 
-def _journaled(case: Case) -> bool:
-    """Whether the journal holds this step's entry already (step 2)."""
+def _journaled(case: Case, from_format: int, to_format: int) -> bool:
+    """Whether the journal holds a step's case_upgrade entry already, from `from_format` to `to_format` (format 2's step
+    2, and format 4's step): a line of it, the last one too, which a crash may leave without its LF. For a step from a
+    format with the chain, only a chained line after the newest chain_break counts: an unchained one that a seal covers
+    never stands for it, and a chain_break after one may have put that very line on record as a break, so the step
+    writes its own entry after it."""
     path = case.folder / JOURNAL_FILE
     if not path.exists():
         return False
+    chained = from_format >= cases.FIRST_CHAINED
+    step = ("case_upgrade", from_format, to_format)
+    found = False
     with path.open("rb") as f:
         for line in f:
-            if b'"case_upgrade"' in line:
-                entry = parse_line(line.rstrip(b"\n"))   # by the rule every reader shares
-                if entry is None:
-                    continue   # the journal's own read names a torn line
-                if (entry.get("action"), entry.get("from_format"), entry.get("to_format")) == ("case_upgrade", 1, 2):
-                    return True
-    return False
+            if b'"case_upgrade"' not in line and not (chained and b'"chain_break"' in line):
+                continue
+            entry = parse_line(line.rstrip(b"\n"))   # by the rule every reader shares
+            if entry is None or (chained and "prev" not in entry):
+                continue   # a torn line, which the journal's own read names, or an unchained one
+            if (entry.get("action"), entry.get("from_format"), entry.get("to_format")) == step:
+                found = True
+            elif chained and entry.get("action") == "chain_break":
+                found = False
+    return found
 
 
 def _qualifying(runs: list[RunRecord]) -> tuple[set[str], list[RunRecord]]:
@@ -317,11 +339,13 @@ def _remap(case: Case, con: duckdb.DuckDBPyConnection | None, runs: list[RunReco
     named, candidates = referenced_ids(case.folder / JOURNAL_FILE)
     placed = _place(named, parsed, candidates)   # step 7
     dropped = _dropped(case, con, members, reloaded, parsed, strays, named)
+    unreached = None   # the references that reach no loaded event, which only a database can tell
     if con is not None:
         _reload(case, con, groups, reloads)   # step 8
         for run_id in unrecorded:
             _delete(con, "run_id = ?", [run_id])
         _restore(case, con, runs, groups)
+        unreached = _unreached(con, named, placed["pairs"], placed["unplaced"])
     _reached(8)
     unpinned = _pin(case, parsed)   # step 9
     _reached(9)
@@ -333,7 +357,7 @@ def _remap(case: Case, con: duckdb.DuckDBPyConnection | None, runs: list[RunReco
                       for run_id, p in sorted(parsed.items())},
              "map_size": len(lines), "map_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
     loads = {run_id: p for run_id, p in parsed.items() if run_id in reloaded}   # the case's events
-    return {"text": _sentence(loads, placed["pairs"], placed["unplaced"], named), "rekey": rekey}   # step 10
+    return {"text": _sentence(loads, placed["pairs"], placed["unplaced"], named, unreached), "rekey": rekey}   # step 10
 
 
 def _check(case: Case, con: duckdb.DuckDBPyConnection, groups: dict, parsed: dict[str, Parsed],
@@ -429,6 +453,17 @@ def _rows_of(con: duckdb.DuckDBPyConnection | None, run_id: str) -> set[str]:
     return {uid for (uid,) in con.execute("SELECT event_uid FROM events WHERE run_id = ?", [run_id]).fetchall()}
 
 
+def _unreached(con: duckdb.DuckDBPyConnection, named: set[str], pairs: dict, unplaced: dict) -> int:
+    """After step 8: how many of the IDs the journal names (`named`) reach no event in the events table, each one
+    followed to the ID its pair gives it, so two references to one missing event count twice. The events are those of any
+    tool, so a mark on an event of an EVTX log counts only when the event is gone. An ID step 7 left unplaced names more
+    than one event and has its own count, so it is left out, and so are an earlier rekey's candidates, which no entry
+    names. The IDs go to one query as a list."""
+    reached = [pairs.get(uid, uid) for uid in sorted(named - unplaced.keys())]
+    return con.execute("SELECT count(*) FROM (SELECT unnest(?::VARCHAR[]) AS uid) AS r ANTI JOIN events e "
+                       "ON e.event_uid = r.uid", [reached]).fetchone()[0]
+
+
 def _reload(case: Case, con: duckdb.DuckDBPyConnection, groups, reloads: list[RunRecord]) -> None:
     """Step 8: each tool's rows on each host are deleted, then the runs a rebuild loads for it are loaded again, in its
     order and with its checks. Found SRUM's empty sources and SQLECmd's absolute paths differ from the new ones, so a load
@@ -518,12 +553,13 @@ def _pin_one(case: Case, r: RunRecord, outside: int) -> str:
     return ""
 
 
-def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict, named: set[str]) -> str:
+def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict, named: set[str], unreached: int | None = None) -> str:
     """The entry's text: the events of the runs a rebuild loads whose IDs the new rules change, by tool, and the
     journal references the map moved: the IDs the journal names (`named`) among its pairs, and its unplaced IDs. The
     pairs also hold the earlier rekeys' candidates it placed, which are no reference. Counted from the runs' output, so a
     run of the step after a crash says the same. A moved case's SQLECmd rows loaded before the move already have their
-    new IDs, and are counted too."""
+    new IDs, and are counted too. A last sentence gives how many references name no loaded event (`unreached`, from
+    _unreached) when that is above 0; with no database it is None and the text says nothing of it."""
     changed: dict[str, set[str]] = {}
     for p in parsed.values():
         changed.setdefault(p.record.parser, set()).update(new for old, new in p.ids.items() if old != new)
@@ -531,16 +567,27 @@ def _sentence(parsed: dict[str, Parsed], pairs: dict, unplaced: dict, named: set
               for name, label in LABELS.items() if changed.get(name)]
     what = "Event IDs no longer depend on where or in which time zone a tool ran"
     text = f"{what}: {_listed(counts)} took new IDs." if counts else f"{what}; no event here took a new ID."
+    return text + _references_sentence(pairs, unplaced, named, unreached)
+
+
+def _references_sentence(pairs: dict, unplaced: dict, named: set[str], unreached: int | None) -> str:
+    """What a rekey's text says of the journal's references, each sentence after a space: how many now name their
+    event's new ID, how many are left unplaced, and how many name no loaded event."""
+    text = ""
     n, u = len(pairs.keys() & named), len(unplaced)
     if not n and not u:
-        return f"{text} No journal reference changed."
-    text += (" No journal reference was placed on a new ID." if n == 0
-             else " 1 journal reference now names its event's new ID." if n == 1
-             else f" {n:,} journal references now name their events' new IDs.")
-    if not u:
-        return f"{text} None was left unplaced."
-    return (f"{text} {u:,} {'was' if u == 1 else 'were'} left unplaced, each naming more than one event; the Case overview "
-            "counts them, and each event they may mean says so.")
+        text += " No journal reference changed."
+    else:
+        text += (" No journal reference was placed on a new ID." if n == 0
+                 else " 1 journal reference now names its event's new ID." if n == 1
+                 else f" {n:,} journal references now name their events' new IDs.")
+        text += (" None was left unplaced." if not u
+                 else f" {u:,} {'was' if u == 1 else 'were'} left unplaced, each naming more than one event; the Case "
+                      "overview counts them, and each event they may mean says so.")
+    if unreached:
+        text += (" 1 journal reference names no loaded event." if unreached == 1
+                 else f" {unreached:,} journal references name no loaded event.")
+    return text
 
 
 def _listed(items: list[str]) -> str:
@@ -711,8 +758,8 @@ def _check_unsealed(case: Case, path: Path) -> None:
 
 def _check_set_back(case: Case) -> None:
     """A head recorded outside the case, with a journal that has no chain, means the case had a chain and was set back
-    from format 3, so a step stops before it writes anything, naming the record. Both steps ask first: format 2's step
-    would otherwise reload and write format 2 into a case that is refused a moment later."""
+    from a format with the chain, so a step stops before it writes anything, naming the record. Both steps ask first:
+    format 2's step would otherwise reload and write format 2 into a case that is refused a moment later."""
     path = case.folder / JOURNAL_FILE
     if path.exists() and has_chain(path):
         return
@@ -721,10 +768,10 @@ def _check_set_back(case: Case) -> None:
         raise CaseError(
             f"{case.settings.name} is at case format {case.settings.case_format} and its journal has no hash chain, but "
             f"this computer recorded the head of its chain, entry #{record['seq']}, at {record.get('at', '')}, in "
-            f"{heads.path_for(case.folder)}. The case was set back from format 3 and its chained lines removed, or its "
-            "folder was restored from a copy made before its upgrade. Nothing was changed. Restore the case folder from "
-            "a copy made after the upgrade; or, if the reset was intended, remove that file and open the case again, "
-            "which seals the journal as it stands.")
+            f"{heads.path_for(case.folder)}. The case was set back from a format with the chain and its chained lines "
+            "removed, or its folder was restored from a copy made before its upgrade. Nothing was changed. Restore the "
+            "case folder from a copy made after the upgrade; or, if the reset was intended, remove that file and open "
+            "the case again, which seals the journal as it stands.")
 
 
 def _seal_sentence(sealed: dict) -> str:
@@ -736,12 +783,320 @@ def _seal_sentence(sealed: dict) -> str:
             f"started {chain}")
 
 
+FORMAT_4_OPENS = "Only builds that read case format 4 open the case from here on."
+FORMAT_4_TEXT = f"{FORMAT_4_OPENS} Nothing already in the case changed."
+
+
+@contextmanager
+def upgrade_format_4(case: Case) -> Iterator[dict | None]:
+    """UPGRADES[3] (case.upgrade): the fields of the case_upgrade entry, which upgrade_recorder writes as an ordinary
+    chained entry after the journal's read-only checks; or None when the journal holds the step's chained entry
+    already: a crash came after it and before case.yaml took format 4, so upgrade_recorder runs the same checks and
+    only the number is written. Either way a journal with no chain or with a break raises KeptAtFormat, and the case
+    stays at format 3. The events database is held from the first line of the step to the last, as the earlier steps
+    hold it, so a running app stops the step before it writes.
+
+    The entry says only that nothing in the case changed, except for found output (_remap_found_output), whose step
+    changes the events database and so asks the journal's checks first (case.check_journal). The names the moved runs'
+    events carried are kept in RENAMED_FILE until the entry is journaled. A journal that holds a line a case at format 4
+    has already can't take the step's rekey, so the step moves nothing then and names the runs, except for runs an
+    earlier open began to load again, which stop it."""
+    loaded = case.db_path.exists()
+    with _held_database(case) as con:
+        if _journaled(case, 3, 4):
+            yield None
+        else:
+            closed = cases.check_journal()
+            yield _remap_found_output(case, con if loaded else None, closed) or {"text": FORMAT_4_TEXT}
+        (case.folder / RENAMED_FILE).unlink(missing_ok=True)   # the entry is journaled
+
+
+def _linked(case: Case) -> bool:
+    """Whether a file in the evidence is named differently against the evidence path as case.yaml writes it than against
+    the resolved path, which found output is read under (parse_context): case.yaml names the evidence through a
+    junction, a substituted drive, or a mapped one."""
+    return evidence_relative(str(long_path(case.evidence, "probe")), case.evidence) != "probe"
+
+
+LONG_FORM = "//?/"   # how a source file names a file outside the evidence root it was read under (evidence_relative)
+
+
+def _stored_sources(con: duckdb.DuckDBPyConnection, runs: list[RunRecord]) -> dict[str, set[str]]:
+    """Each run's source files in the events table. A run with no rows is not in the answer."""
+    held = id_table(con, "found_runs", sorted(r.run_id for r in runs))
+    rows = con.execute(f"SELECT DISTINCT run_id, source_file FROM events WHERE run_id IN (SELECT v FROM {held})").fetchall()
+    found: dict[str, set[str]] = {}
+    for run_id, source in rows:
+        found.setdefault(run_id, set()).add(source)
+    return found
+
+
+def _inputs_by_name(case: Case, record: RunRecord) -> dict[str, str]:
+    """A run of found output's inputs, each by the name its events carry now: the path under the resolved evidence root
+    (parse_context), evidence-relative."""
+    root = long_path(case.evidence)
+    return {evidence_relative(str(long_path(root, p)), root): p for p in (PureWindowsPath(q).as_posix() for q in record.inputs)}
+
+
+def _old_names(case: Case, record: RunRecord, stored: set[str] | None) -> dict[str, str]:
+    """Each input of a run of found output, by the name its events carry now, with the name a load under a link gave
+    them: the file's whole path. The stored names (`stored`, the events table's extended-length ones) are matched to the
+    inputs by the run's root (events.names_by_root, which a later load of found output replaces rows by), so the old name
+    is the one the rows carry, whatever has happened to the evidence since. With none, it is where the file is now."""
+    inputs = _inputs_by_name(case, record)
+    if stored is None:
+        root = long_path(case.evidence)
+        return {name: PureWindowsPath(str(long_path(root, p))).as_posix() for name, p in inputs.items()}
+    by_input = {p: name for name, p in inputs.items()}
+    return {by_input[p]: source for source, p in names_by_root(stored, inputs.values(), evidence_root_name(case)).items()}
+
+
+def _renamed_ids(case: Case, record: RunRecord, old: dict[str, str], con: duckdb.DuckDBPyConnection | None) -> Parsed:
+    """A run of found output's events, each ID with the one a load gave it while the evidence root was the path as
+    case.yaml writes it, which names a file by its whole path when that path is a link: the output is read once, and
+    each event's file is named as `old` gives it (_old_names). With `con`, only the IDs the run's rows hold, so a pair is
+    always of an event that is stored."""
+    now = parse_context(case, record, case.runs_folder / record.run_id)
+    ids_then, ids_now = EventIds(), EventIds()
+    pairs = {}
+    for event in PARSERS[record.parser](now):
+        then = replace(event, source_file=old.get(event.source_file, event.source_file))
+        pairs[ids_then(record.host, then)[0]] = ids_now(record.host, event)[0]
+    if con is not None:
+        held = id_table(con, "renamed_ids", pairs)
+        rows = con.execute(f"SELECT event_uid FROM events WHERE run_id = ? AND event_uid IN (SELECT v FROM {held})",
+                           [record.run_id]).fetchall()
+        present = {uid for (uid,) in rows}
+        pairs = {before: after for before, after in pairs.items() if before in present}
+    return Parsed(record, pairs, 0)
+
+
+def _read_run(case: Case, record: RunRecord, names: dict[str, str] | None, stored: set[str] | None,
+              con: duckdb.DuckDBPyConnection | None) -> tuple[Parsed | None, dict[str, str], str]:
+    """A run of found output checked against its record and read once (_renamed_ids): the pairs, the names the events
+    carried (`names`, or _old_names of the run's `stored` rows when none are given), and why not, "" when it was read. A
+    run that fails either check, or that this build can't read, has no pairs and says why."""
+    try:
+        problems, _ = run_problems(case, record, f"case format upgrade reads {record.run_id}")
+        if problems:
+            return None, {}, f"its output doesn't match its record: {'; '.join(problems)}"
+        names = names or _old_names(case, record, stored)
+        return _renamed_ids(case, record, names, con if stored else None), names, ""
+    except Exception as exc:   # noqa: BLE001  (a parser refusing the output, or any failure reading it, is named, never fatal)
+        return None, {}, f"its output can't be read by this build ({type(exc).__name__}: {exc})"
+
+
+def _remap_found_output(case: Case, con: duckdb.DuckDBPyConnection | None, closed: bool = False) -> dict | None:
+    """The 3 to 4 entry's fields for output found in the evidence that a build loaded while case.yaml named the evidence
+    through a link, or None when the step has nothing to say of it, which is the usual case and reads no output.
+
+    The runs are the ones a rebuild loads (latest_runs) whose rows in the events table name a file by an extended-length
+    path. A run with no rows, such as every run of a case with no events database or one the step stopped in, is read
+    when case.yaml names the evidence through a link (_linked), and counts only if the journal names an ID the old naming
+    gives, since nothing else shows it was loaded that way. A run with rows in the plain form is left alone, whatever
+    case.yaml says now. Each run is checked against its record and read once under the name its rows carry
+    (_read_run); one that fails either is left as it is and named, since one run must not stop a step that runs
+    again at every open, and its events keep the IDs they have. When `closed`, the journal holds a line that closes the
+    place of the rekey from format 3 to 4 (journal.check_for_upgrade), so every run whose IDs would move is left as it is
+    and named instead, before the first row is deleted: every reader would call the entry a break. The pairs for the IDs
+    the journal names are placed as format 2's step places them (_place). With a database, the rows of the runs whose
+    events took new IDs are deleted and the runs loaded again, in a rebuild's order, so the rows are a rebuild's and the
+    references find them.
+
+    Before the first row is deleted, the name each such run's events carried is written to RENAMED_FILE (_keep_names). A
+    case with no events database has no run to finish, so the step leaves the file unread there and removes it with the
+    entry. A run of the step that finds the file reads the runs whose rows a stop left plain or took from it
+    (_stopped_names): the names are only the old half of each pair, so the pairs come from the run's output, and the
+    run's rows must be the ones that output gives. Such a run that can't be read, whose names or rows don't fit it, or
+    that the journal can't take a rekey for, stops the step instead (_cannot_finish): its old IDs are in no row, so
+    naming it would lose them. A run whose rows are still in the old form is read from them, as a run the step never
+    touched. A stopped run with rows is moved again only when the journal names one of its old IDs, and one with none
+    always is, since it has no events until it is loaded. Nothing is journaled before the load, so a stop anywhere in the
+    step leaves format 3 and the next run of the step does the load again and journals the same pairs."""
+    members = [r for r in latest_runs(read_runs(case)) if r.from_output and r.parser in PARSERS]
+    sources = _stored_sources(con, members) if con is not None else {}
+    linked = _linked(case)
+    kept = _kept_names(case) if con is not None else {}   # a stop that kept names had a database
+    long_names: dict[str, set[str] | None] = {}   # each run to read, with the extended-length names its rows hold
+    for r in members:
+        names = {source for source in sources.get(r.run_id, ()) if source.startswith(LONG_FORM)}
+        if names or (linked and r.run_id not in sources) or r.run_id in kept:
+            long_names[r.run_id] = names or None
+    runs = [r for r in members if r.run_id in long_names]
+    stopped = {r.run_id for r in runs if r.run_id in kept and not long_names[r.run_id]}   # rows a stop left plain or took
+    named, candidates = referenced_ids(case.folder / JOURNAL_FILE) if runs else (set(), set())
+    parsed: dict[str, Parsed] = {}
+    olds: dict[str, dict[str, str]] = {}
+    skipped: dict[str, str] = {}
+    for i, r in enumerate(runs):
+        report_stage(f"{UPGRADING}: reading the found output of the runs", i + 1, len(runs))
+        stored, resumed = long_names[r.run_id], r.run_id in stopped
+        read, names, reason = _read_run(case, r, _stopped_names(case, r, kept[r.run_id]) if resumed else None, stored, con)
+        if read is None:
+            if resumed:
+                raise _cannot_finish(
+                    case, f"run {r.run_id} can't be read now ({reason}), and the step began to load it again, so its old IDs "
+                    "are in no row",
+                    f"Put the evidence back as it was and open the case again, or remove {RENAMED_FILE}, after which the "
+                    "marks, tags, notes, and findings on that run's events name IDs no event has")
+            skipped[r.run_id] = reason
+        elif resumed and r.run_id in sources and con is not None and not _rows_fit(con, r.run_id, read.ids.values()):
+            raise _cannot_finish(
+                case, f"the rows of run {r.run_id} aren't the ones its output gives",
+                f"Remove {RENAMED_FILE}, which only a stopped upgrade leaves, then open the case again")
+        elif stored and not read.ids:
+            skipped[r.run_id] = "none of the events its output gives are in the events table under the names its rows carry"
+        elif stored or (resumed and r.run_id not in sources) or (named | candidates) & read.ids.keys():
+            parsed[r.run_id], olds[r.run_id] = read, names
+    moved = {run_id: p for run_id, p in parsed.items() if any(old != new for old, new in p.ids.items())}
+    if closed and (again := [run_id for run_id in moved if run_id in stopped]):
+        raise _cannot_finish(
+            case, f"the journal holds a line only a case at format 4 has, after which a rekey of event IDs is a break, and "
+            f"run {again[0]} was loaded again by an earlier open, so its old IDs are in no row",
+            f"Remove {RENAMED_FILE}, after which the marks, tags, notes, and findings on that run's events name IDs no "
+            "event has, or restore the journal and case.yaml from a copy made before the line was added")
+    left = list(moved) if closed else []   # the runs whose IDs would move, left as they are when the journal can't take a rekey
+    if left:
+        moved = {}
+    if not moved:
+        if not (skipped or left):
+            return None
+        text = " ".join(filter(None, (FORMAT_4_TEXT, left and _closed_sentence(left), skipped and _skipped_sentence(skipped))))
+        return {"text": text, "skipped_runs": {**skipped, **dict.fromkeys(left, CLOSED_REASON)}}
+    placed = _place(named, parsed, candidates)
+    unreached = None
+    if con is not None:
+        _keep_names(case, kept, {run_id: olds[run_id] for run_id in moved})
+        _reload_found(case, con, runs, moved)
+        unreached = _unreached(con, named, placed["pairs"], placed["unplaced"])
+    lines = sorted({f"{old} {new}" for p in moved.values() for old, new in p.ids.items() if old != new})
+    rekey = {**placed, "skipped_runs": skipped,
+             "runs": {run_id: {"parser": p.record.parser, "events": len(p.ids),
+                               "changed": sum(old != new for old, new in p.ids.items())}
+                      for run_id, p in sorted(moved.items())},
+             "map_size": len(lines), "map_sha256": hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()}
+    text = _found_output_sentence(len(lines), placed["pairs"], placed["unplaced"], named, unreached)
+    return {"text": f"{text} {_skipped_sentence(skipped)}" if skipped else text, "rekey": rekey}
+
+
+def _cannot_finish(case: Case, why: str, remedy: str) -> CaseError:
+    """The error for a step that can't finish what an earlier open began: nothing has been changed, so the case stays at
+    format 3 with RENAMED_FILE in place, and `remedy` says what to do."""
+    return CaseError(f"{case.settings.name} needs a case format upgrade that an earlier open began, and it can't finish: "
+                     f"{why}. The case is unchanged, at format 3, and {RENAMED_FILE} is in place. {remedy}.")
+
+
+def _kept_names(case: Case) -> dict[str, dict[str, str]]:
+    """The runs an earlier run of the step began to load again, each with the name its events carried for every file it
+    read (_old_names), by the name they carry now (_keep_names); none when no such run stopped. A file that isn't a map of
+    runs to maps of names stops the step, with the case unchanged."""
+    path = case.folder / RENAMED_FILE
+    if not path.is_file():
+        return {}
+    try:
+        kept = json.loads(path.read_text(encoding="utf-8"))
+        if not (isinstance(kept, dict) and all(
+                isinstance(names, dict) and names and all(isinstance(now, str) and isinstance(old, str)
+                                                          for now, old in names.items())
+                for names in kept.values())):
+            raise ValueError("it isn't a map of runs to maps of file names")
+    except (OSError, ValueError, RecursionError) as exc:
+        raise CaseError(f"{case.settings.name} needs a case format upgrade, and {path} can't be read: {exc}. The case is "
+                        "unchanged, at format 3. Remove the file, which only a stopped upgrade leaves, then open the "
+                        "case again.") from exc
+    return kept
+
+
+def _stopped_names(case: Case, record: RunRecord, kept: dict[str, str]) -> dict[str, str]:
+    """The names a stopped step kept for a run whose rows it left plain or took, when they are ones a load under a link
+    gives the run's files: each is the extended-length name of one of its inputs, by the name that input's events carry
+    now, ends in the input's path, and all share one root. A CaseError otherwise, since the step wrote no such file."""
+    inputs = _inputs_by_name(case, record)
+    roots = set()
+    for name, old in kept.items():
+        path = inputs.get(name)
+        if path is None or not old.startswith(LONG_FORM) or not old.casefold().endswith(f"/{path.casefold()}"):
+            raise _cannot_finish(
+                case, f"{RENAMED_FILE} names {name!r} for run {record.run_id}, which is not a name a load under a link gave a "
+                "file the run read",
+                f"Remove {RENAMED_FILE}, which only a stopped upgrade leaves, then open the case again")
+        roots.add(old.casefold()[:-len(path.casefold()) - 1])   # folding can lengthen a name: "ß" folds to "ss"
+    if len(roots) != 1:
+        raise _cannot_finish(
+            case, f"{RENAMED_FILE} gives the files of run {record.run_id} more than one root",
+            f"Remove {RENAMED_FILE}, which only a stopped upgrade leaves, then open the case again")
+    return kept
+
+
+def _rows_fit(con: duckdb.DuckDBPyConnection, run_id: str, ids: Iterable[str]) -> bool:
+    """Whether every row of the run has one of `ids`."""
+    held = id_table(con, "fitting_ids", ids)
+    (strangers,) = con.execute(f"SELECT count(*) FROM events WHERE run_id = ? AND event_uid NOT IN (SELECT v FROM {held})",
+                               [run_id]).fetchone()
+    return not strangers
+
+
+def _keep_names(case: Case, kept: dict[str, dict[str, str]], moved: dict[str, dict[str, str]]) -> None:
+    """Before the step deletes a row: the runs in `moved` and those already in RENAMED_FILE (`kept`), each with the name
+    its events carried for every file, written whole or not at all. A stop after that leaves a file the next run of the
+    step reads, whatever state the rows and case.yaml are in. The file is removed once the entry is journaled
+    (upgrade_format_4)."""
+    now = {**kept, **moved}
+    if now != kept:
+        write_atomically(case.folder / RENAMED_FILE, json.dumps(now, sort_keys=True))
+
+
+def _reload_found(case: Case, con: duckdb.DuckDBPyConnection, runs: list[RunRecord], moved: dict[str, Parsed]) -> None:
+    """The rows of the runs in `moved` deleted, then loaded again as a rebuild loads them, in its order and with its
+    checks (runner.reload_run), which writes each run's record again. `runs` are the ones a rebuild loads."""
+    for i, run_id in enumerate(moved):
+        report_stage(f"{UPGRADING}: reloading the found output of the runs", i + 1, len(moved))
+        _delete(con, "run_id = ?", [run_id])
+    layout = host_layout(case)
+    for record in runs:
+        if record.run_id in moved:
+            reload_run(case, record, layout)
+
+
+CLOSED_REASON = "the journal holds a line only a case at format 4 has, after which a rekey of event IDs is a break"
+
+
+def _closed_sentence(runs: list[str]) -> str:
+    """What the 3 to 4 entry says of the runs it left as they are because the journal can't take a rekey (CLOSED_REASON):
+    their events keep the IDs they have, and a rebuild would give them IDs that no journal reference follows."""
+    one = len(runs) == 1
+    return (f"The found output of {'this run' if one else 'these runs'} ({', '.join(runs)}) was loaded while case.yaml named "
+            "the evidence through a link, but its events keep the IDs they have: the journal holds a line only a case at "
+            "format 4 has, after which a rekey of event IDs is a break. A rebuild gives them IDs under the evidence folder "
+            "that no mark, tag, or finding follows.")
+
+
+def _skipped_sentence(skipped: dict[str, str]) -> str:
+    """What the 3 to 4 entry says of the runs it couldn't read: it could not tell which IDs a rebuild would give their
+    events. Where they were loaded while case.yaml named the evidence through a link, they keep the IDs they have, and
+    a rebuild would give them IDs that no journal reference follows."""
+    one = len(skipped) == 1
+    return (f"The found output of {'this run' if one else 'these runs'} could not be read now ({', '.join(skipped)}), so "
+            "the step could not tell which IDs a rebuild gives its events. Where they were loaded while case.yaml named the "
+            "evidence through a link, they keep the IDs they have, and a rebuild gives them IDs under the evidence folder "
+            "that no mark, tag, or finding follows.")
+
+
+def _found_output_sentence(changed: int, pairs: dict, unplaced: dict, named: set[str], unreached: int | None) -> str:
+    """The text of the 3 to 4 entry that moved `changed` IDs: what changed, then what _references_sentence says."""
+    return (f"{FORMAT_4_OPENS} Output found in the evidence was loaded while case.yaml named the evidence through a link, "
+            "so its events named each file by its whole path. They now name it by its path under "
+            f"the evidence folder, and {changed:,} {'event' if changed == 1 else 'events'} took new IDs."
+            + _references_sentence(pairs, unplaced, named, unreached))
+
+
 def upgraded(case: Case, client: str = "cli") -> Case:
     """The case at CASE_FORMAT, upgraded first if it is older, for a command that writes to it: a load into a format 1
-    case would add new IDs to a journal that has no map from the old ones, and a format 3 journal takes
-    no ordinary entry until its chain has started. The command line calls it right before the first
-    load or write, after the command checks its arguments, so a command that stops before then leaves the format as it
-    is. `client` is the kind of process, which the seal names."""
+    case would add new IDs to a journal that has no map from the old ones, and a journal from before format 3 takes
+    no ordinary entry until its chain has started. A case whose journal is read-only stays at the format it reached,
+    from format 3 on (KeptAtFormat), and the command's first write then fails on the read-only reason. The command line
+    calls it right before the first load or write, after the command checks its arguments, so a command that stops
+    before then leaves the format as it is. `client` is the kind of process, which the chained entries name."""
     if case.settings.case_format >= cases.CASE_FORMAT:   # read at the call, as case.upgrade reads it
         return case
     return upgrade(case, upgrade_recorder(Journal(case, client)))
@@ -749,11 +1104,53 @@ def upgraded(case: Case, client: str = "cli") -> Case:
 
 def upgraded_copy(case: Case, source: Case, client: str = "cli") -> Case:
     """A new copy (case.copy_case) at CASE_FORMAT, before its rebuild loads under this build's rules. A copy of an older
-    source keeps its format and an empty journal, so the upgrade seals it, after format 2's step for a format 1 source,
-    and case_created then follows the seal, naming the source and its journal's bytes. A format 3 source's copy has its
-    case_created already."""
-    older = case.settings.case_format < cases.FIRST_CHAINED
-    case = upgraded(case, client)
-    if older and case.settings.case_format >= cases.FIRST_CHAINED:
+    source keeps its format and an empty journal, so the steps up to the chain run first, format 2's step for a format
+    1 source and then the seal, and case_created follows the seal, naming the source and its journal's bytes. A copy of
+    a source with the chain has its case_created already. The steps from a format with the chain then follow
+    case_created, so every copy's journal reads the same way after it, whatever its source's format. Last, for a source
+    whose journal holds a record of the manifest, a manifest_recorded entry by the app carries the values of the record
+    source_record gives: the copy holds the source's manifest.jsonl byte for byte, so verify gives the copy its source's
+    answer, whatever it is. When the source's check can't vouch for that record, the entry names the reasons in
+    `unvouched`, so every output keeps the warning."""
+    if case.settings.case_format < cases.FIRST_CHAINED:
+        case = upgrade(case, upgrade_recorder(Journal(case, client)), until=cases.FIRST_CHAINED)
         start_chain(case, client, copied_from=copied_from(source))
+    case = upgraded(case, client)
+    if records_manifest(case) and (carried := source_record(source)):
+        record, reasons = carried
+        Journal(case, client).append("manifest_recorded", SYSTEM, **{k: record[k] for k in ("sha256", "bytes", "lines")},
+                                     via="copy", **({"unvouched": reasons} if reasons else {}))
     return case
+
+
+def source_record(source: Case) -> tuple[dict, list[str]] | None:
+    """The manifest record a copy of `source` carries, with the reasons its source couldn't vouch for it (journal's
+    UNVOUCHED_WORDS), in their order; None for a source whose journal doesn't record the manifest or whose verify counts
+    no record.
+
+    The record is the one the source's own verify counts (intake.record_at_head): the newest at or before the head this
+    computer recorded outside the journal, whether the journal has a break or not, so the copy gives the source's
+    answer. With no head recorded, verify counts the newest record. A head that is no line of the journal counts none;
+    the copy then carries the newest record, with a break, since a copy with no record would carry no warning. The
+    reasons: "break" for a journal with a break, one on record included, or a head that is no line of it; "no_head" for
+    no head recorded here, which leaves nothing to show the record wasn't added later; "add" when the first record came
+    with Add new evidence, which leaves the lines before it unrecorded. The reasons the first record names pass on to
+    its copy, so a copy never vouches for more than its source."""
+    path = source.folder / JOURNAL_FILE
+    if not (records_manifest(source) and path.is_file()):
+        return None
+    head = heads.read(source.folder)
+    found = check(path, head["head"] if head else None)
+    compared = found.expected is not None   # the head recorded here is a chained line of the journal
+    record = record_at_head(found, True)[0] if compared else counted_record(found.manifests, None)[0]
+    if record is None:
+        return None
+    first = found.manifests[0]
+    reasons = {*first.get("unvouched", ())}
+    if not found.consistent or (head and not compared):
+        reasons.add("break")
+    if not head:
+        reasons.add("no_head")
+    if first["via"] == "add":
+        reasons.add("add")
+    return record, [reason for reason in UNVOUCHED_WORDS if reason in reasons]

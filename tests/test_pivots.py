@@ -1526,3 +1526,119 @@ def test_the_window_row_has_its_own_broad_text(papp):
     assert window_text == ("Broad: {count} events. The list shows the 500 nearest in time; open one source from the breakdown "
                            "to reach the rest.")
     assert g["over_limit_text"] == "Broad: {count} events. The list shows the 500 nearest in time."
+
+
+# ---------- the reasons a kind declines a pivot ----------
+
+def declined_reasons(g):
+    """The not-offered line of a guidance, as {pivot: reason}."""
+    return {n["pivot"]: n["reason"] for n in g["not_offered"]}
+
+
+def test_object_access_offers_same_file_only_when_the_object_is_a_file(papp):
+    """A 4663 on a registry key and a 4660 name no file, so their file key is the accessing process's. A 4660 names no
+    object at all, so its reason points to the access event that does."""
+    def access(n, code, **kw):
+        fields = {"process_executable": "C:\\Windows\\regedit.exe", "file_key": "\\windows\\regedit.exe",
+                  "logon_id": "0x510986", "user_name": "Administrator", "user_domain": "C137", **kw}
+        return security_event(T0 + (700 + n) * SEC, 9950 + n, code, **fields)
+    more(papp, [access(1, "4663"), access(2, "4660"),
+                access(3, "4663", file_path="C:\\Data\\secret.docx", file_key="\\data\\secret.docx")])
+    reasons = {9951: "The object isn't a file, so this event is keyed on the process that accessed it.",
+               9952: "A 4660 doesn't name the object it deleted. The 4656 or 4663 from the same process with the same "
+                     "handle ID names it."}
+    for record, reason in reasons.items():
+        g = guide(papp, uid_of(papp.con, f"record_id = {record}"))
+        assert g["kind"] == "object_access" and "file" not in [r["pivot"] for r in g["rows"]], record
+        assert declined_reasons(g)["file"] == reason, record
+    g = guide(papp, uid_of(papp.con, "record_id = 9953"))
+    assert (row_of(g, "file")["label"], row_of(g, "file")["value"]) == ("Same file (the object)", "C:\\Data\\secret.docx")
+    assert "file" not in declined_reasons(g)
+
+
+def test_a_sysmon_event_and_a_system_104_say_where_the_logon_is_when_they_record_none(papp):
+    def sysmon(n, code, **kw):
+        return Event(ts_us=T0 + (710 + n) * SEC, ts_desc="Event Recorded", artifact="evtx", source_file="DC01/Sysmon.evtx",
+                     source_record=str(n), record_id=9960 + n, message=f"Sysmon {code}", event_code=code,
+                     event_provider="Microsoft-Windows-Sysmon", log_channel="Microsoft-Windows-Sysmon/Operational", **kw)
+
+    def cleared(n, **kw):
+        return Event(ts_us=T0 + (730 + n) * SEC, ts_desc="Event Recorded", artifact="evtx", source_file="DC01/System.evtx",
+                     source_record=str(n), record_id=9970 + n, message="104 log cleared", event_code="104",
+                     event_provider="Microsoft-Windows-Eventlog", log_channel="System", user_name="Administrator",
+                     user_domain="C137", **kw)
+    codes = {"3": "sysmon_network", "11": "sysmon_file_create", "7": "sysmon_image_load", "8": "sysmon_remote_thread",
+             "10": "sysmon_process_access"}
+    more(papp, [sysmon(n, code) for n, code in enumerate(codes, 1)] + [sysmon(6, "3", logon_id="0x5a1"), cleared(1),
+                                                                      cleared(2, logon_id="0x5a1")])
+    started = "The logon is on the Sysmon 1 event that started the {}process."
+    for n, (code, kind) in enumerate(codes.items(), 1):
+        g = guide(papp, uid_of(papp.con, f"record_id = {9960 + n}"))
+        source = "source " if code in ("8", "10") else ""
+        assert g["kind"] == kind and "session" not in [r["pivot"] for r in g["rows"]], kind
+        assert declined_reasons(g)["session"] == f"A Sysmon {code} event records no logon ID. {started.format(source)}", kind
+    g = guide(papp, uid_of(papp.con, "record_id = 9971"))
+    assert g["kind"] == "log_cleared" and "session" not in [r["pivot"] for r in g["rows"]]
+    assert declined_reasons(g)["session"] == ("A System 104 records the account that cleared the log but no logon ID. When the "
+                                              "Security log was cleared too, its 1102 records the logon.")
+    # An imported row that carries a logon ID still ranks the session
+    for record in (9966, 9972):
+        g = guide(papp, uid_of(papp.con, f"record_id = {record}"))
+        assert row_of(g, "session")["value"] == "0x5a1" and "session" not in declined_reasons(g), record
+
+
+def test_an_http_record_says_where_its_file_name_and_hash_are_and_a_file_record_keeps_all_its_rows(papp, tmp_path):
+    md5, sha256 = "d41d8cd98f00b204e9800998ecf8427e", "a1" * 32
+
+    def eve(when, kind, **more_fields):
+        return {"timestamp": f"2020-09-19T03:40:{when}.000000+0000", "event_type": kind, "flow_id": 91,
+                "src_ip": "10.42.85.115", "src_port": 49800, "dest_ip": "194.61.24.102", "dest_port": 80, "proto": "TCP",
+                **more_fields}
+    (tmp_path / "web").mkdir()
+    add_capture(papp.case, tmp_path / "web", [
+        eve("00", "http", http={"hostname": "194.61.24.102", "url": "/coreupdater.exe", "http_method": "GET", "status": 200}),
+        eve("01", "fileinfo", fileinfo={"filename": "/coreupdater.exe", "md5": md5, "sha256": sha256, "size": 7168})])
+
+    def zeek(n, log, **kw):
+        return Event(ts_us=T0 + (740 + n) * SEC, ts_desc="Zeek", artifact="zeek", source_file=f"network/{log}.log",
+                     source_record=str(n), message=log, log_channel=log, source_ip="10.42.85.115", dest_ip="194.61.24.102",
+                     **kw)
+    load_events(papp.case, [
+        zeek(0, "http", extra={"uid": "CHttp1", "_path": "http", "uri": "/coreupdater.exe"}),
+        zeek(1, "files", file_path="coreupdater.exe",
+             extra={"uid": "CFiles1", "_path": "files", "filename": "coreupdater.exe", "md5": md5})], "network",
+        tool="import", run="zh")
+    papp.refresh_identity(events_changed=True)
+
+    def guide_of(where):
+        return guide(papp, uid_of(papp.con, where))
+
+    def name_and_hash(g):
+        return {pivot: why for pivot, why in declined_reasons(g).items() if pivot in ("hash", "file_name")}
+    suricata_http = guide_of("artifact = 'suricata' AND log_channel = 'http'")
+    assert suricata_http["kind"] == "suricata_http_file"
+    assert [r["pivot"] for r in suricata_http["rows"]] == ["flow", "addr"]
+    assert name_and_hash(suricata_http) == {
+        "hash": "A Suricata http record carries no file hash. Its hash, when Suricata records one, is on the fileinfo "
+                "record of the same flow, which Same flow reaches.",
+        "file_name": "The app reads no file name from a Suricata http record's URL. The name is on the fileinfo record of "
+                     "the same flow, which Same flow reaches."}
+    zeek_http = guide_of("artifact = 'zeek' AND log_channel = 'http'")
+    assert zeek_http["kind"] == "suricata_http_file" and [r["pivot"] for r in zeek_http["rows"]] == ["flow", "addr"]
+    assert name_and_hash(zeek_http) == {
+        "hash": "A Zeek http record carries no file hash. Its hash, when Zeek records one, is on Zeek's files record of "
+                "the transfer.",
+        "file_name": "The app reads no file name from a Zeek http record's URI or its file name fields. Zeek's files "
+                     "record of the transfer names the file only when the sender named it in a Content-Disposition "
+                     "header."}
+    for where in ("artifact = 'suricata' AND log_channel = 'fileinfo'", "artifact = 'zeek' AND log_channel = 'files'"):
+        g = guide_of(where)
+        assert [r["pivot"] for r in g["rows"]] == ["flow", "hash", "file_name", "addr"], where
+        assert not {"hash", "file_name"} & declined_reasons(g).keys(), where
+
+
+def test_the_destination_end_of_an_addr_row_takes_the_destination_alone(papp):
+    ev = {"host": "DC01", "source_ip": "194.61.24.102", "dest_ip": "10.42.85.115"}
+    assert pivots._addresses(ev, "dest_ip", papp.identity) == ["10.42.85.115"]
+    assert pivots._addresses({**ev, "dest_ip": ""}, "dest_ip", papp.identity) == []
+    assert pivots._addresses(ev, "each", papp.identity) == ["194.61.24.102", "10.42.85.115"]

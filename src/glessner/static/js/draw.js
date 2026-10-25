@@ -146,16 +146,24 @@ export function drawWindowLinks(ctx, colors) {
 
 // A link whose ends fall in one row has nowhere to go: a host's logon to itself, or both hosts inside one folded group.
 // The folded ones are counted, the window count's hover says how many, and the status line's note says
-// to open the group.
+// to open the group. A link from a host with no lane, as when the Sources hide that host, has nowhere to start: those
+// are counted too, and the note names the hosts.
 export function drawLinks(ctx, x, links, colors) {
   const hostIdx = S.groupby.indexOf('host');
   S.linksDrawn = 0;
   S.linksFolded = 0;
+  S.linksSkipped = 0;
   if (hostIdx < 0) { S.linkNote = 'Add Host to the lane keys to see logon links.'; return; }
+  const laneless = new Set();
   for (const l of links.items) {
     if (!l.target_keys) continue;
     const r2 = rowOfKeys(l.target_keys);
     const r1 = l.outside ? (S.rowIndex.get('out:' + l.source) ?? S.rowIndex.get(OUTSIDE_GROUP)) : sourceRow(l.source, l.target_keys, hostIdx);
+    if (r1 === undefined && r2 !== undefined && !l.outside) {
+      S.linksSkipped++;
+      laneless.add(l.source);
+      continue;
+    }
     if (r1 === undefined || r2 === undefined) continue;
     if (r1 === r2) {
       if (S.rows[r1].children.length > 0 && l.source !== l.target_keys[hostIdx]) S.linksFolded++;
@@ -175,7 +183,19 @@ export function drawLinks(ctx, x, links, colors) {
     if (count > 1) { ctx.font = '11px system-ui'; ctx.fillText(String(count), px + 4, (y1 + y2) / 2); }
     S.linkSegs.push({ x: px, y1: Math.min(y1, y2), y2: Math.max(y1, y2), l });
   }
-  if (S.linksFolded) S.linkNote = "Logon links inside a folded group aren't drawn; open the group to see them.";
+  const notes = [];
+  if (S.linksFolded) notes.push("Logon links inside a folded group aren't drawn; open the group to see them.");
+  if (laneless.size) {
+    notes.push(`Logon links from ${hostList([...laneless].sort())} aren't drawn: no lane holds ` +
+               `${laneless.size === 1 ? 'its' : 'their'} events under the current Sources and View.`);
+  }
+  S.linkNote = notes.join(' ');
+}
+
+// Host names as a list in words, the first three named: "A", "A and B", "A, B, and C", "A, B, C, and 2 more".
+function hostList(names) {
+  const parts = names.length > 3 ? [...names.slice(0, 3), `${names.length - 3} more`] : names;
+  return parts.length < 3 ? parts.join(' and ') : `${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}`;
 }
 
 // The focused event's pair: the same moment on a host's clock and in the capture, as a

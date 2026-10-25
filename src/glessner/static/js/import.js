@@ -4,43 +4,86 @@
 // mapping, so a rebuild repeats it. Log text comes from evidence, so it only ever goes in with textContent.
 
 import { api, el, fmtUs, plural, post, setStatus, skippedLinks } from './core.js';
-import { button, claimDetails, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, keepPage, pageAction, pageRead, setPage, showingPage } from './event_page.js';
 import { refreshCaseState } from './frame.js';
 
-const I = { meta: null, path: null, checked: new Set(), preview: null, mapping: null, all: false, saveAs: '', busy: false };
+// `mapping` is the mapping on screen, which Import sends, and `asked` the promise of the mapping last asked to preview
+// for the file on screen, in full, which the next change starts from.
+const I = { meta: null, path: null, checked: new Set(), preview: null, mapping: null, asked: Promise.resolve(null), all: false,
+            saveAs: '', busy: false };
 const KIND = { w3c_log: 'W3C log', kv_log: 'key=value log', csv: 'CSV', jsonl: 'JSON', line_log: 'log lines' };
 const DELIMITERS = [[',', 'comma'], ['\t', 'tab'], [';', 'semicolon'], ['|', 'pipe']];
 const SAMPLE_ROWS = 5;
 // How much a file holds: a JSON array by its records, which can share one line, and any other file by its lines.
 const size = (p) => (p.array_records != null ? plural(p.array_records, 'record') : plural(p.lines, 'line'));
 
+// The page, from the file list read again. The file on screen keeps its mapping, so a redraw, as after Add new
+// evidence, and the page opened again, with Back or the Case menu's Import, show the mapping the analyst chose, from
+// the last one asked for, as a change does; a file put on screen anew starts from the server's guess.
 export async function showImport() {
   const latest = claimDetails();   // a page asked for after it keeps the panel
+  const drew = pageRead();
   try { I.meta = await api(`/api/imports${I.all ? '?all=1' : ''}`); }
   catch (err) { setStatus(`Import page failed: ${err.message}`); return; }
   if (!latest()) return;
   // A file loaded as found output from the Tools page, such as an Autoruns CSV, is listed apart and can't be picked:
   // importing it would load its events a second time.
   const files = I.meta.files.filter((f) => !f.loaded);
-  if (!files.some((f) => f.path === I.path)) I.path = (files.find((f) => !f.imported) || files[0] || {}).path || null;
+  if (!files.some((f) => f.path === I.path)) pickFile((files.find((f) => !f.imported) || files[0] || {}).path || null);
   for (const p of [...I.checked]) if (!files.some((f) => f.path === p)) I.checked.delete(p);
-  if (I.path) await loadPreview(null); else render();
+  if (I.path) {
+    let mapping = I.mapping;   // null for a file put on screen anew
+    if (mapping) {
+      mapping = (await I.asked) || mapping;
+      if (!latest()) return;   // a file picked meanwhile claims the panel for its own preview
+    }
+    if (!await readPreview(mapping, mapping !== null)) return;
+  } else render();
+  drew('import', showImport);
 }
 
-async function loadPreview(mapping) {
+// Put a file on screen. A mapping belongs to its file, so the new one has none until its preview gives the guess.
+function pickFile(path) {
+  I.path = path;
+  I.mapping = null;
+}
+
+// Read the preview of I.path under `mapping` and draw the page with it. Returns whether the page drew, which it doesn't
+// when another page or a later preview was asked for meanwhile. Only the preview that draws sets the mapping Import
+// sends, so the mapping sent is the one on screen. `full` says `mapping` is whole, as a change makes it; the guess
+// (null), a ready-made mapping, and a saved one are whole only as the preview answers them.
+async function readPreview(mapping, full = false) {
   const latest = claimDetails();
-  try {
-    I.preview = await post('/api/import_preview', { path: I.path, ...(mapping ? { mapping } : {}) });
-    I.mapping = I.preview.mapping;
-  } catch (err) { I.preview = { error: err.message }; }
-  if (latest()) render();
+  const answer = post('/api/import_preview', { path: I.path, ...(mapping ? { mapping } : {}) });
+  I.asked = full ? Promise.resolve(mapping) : answer.then((p) => p.mapping, () => null);
+  let preview;
+  try { preview = await answer; }
+  catch (err) { preview = { error: err.message }; }
+  if (!latest()) return false;
+  I.preview = preview;
+  if (!preview.error) I.mapping = preview.mapping;
+  render();
+  return true;
 }
 
-function change(edit) {
-  const m = structuredClone(I.mapping);
+// A new preview on the page on screen, which keeps the file list it read: Add new evidence, answering after the preview
+// was asked for, still lists the new files
+async function loadPreview(mapping, full = false) {
+  if (await readPreview(mapping, full)) keepPage('import');
+}
+
+// A change to the mapping, made on the page on screen. It starts from the mapping last asked for, so a change made before
+// the last one's preview answers keeps that one. A change made after another file was picked, before that file's
+// preview draws, is dropped: the controls on screen are still the earlier file's.
+async function change(edit) {
+  const path = I.path;
+  if (!I.mapping) return;
+  const base = (await I.asked) || I.mapping;
+  if (I.path !== path || !I.mapping) return;
+  const m = structuredClone(base);
   edit(m);
   delete m.saved_as;   // no longer the saved mapping as it was
-  loadPreview(m);
+  loadPreview(m, true);
 }
 
 function render() {
@@ -58,7 +101,7 @@ function fileList() {
     box.addEventListener('change', () => { if (box.checked) I.checked.add(f.path); else I.checked.delete(f.path); render(); });
     const done = f.imported ? `imported, ${plural(f.imported.rows || 0, 'event')}` : 'not imported';
     return el('div', { class: `imp-file${f.path === I.path ? ' sel' : ''}` }, box,
-      el('div', {}, button(f.path, () => { I.path = f.path; loadPreview(null); }, { class: 'linklike' }),
+      el('div', {}, button(f.path, () => { pickFile(f.path); loadPreview(null); }, { class: 'linklike' }),
          el('div', { class: 'muted' }, `${[KIND[f.artifact] || 'Unidentified', f.detail].filter(Boolean).join(', ')}; ${done}`)));
   });
   const all = el('input', { type: 'checkbox' });
@@ -78,6 +121,7 @@ function fileList() {
 }
 
 async function addEvidence() {
+  const done = pageAction('import');
   try {
     const res = await post('/api/evidence_add', {});
     const kinds = Object.entries(res.by_artifact).map(([k, n]) => `${n} ${KIND[k] || k}`).join(', ');
@@ -86,7 +130,7 @@ async function addEvidence() {
                          : 'No new files in the evidence folder.' +
                (gone ? ` ${plural(gone, 'listed file')} ${gone === 1 ? 'is' : 'are'} gone from it; run verify.` : ''))
               + unreadable(res.errors) + skippedLinks(res.links));
-    if (showingPage('import')) showImport();   // not over a page asked for while the files were hashed
+    done();   // not over a page asked for while the files were hashed
   } catch (err) { setStatus(`Add new evidence failed: ${err.message}`); }
 }
 

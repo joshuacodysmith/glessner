@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path, PureWindowsPath
 
+import duckdb
 import pytest
 from chain_fixtures import append_unchained
 from parser_fix_fixtures import EVIDENCE, EVTX_ROWS, write_csv
@@ -170,6 +171,9 @@ def test_an_id_that_named_two_records_is_left_unplaced_with_both(tmp_path):
             assert api_event(app, {"uid": [candidate]})["event"]["unplaced"] == [{"seq": seq, "id": uid, "others": 1}]
         # The ID itself names no event, so its mark is an orphan too
         assert (api_overview(app, {})["progress"]["unplaced"], app.orphans) == (1, 1)
+        # The text counts it as unplaced, and not again among the references that name no loaded event
+        assert the_upgrade(f)["text"].endswith(" 1 was left unplaced, each naming more than one event; the Case overview "
+                                               "counts them, and each event they may mean says so.")
     finally:
         app.con.close()
 
@@ -215,6 +219,56 @@ def test_the_entry_s_text_counts_the_events_a_rebuild_loads(tmp_path):
     assert 0 < n == rekey_["runs"][first.run_id]["changed"] - 1
     assert the_upgrade(f)["text"] == ("Event IDs no longer depend on where or in which time zone a tool ran: "
                                       f"{n} Suricata events took new IDs. No journal reference changed.")
+
+
+NO_NEW_ID = "Event IDs no longer depend on where or in which time zone a tool ran; no event here took a new ID."
+UNPLACED = ("1 was left unplaced, each naming more than one event; the Case overview counts them, and each event they may "
+            "mean says so.")
+
+
+@pytest.mark.parametrize(
+    ("pairs", "unplaced", "unreached", "tail"),
+    [
+        ({}, {}, None, " No journal reference changed."),
+        ({}, {}, 0, " No journal reference changed."),
+        ({}, {}, 1, " No journal reference changed. 1 journal reference names no loaded event."),
+        ({}, {}, 2, " No journal reference changed. 2 journal references name no loaded event."),
+        ({}, {}, 1234, " No journal reference changed. 1,234 journal references name no loaded event."),
+        ({"a": "b"}, {}, None, " 1 journal reference now names its event's new ID. None was left unplaced."),
+        ({"a": "b"}, {}, 0, " 1 journal reference now names its event's new ID. None was left unplaced."),
+        ({"a": "b"}, {}, 1, " 1 journal reference now names its event's new ID. None was left unplaced. "
+                            "1 journal reference names no loaded event."),
+        ({"a": "b", "c": "d"}, {}, 3, " 2 journal references now name their events' new IDs. None was left unplaced. "
+                                      "3 journal references name no loaded event."),
+        ({}, {"u": ["x", "y"]}, None, f" No journal reference was placed on a new ID. {UNPLACED}"),
+        ({}, {"u": ["x", "y"]}, 0, f" No journal reference was placed on a new ID. {UNPLACED}"),
+        ({}, {"u": ["x", "y"]}, 2, f" No journal reference was placed on a new ID. {UNPLACED} "
+                                   "2 journal references name no loaded event."),
+        ({"a": "b"}, {"u": ["x", "y"]}, 1, f" 1 journal reference now names its event's new ID. {UNPLACED} "
+                                           "1 journal reference names no loaded event."),
+    ],
+    ids=["none unchanged, no count", "none unchanged, 0", "none unchanged, 1", "none unchanged, 2", "none unchanged, 1,234",
+         "one placed, no count", "one placed, 0", "one placed, 1", "two placed, 3", "unplaced, no count", "unplaced, 0",
+         "unplaced, 2", "one placed and one unplaced, 1"],
+)
+def test_the_text_adds_the_count_of_references_that_name_no_loaded_event(pairs, unplaced, unreached, tail):
+    """The sentence follows whatever the text says once the count is above 0; no count (None) and 0 leave the text as it
+    was."""
+    named = {*pairs, *unplaced}
+    count = () if unreached is None else (unreached,)   # with None the argument is left out, for its default
+    assert rekey._sentence({}, pairs, unplaced, named, *count) == NO_NEW_ID + tail
+
+
+def test_each_reference_is_counted_at_the_event_its_pair_gives_it():
+    """A reference counts when no event holds the ID its pair gives it, or its own ID when it has none, so two references
+    to one missing event count twice; an ID left unplaced counts apart; with nothing named, nothing is counted."""
+    pairs = {"moved_from": "moved_to", "old_a": "new_gone", "old_b": "new_gone"}
+    named = {"here", "moved_from", "gone", "old_a", "old_b", "unplaced"}
+    with duckdb.connect() as con:
+        con.execute("CREATE TABLE events (event_uid VARCHAR)")
+        con.execute("INSERT INTO events VALUES ('here'), ('moved_to')")
+        assert rekey._unreached(con, named, pairs, {"unplaced": ["x", "y"]}) == 3   # gone, old_a, and old_b
+        assert rekey._unreached(con, set(), pairs, {}) == 0
 
 
 def test_a_superseded_run_whose_output_no_longer_gives_its_load_is_skipped(tmp_path):
@@ -266,6 +320,10 @@ def test_nothing_outside_the_map_changes(tmp_path):
     # Its reference pairs through its parse, to a record no run loads: an orphan the entry names
     assert rekeyed["pairs"][failed[0]] not in f.uids() and rekeyed["pairs"][failed[0]] in state_of(app.case)["marks"]
     assert gone not in rekeyed["pairs"] and gone in state_of(app.case)["marks"] and App(app.case).orphans == 2
+    # The text counts those two, the references that name no loaded event, and not the event log's marks or
+    # AmcacheParser's, whose events are loaded
+    assert the_upgrade(f)["text"].endswith(" 1 journal reference now names its event's new ID. None was left unplaced. "
+                                           "2 journal references name no loaded event.")
 
 
 def test_a_failed_run_whose_evidence_changed_is_skipped_and_its_rows_drop(tmp_path):
@@ -384,6 +442,8 @@ def test_rows_of_the_only_run_of_a_tool_and_host_drop_when_no_record_selects_it(
     upgraded(f.case)
     assert the_upgrade(f)["rekey"]["dropped_runs"] == {run.run_id: {"rows": 7, "references": old}}
     assert not f.uids("suricata") and case_format(f.case) == CASE_FORMAT
+    # Every mark now names no loaded event, so the count comes after the dropped run's rows are deleted
+    assert the_upgrade(f)["text"].endswith(" No journal reference changed. 7 journal references name no loaded event.")
     assert not (f.case.folder / rekey.DROPPED_FILE).exists()
     copy = open_case(Path(shutil.copytree(f.case.folder, tmp_path / "copy")))
     rebuild(copy)
@@ -508,6 +568,8 @@ def test_a_tool_run_whose_rows_an_unrecorded_rerun_replaced_is_loaded_again(tmp_
     assert f.uids(where="run_id = ?", params=[first.run_id]) == ids
     assert not f.uids(where="run_id = ?", params=[rerun.run_id])
     assert ids[0] in state_of(f.case)["marks"] and set(state_of(f.case)["marks"]) <= set(f.uids())
+    # The count comes after the first run's load, so the marked event is loaded when it is looked for
+    assert "no loaded event" not in the_upgrade(f)["text"]
     copy = open_case(Path(shutil.copytree(f.case.folder, tmp_path / "copy")))
     rebuild(copy)
     assert digest(f.case) == digest(copy)
@@ -665,11 +727,13 @@ def test_the_step_runs_once_in_effect(tmp_path, monkeypatch):
     base.eve_run(7)
     base.eve_run(-5)   # the same capture, rerun in another zone: its marks orphaned the first run's
     base.mark(base.uids("suricata")[:3])
+    base.mark([new_id("an ID no run gives")])   # names no event before or after the step, so the text counts it
     base.sqlecmd_run()
     append_unchained(base.case.folder, "note", target=base.uids("sqlecmd")[0], text="bob's visit")
     clean = faulted(tmp_path, base, "clean")
     upgraded(clean.case)
     expected = outcome(clean)
+    assert expected[0].endswith(" None was left unplaced. 1 journal reference names no loaded event.")
     for step in (4, 8, 9):
         f = faulted(tmp_path, base, f"step{step}")
         monkeypatch.setattr(rekey, "_reached", crash_at(step))
@@ -868,6 +932,18 @@ def test_a_second_upgrade_of_a_case_without_a_database_stops(tmp_path, monkeypat
     assert len(f.upgrades()) == 1 and case_format(f.case) == CASE_FORMAT
 
 
+def test_the_text_of_a_case_without_a_database_counts_no_reference_that_names_no_event(tmp_path):
+    """With nothing loaded there is no event to look for, so marks on an event the output gives and on an ID no run gives
+    leave the text with no count of references that name no loaded event."""
+    f = Format1(tmp_path)
+    f.eve_run(7)
+    f.mark([*f.uids("suricata")[:2], new_id("an ID no run gives")])
+    f.case.db_path.unlink()
+    upgraded(f.case)
+    text = the_upgrade(f)["text"]
+    assert text.endswith(" None was left unplaced.") and "no loaded event" not in text
+
+
 def test_a_connection_in_this_process_stops_the_step_as_another_process_s_does(tmp_path, monkeypatch):
     """A read-only connection to the database in this process makes DuckDB refuse the step's with another error than
     another process's does; the step stops all the same, with its message and the case unchanged. A failure after the
@@ -993,8 +1069,8 @@ def test_a_command_that_loads_refuses_while_an_app_holds_the_case(tmp_path, comm
 
 def test_a_copy_of_a_format_1_case_is_upgraded_before_its_rebuild(tmp_path):
     """copy-case and the start page's copy upgrade the copy before its rebuild loads, so its journal holds format
-    2's entry, the seal, and case_created naming the source's journal; the copy's events take format 2's IDs, and
-    the source stays as it was."""
+    2's entry, the seal, case_created naming the source's journal, and the 3 to 4 entry; the copy's events take format
+    2's IDs, and the source stays as it was."""
     from glessner.start import start_copy
 
     f, _ = found_eve_case(tmp_path / "source")
@@ -1012,9 +1088,10 @@ def test_a_copy_of_a_format_1_case_is_upgraded_before_its_rebuild(tmp_path):
         copy = Format1.__new__(Format1)
         copy.case = open_case(tmp_path / name)
         (entry,) = copy.upgrades()
-        rekeyed, seal, created = [json.loads(line) for line in copy.journal_bytes().splitlines()]
+        rekeyed, seal, created, step = [json.loads(line) for line in copy.journal_bytes().splitlines()]
         assert case_format(copy.case) == CASE_FORMAT and rekeyed == entry and seal["sealed"]["lines"] == 1
         assert created["action"] == "case_created" and created["copied_from"]["bytes"] == len(before)
+        assert (step["action"], step["from_format"], step["to_format"]) == ("case_upgrade", 3, 4)
         assert not entry["rekey"]["pairs"] and entry["rekey"]["runs"] and copy.uids("suricata") == expected
     assert f.journal_bytes().startswith(before)
 
@@ -1161,7 +1238,12 @@ def test_a_final_entry_without_a_line_break_survives_the_upgrade(tmp_path):
     new = the_upgrade(f)["rekey"]["pairs"][old[0]]
     assert the_upgrade(f)["recovered"] == [{"completed": True, "entry": {"action": "mark", "seq": 1}}]
     assert new != old[0] and case_format(f.case) == CASE_FORMAT
-    assert journal.read_bytes().startswith(bare + b"\n") and journal.read_bytes().count(b"\n") == 3   # and the seal
+    after = journal.read_bytes()
+    assert after.startswith(bare + b"\n") and after.count(b"\n") == 5
+    written = [json.loads(line) for line in after.splitlines()]
+    assert [(e["action"], e.get("from_format"), e.get("to_format")) for e in written] == [
+        ("mark", None, None), ("case_upgrade", 1, 2), ("case_upgrade", 2, 3), ("case_yaml", None, None),
+        ("case_upgrade", 3, 4)]
     assert set(Journal(open_case(f.case.folder)).state.marks) == {new} and set(f.uids("suricata")) >= {new}
 
 
@@ -1310,8 +1392,9 @@ def test_a_case_with_nothing_to_upgrade_reports_one_opening_stage(synthetic_case
 
 def test_the_serve_command_lists_the_upgrade_s_steps_as_each_starts(tmp_path, monkeypatch, capsys):
     """serve's open of a format 1 case says that it upgrades the case, and lists each stage the
-    upgrade reports once, in order, then the open's own and "Opened", before the link. Each line is written as its step
-    starts, not when the open ends: the reload's line is in the command window when its first run reloads."""
+    upgrade reports once, in order, then the open's own and "Opened", then the format the open left the case at, before
+    the link. Each line is written as its step starts, not when the open ends: the reload's line is in the command
+    window when its first run reloads."""
     from glessner import server
     from glessner.cli import OPENING
 
@@ -1330,7 +1413,7 @@ def test_the_serve_command_lists_the_upgrade_s_steps_as_each_starts(tmp_path, mo
     monkeypatch.setattr(server.Server, "serve_forever", lambda self: None)
     assert main(["serve", str(f.case.folder), "--no-browser", "--port", "0"]) == 0
     lines = "".join([*before, capsys.readouterr().out]).splitlines()
-    assert lines[1] == ("It is at case format 1, from an earlier build, so this open upgrades it to format 3 first. The "
+    assert lines[1] == ("It is at case format 1, from an earlier build, so this open upgrades it to format 4 first. The "
                         "upgrade runs once, and on a large case it takes a while; each step is listed as it starts.")
     steps = [line[8:] for line in lines[2:] if line[:8].endswith(" s  ") and not line[8:].startswith("  still")]
     reloading = next(s for s in steps if s.startswith(f"Upgrading the case format: reloading {rows:,} Suricata events, "))
@@ -1342,4 +1425,6 @@ def test_the_serve_command_lists_the_upgrade_s_steps_as_each_starts(tmp_path, mo
     assert reloading in "".join(before)
     opened = next(i for i, line in enumerate(lines) if line.endswith("  Opened."))
     assert opened < next(i for i, line in enumerate(lines) if line.startswith("Serving "))
+    assert lines[opened + 1] == "It is now at case format 4, which older builds can't open."
+    assert lines[opened + 2].startswith("Serving ")
     assert case_format(f.case) == CASE_FORMAT

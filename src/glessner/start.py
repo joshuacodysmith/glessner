@@ -13,6 +13,7 @@ import ctypes
 import json
 import os
 import re
+import stat
 import string
 import sys
 import threading
@@ -25,6 +26,7 @@ from pathlib import Path
 from .case import Case, CaseError, copy_case, create_case, open_case, tools_folder_problem, write_atomically
 from .events import connect
 from .intake import entry_kind, intake, walk
+from .journal import Journal
 from .long_paths import long_path
 from .queries import timeline_count
 from .rekey import upgraded_copy
@@ -37,6 +39,14 @@ MAX_FOLDERS = 500      # folders listed at once by the folder browser
 # GetDriveTypeW's answers for a drive letter with no root folder and for a mapped network drive
 DRIVE_NO_ROOT_DIR = 1
 DRIVE_REMOTE = 4
+# The prefixes of Windows' device namespaces: the Win32 file namespace (\\?\), the Win32 device namespace (\\.\), and the NT
+# object namespace (\??\)
+DEVICE_PREFIXES = ("\\\\?\\", "\\\\.\\", "\\??\\")
+# The names, after any Global, that start a device path which can reach a share: UNC, the link to \Device\Mup, and
+# GLOBALROOT, the link to the root of the NT object namespace
+SHARE_LINKS = ("UNC", "GLOBALROOT")
+# Global is the link to the global device names, so a path through it goes where the name after it goes
+GLOBAL_LINK = "GLOBAL"
 # Several copies of one collection in the evidence folder. A dataset folder whose collection, triage, and triage_more
 # folders each hold WIN-L0ZZQ76PMUF's folder brings the one host in three times, once per top-level folder. A subfolder
 # is a host's when it holds a volume's Windows
@@ -161,36 +171,78 @@ def local_drives() -> list[str]:
     return [root for root in local if os.path.isdir(root)]
 
 
-def _network_path(text: str) -> bool:
-    r"""Whether a path, on Windows, is on a network share. It reads the text and the drive's type and opens nothing.
+def _device_path(text: str) -> bool:
+    r"""Whether a path, on Windows, reaches something in this computer through a device namespace: a \\?\, \??\, or
+    \\.\ path whose next part is a drive letter that isn't a mapped network drive (\\?\C:\Windows), or a name of any
+    other kind (\\.\PhysicalDrive0, \\?\Volume{...}\, \\?\pipe\name). Global parts are skipped, since Global links to the
+    global device names and the part after it decides: \\?\Global\C:\Windows is a device path. A path whose deciding
+    part is one of SHARE_LINKS (\\?\Global\UNC\server\share), which can reach a share through \Device\Mup, is not, and
+    neither is a path to a mapped drive. Forward slashes are read as backslashes. It reads the text and the drive's type
+    and opens nothing. On other platforms no path is."""
+    if sys.platform != "win32":
+        return False
+    text = text.replace("/", "\\")
+    prefix = next((p for p in DEVICE_PREFIXES if text.startswith(p)), None)
+    if prefix is None:
+        return False
+    names = text[len(prefix):].split("\\")
+    name = next((n for n in names if n.upper() != GLOBAL_LINK), GLOBAL_LINK)
+    if name.upper() in SHARE_LINKS:
+        return False
+    if len(name) == 2 and name[1] == ":" and DRIVE_LETTER.match(name[0]):
+        return _drive_type(f"{name[0].upper()}:\\") != DRIVE_REMOTE
+    return True
 
-    Forward slashes are read as backslashes. A path that starts with two backslashes is on a share: a UNC path
-    (\\server\share), or a \\?\UNC\ or \\.\ device path. So is a path that starts with \??\, the NT object-namespace
-    prefix, which Windows passes through as it is (\??\UNC\server\share, \??\GLOBALROOT\Device\Mup\server\share). The
-    \\?\C:\ and \??\C:\ forms of a local drive are refused along with them, since Browse never produces them. A path
-    with a drive letter is on a share when that drive is a mapped network drive, and a path with none is on the
-    working directory's drive. On other platforms no path is."""
+
+def _network_path(text: str) -> bool:
+    r"""Whether a path, on Windows, is on a network share, or may be: Browse refuses it as one. It reads the text and
+    the drive's type and opens nothing.
+
+    Forward slashes are read as backslashes. A path that starts with two backslashes is on a share (\\server\share,
+    \\?\UNC\server\share), and so is one that starts with \??\, the NT object-namespace prefix, which Windows passes
+    through as it is (\??\UNC\server\share, \??\GLOBALROOT\Device\Mup\server\share), unless _device_path says it
+    reaches this computer's own devices. A device path to a mapped drive, and one that goes through UNC or GLOBALROOT,
+    with Global before it or not, stay here. A path with a drive letter is on a share when that drive is a mapped
+    network drive, and a path with none is on the working directory's drive. On other platforms no path is."""
     if sys.platform != "win32":
         return False
     text = text.replace("/", "\\")
     if text.startswith(("\\\\", "\\??\\")):
-        return True
+        return not _device_path(text)
     drive = os.path.splitdrive(text)[0] or os.path.splitdrive(os.getcwd())[0]
     if drive.startswith("\\\\"):  # a working directory on a share
         return True
     return len(drive) == 2 and drive[1] == ":" and _drive_type(f"{drive[0].upper()}:\\") == DRIVE_REMOTE
 
 
+def _redirects(folder: Path) -> bool:
+    """Whether a folder redirects to another path: a symbolic link, a junction, a volume mounted in a folder, or another
+    reparse point that names a path. It reads the folder's own attributes and follows nothing; False for a folder that
+    can't be read. os.path.islink is false for a junction, which can lead to a symbolic link. A reparse point that names
+    no path, such as a cloud-sync folder, stays on its own volume; lstat follows it and shows an ordinary folder."""
+    try:
+        return bool(os.lstat(folder).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return False
+
+
 def _through_link(path: Path) -> bool:
-    """Whether a folder on the way to `path`, from its drive's root down, is a symbolic link. Windows follows a link on
-    a local drive to a share, so a link can lead off this computer. Each folder is asked about in turn and the walk
-    stops at the first link, so nothing past a link is touched; asking about a link reads the link itself, on its own
-    volume. `path` must already be known to be on a local drive, since asking about a folder on a share would reach it.
-    On other platforms no path is."""
+    """Whether a folder on the way to `path`, from its drive's root down, is a link: a folder that redirects to another
+    path (_redirects). Windows follows a symbolic link on a local drive to a share, and a junction can lead to such a
+    link, so a link can lead off this computer. Each folder is asked about in turn and the walk stops at the first
+    link, so nothing past a link is touched; asking about a link reads the link itself, on its own volume. `path` must
+    already be known to be on a local drive, since asking about a folder on a share would reach it. On other platforms
+    no path is."""
     if sys.platform != "win32":
         return False
     absolute = Path(os.path.abspath(path))
-    return any(os.path.islink(folder) for folder in (*reversed(absolute.parents), absolute))
+    return any(_redirects(folder) for folder in (*reversed(absolute.parents), absolute))
+
+
+def _listed(entry: os.DirEntry) -> bool:
+    """Whether a folder's listing shows the entry: a folder that is neither a symbolic link nor a junction, which browse
+    refuses to open (_through_link). A folder that is another reparse point, such as a cloud-sync folder, is shown."""
+    return entry.is_dir(follow_symlinks=False) and not entry.is_junction()
 
 
 def _unlisted(path: Path, message: str) -> dict:
@@ -199,14 +251,17 @@ def _unlisted(path: Path, message: str) -> dict:
 
 def browse(path: str) -> dict:
     """The folders inside a folder, for picking one; with no path, the drives in this computer. Browse opens only
-    folders on this computer. A UNC or device path, a path on a mapped drive, and a path that passes through a symbolic
-    link, which can point at a share, list nothing and say so. check() still opens the paths typed into the start
-    page's folder fields, a share included."""
+    folders on this computer. A UNC path, a device path, a path on a mapped drive, and a path that passes through a
+    link (_through_link), which can lead to a share, list nothing and say so; a device path to this computer has words
+    of its own. A symbolic link or a junction in the folder isn't listed as a folder (_listed). check() still opens the
+    paths typed into the start page's folder fields, a share included."""
     if not path:
         if sys.platform == "win32":
             return {"path": "", "parent": None, "folders": local_drives(), "message": ""}
         path = "/"
     p = Path(path).expanduser()  # the checks below run on the expanded path, since a home folder can sit on a share
+    if _device_path(str(p)):
+        return _unlisted(p, "Browse doesn't open device paths. Type the folder's path instead.")
     if _network_path(str(p)):
         return _unlisted(p, "Browse doesn't open network folders. Type the folder's path instead.")
     if _through_link(p):
@@ -214,7 +269,7 @@ def browse(path: str) -> dict:
     if not p.is_dir():
         return _unlisted(p, "Folder not found.")
     try:
-        folders = sorted((e.name for e in os.scandir(p) if e.is_dir(follow_symlinks=False)), key=str.lower)
+        folders = sorted((e.name for e in os.scandir(p) if _listed(e)), key=str.lower)
         message = ""
     except PermissionError:
         folders, message = [], "This folder can't be read."
@@ -400,7 +455,7 @@ def start_new_case(body: dict, analyst: str, open_case_fn: Callable[[Case], None
     job = StartJob("new", str(case.folder), name, stage="Taking in the evidence")
 
     def work():
-        summary = intake(case, job.progress)
+        summary = intake(case, job.progress, Journal(case, "server"))
         job.result = {"files": summary.files, "bytes": summary.total_bytes, "by_artifact": summary.by_artifact,
                       "unidentified": len(summary.unidentified), "errors": summary.errors, "links": summary.links}
         job.stage = "Opening the case"
@@ -439,6 +494,7 @@ def start_copy(body: dict, analyst: str) -> StartJob:
         job.case_folder = str(case.folder)
         # A copy of an older case keeps its format, with no events and an empty journal, so its upgrade records what
         # changed and seals the journal before its rebuild loads under this build's rules, and case_created follows.
+        # The entries of the steps from a format with the chain follow case_created, in every copy.
         case = upgraded_copy(case, source, "server")
         job.stage = "Loading the events from the copied runs"
         left_out = []

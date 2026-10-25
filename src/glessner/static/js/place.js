@@ -1,6 +1,9 @@
 // The page after a reload. F5 in the same tab, while the server still has the same
 // open of the case, comes back to the path's step, the Details page, the selection and the event in focus with the pivot
-// trail, the search box's text, the Lanes preset, and the timeline's window. Every other load opens on the
+// trail, the search box's text, the Lanes preset, and the timeline's window. On the Findings page it also comes back to
+// the open finding forms, new or an edit, as they were typed, and the report summary's unsaved text; a saved finding or
+// summary leaves none to bring back. When the Findings page can't draw them, as its read failed or another page came
+// first, they wait for its next draw, through further reloads on any step. Every other load opens on the
 // Case overview: a new tab from the printed link (sessionStorage is the tab's own), a new serve run or another open of the
 // case (each has its own open ID, /api/meta's case_id), and a link or an address opened in the same tab, which is a
 // navigation and not a reload. The Sources and View filters start off, as on every load, and the status line says so
@@ -9,9 +12,9 @@
 import { showAudit } from './audit.js';
 import { $, LISTED_EVENTS, S } from './core.js';
 import { draw } from './draw.js';
-import { loadDetails } from './event_page.js';
+import { claimDetails, fillFocusEvent, loadDetails } from './event_page.js';
 import { filterCount } from './filters.js';
-import { showFindings } from './findings.js';
+import { findingsDraft, keepFindingsDraft, showFindings } from './findings.js';
 import { behindOverview, markTab } from './frame.js';
 import { showImport } from './import.js';
 import { pivot, showInvestigate, showRules } from './pages.js';
@@ -21,7 +24,8 @@ import { showTools } from './tools.js';
 import { viewCount } from './view.js';
 
 const PLACE_KEY = 'glessner.place';
-// The path's steps that are a Details page of their own, and the pages drawn with no arguments
+// The path's steps that are a Details page of their own, and the pages drawn with no arguments. Findings gives how many
+// of its draft's edit forms it couldn't open again.
 const TAB_PAGES = { investigate: showInvestigate, findings: showFindings, audit: () => showAudit() };
 const PAGES = { tools: () => showTools(), import: showImport, rules: showRules, searchHelp: showSearchHelp };
 // Lists a reload can't draw again: the events under the cursor, and those a Case overview number opened, which read the
@@ -49,7 +53,8 @@ function place() {
   return {
     open: S.meta.case_id, tab: S.tab, preset: Number($('groupby').value) || 0,
     view: { start: view.start, end: view.end }, focus: S.focus, selected, trail: S.trail, trailAt: S.trailAt,
-    details: detailsPlace(), search: $('search').value, filtered: { sources: filterCount() > 0, view: viewCount() > 0 },
+    details: detailsPlace(), draft: findingsDraft(), search: $('search').value,
+    filtered: { sources: filterCount() > 0, view: viewCount() > 0 },
   };
 }
 
@@ -85,26 +90,44 @@ export async function restorePlace(saved) {
     S.trailAt = Number.isInteger(saved.trailAt) && saved.trailAt < S.trail.length ? saved.trailAt : S.trail.length - 1;
   }
   if (typeof saved.search === 'string') $('search').value = saved.search;
+  if (saved.draft) keepFindingsDraft(saved.draft);
   draw();
   const details = saved.details || {};
+  // The page the Details panel had in place of the event's, or null when the event in focus draws its own
+  const page = details.name === 'search' ? () => showSearch(details.q)
+    : details.name === 'suggestions' ? () => showSuggestions(details.source, details.groupBy || '', details.limit || 0)
+    : Object.hasOwn(PAGES, details.name) ? PAGES[details.name] : null;
   const drawDetails = async () => {
-    if (details.name === 'search') await showSearch(details.q);
-    else if (details.name === 'suggestions') await showSuggestions(details.source, details.groupBy || '', details.limit || 0);
-    else if (Object.hasOwn(PAGES, details.name)) await PAGES[details.name]();
+    if (page) await page();
     else if (S.focus) {
       await loadDetails(S.focus);
       const p = details.name === 'event' && details.uid === S.focus ? details.pivot : null;
       if (p) await pivot(S.focus, p.kind, p.seconds, p.ip, p.more, true);
     }
   };
-  if (Object.hasOwn(TAB_PAGES, saved.tab)) await TAB_PAGES[saved.tab]();
-  else if (saved.tab === 'overview') await behindOverview(drawDetails);
-  else {
-    markTab('timeline');
-    await drawDetails();
+  // Pages that name the event in focus, such as Findings' New finding, read it as its Event page left it; when the reload
+  // draws another page, the event is read here first, without drawing its page. The read claims the panel for the page
+  // the reload draws, so a page asked for during it, such as an event clicked on the timeline, keeps the panel.
+  let latest = () => true;
+  if (S.focus && (page || Object.hasOwn(TAB_PAGES, saved.tab))) {
+    latest = claimDetails();
+    await fillFocusEvent(S.focus);
+  }
+  let retired = 0;   // edit forms of findings retired since the page was left, which can't open again
+  if (latest()) {
+    if (Object.hasOwn(TAB_PAGES, saved.tab)) retired = (await TAB_PAGES[saved.tab]()) || 0;
+    else if (saved.tab === 'overview') await behindOverview(drawDetails);
+    else {
+      markTab('timeline');
+      await drawDetails();
+    }
   }
   const words = ['Back where the page was before the reload.'];
   if (details.name === 'list') words.push('Its list of events is not kept across a reload.');
+  if (retired) {
+    words.push(retired === 1 ? 'The finding being edited was retired, so its changes are not kept.'
+      : `${retired} findings being edited were retired, so their changes are not kept.`);
+  }
   const { sources, view } = saved.filtered || {};
   if (sources || view) {
     const which = sources && view ? 'the Sources and View filters' : sources ? 'the Sources filter' : 'the View filter';

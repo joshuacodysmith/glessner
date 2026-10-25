@@ -10,8 +10,8 @@ Glessner is pre-alpha. Read [Limits](#limits) before you rely on it for a case.
 
 You point Glessner at a folder holding a collection, with one top-level folder per host, as KAPE and most collection scripts produce. Glessner then does the following:
 
-- Hashes every file into a manifest and identifies each artifact by its header. It never writes to the evidence folder, and it re-hashes the files each tool run read.
-- Runs the installed tools that read the evidence: EvtxECmd, RECmd, MFTECmd, PECmd, LECmd, JLECmd, SBECmd, AmcacheParser, SrumECmd, RBCmd, SQLECmd, WxTCmd, Hayabusa, and Suricata on packet captures. It logs each exact command line and records each tool's version.
+- Hashes every file into a manifest and identifies each artifact by its header. It never writes to the evidence folder, and it re-hashes the files each tool run read. From case format 4, the journal records the SHA-256, size, and line count of `manifest.jsonl` itself at intake and at each `intake --add`, and `verify`, `close`, and the report compare the file with that record.
+- Runs the installed tools that read the evidence: EvtxECmd, RECmd, MFTECmd, PECmd, LECmd, JLECmd, SBECmd, AmcacheParser, SrumECmd, RBCmd, SQLECmd, WxTCmd, Hayabusa, and Suricata on packet captures. It logs each exact command line and records each tool's version. From case format 4, each run also records its rule or map set and the SHA-256 of its executable and of the rule, map, plugin, and configuration files the run names.
 - Loads other tools' output found in the evidence, such as a KAPE run's CSVs, Zeek's logs, Suricata's EVE JSON, and Sysinternals Autoruns CSVs. It imports text logs no tool reads: Windows Firewall, IIS, FortiGate, SonicWall, Apache, NGINX, syslog, Cisco ASA, Snort and Suricata fast alerts, and CSV or JSON-lines exports such as a SIEM's.
 - Shows every event on one timeline in a local browser page, in lanes you group by mark, role, host, user, artifact, or tactic. Logon links are drawn between hosts. A host's clock can be checked against a capture and corrected with an offset, and the recorded time never changes.
 - Ranks the next pivots for each kind of event, each with its reason and its count across the case before you click, and flags broad ones.
@@ -72,11 +72,11 @@ Without a case folder, `serve` opens the start page, where you can make, open, a
 uv run glessner serve
 ```
 
-The **Tools** page, in the **Case** menu, runs tools from the page. Stop the server with Ctrl+C before running tools from the command line, because both need the events database.
+The **Tools** page, in the **Case** menu, runs tools from the page. Stop the server with Ctrl+C before running tools from the command line, because both need the events database. Ctrl+C waits up to 5 seconds for running requests, then cuts off any that are still running. A load or tool run started from the Tools page isn't waited for, apart from the rebuild that follows a load, so let it finish first.
 
 For a single-host collection, add `--host NAME` to `new-case`. A folder of event logs from many machines loads as one host, and the Hosts panel then offers to split it by the computer each event records.
 
-When the work is done, close the case. Closing re-hashes every evidence file, checks the journal's chain, and prints the journal's head. Record the head outside the case folder, such as in your ticket, and check a copy later with `glessner verify CASE --journal --expect-head HEAD` or with `scripts/check_journal.py`, which needs only Python.
+When the work is done, close the case. Closing re-hashes every evidence file, checks the journal's chain, compares `manifest.jsonl` with its record in the journal, and prints the journal's head. Record the head outside the case folder, such as in your ticket, and check a copy later with `glessner verify CASE --journal --expect-head HEAD` or with `scripts/check_journal.py`, which needs only Python. `glessner verify CASE --expect-head HEAD`, without `--journal`, also compares `manifest.jsonl` with its record at or before that head.
 
 ```bash
 uv run glessner close C:\Cases\CASE01
@@ -84,13 +84,13 @@ uv run glessner close C:\Cases\CASE01
 
 ### Commands
 
-Each command takes the case folder first. `new-case` makes that folder, `copy-case` takes the source case before the new one, and `serve` runs without one to show the start page. `glessner --version` prints the build and exits. A command that is refused, such as for a missing case, prints why and exits 2. `run` and `load-output` exit 1 when a run or load fails or finds the evidence changed, `import` when a file needs a choice or its load fails, `verify` and `close` when an evidence file doesn't match the manifest, and `rebuild` and `copy-case` when they leave a run out because its output or evidence changed. `verify` also exits 1 when the manifest is empty, since nothing was checked, and for a journal problem it prints: no `journal.jsonl`, a case below format 3 checked with `--journal`, a broken chain, a last line with no line end or one cut short, bytes after the last line while another program holds `journal.lock`, a `journal_torn_*.bin` file the journal names that is missing or changed, an `--expect-head` (or, without one, the head this computer recorded) that isn't in the journal, or a `--file` not recorded at or before the head.
+Each command takes the case folder first. `new-case` makes that folder, `copy-case` takes the source case before the new one, and `serve` runs without one to show the start page. `glessner --version` prints the build and exits. A command that is refused, such as for a missing case, prints why and exits 2. `intake`, `intake --add`, and `close` refuse a missing `manifest.jsonl` that the journal records, and `intake --add` also refuses one that differs from its record. `run` and `load-output` exit 1 when a run or load fails or finds the evidence changed, `import` when a file needs a choice or its load fails, `verify` and `close` when an evidence file doesn't match the manifest or `manifest.jsonl` grew past or differs from its record in the journal, and `rebuild` and `copy-case` when they leave a run out because its output or evidence changed. `verify` also exits 1 when the manifest is empty, since nothing was checked, when `manifest.jsonl` is missing while the journal records it, and for a journal problem it prints: no `journal.jsonl`, a case below format 3 checked with `--journal`, a broken chain, a last line with no line end or one cut short, bytes after the last line while another program holds `journal.lock`, a `journal_torn_*.bin` file the journal names that is missing or changed, an `--expect-head` (or, without one, the head this computer recorded) that isn't in the journal, or a `--file` not recorded at or before the head.
 
 | Command | What it does | Options |
 |---|---|---|
 | `new-case CASE` | Make a case folder for an evidence folder | `--evidence` and `--name` (required), `--tools`, `--analyst` (default: your Windows user name), `--host` for a single-host collection |
 | `copy-case SOURCE CASE` | A clean copy: same evidence, intake, and runs, and a new journal whose first entry names the source; reloads the events | `--name` (required), `--analyst` |
-| `intake` | Hash and identify every evidence file | `--add` for files new since intake |
+| `intake` | Hash and identify every evidence file, and record `manifest.jsonl`'s hash in the journal | `--add` for files new since intake, which refuses a `manifest.jsonl` that differs from its record |
 | `tools` | Installed tools with versions and paths, and recommended missing ones | |
 | `run` | Run a tool on each host's evidence and load its output | `--tool ID` or `--all`, `--host` (repeatable), `--option ID=VALUE` |
 | `load-output [KIND]` | List found output, or load one kind of it | `--host` (repeatable), `--anyway` |
@@ -101,8 +101,8 @@ Each command takes the case folder first. `new-case` makes that folder, `copy-ca
 | `rule OP [TARGET]` | `list`, `add` or `change` a rule from a YAML file, or `remove` one by ID | |
 | `export` | Write a timeline file to `exports\` | `--start`, `--end` (ISO 8601 UTC, for `--marks all`), `--format csv` or `jsonl`, `--marks all`, `marked`, or `flagged` (marked and flagged cover the whole case) |
 | `findings` | Write the Markdown report to `exports\` | |
-| `verify` | Re-hash every evidence file against the manifest, then check the journal's chain | `--journal` checks the journal alone, writing nothing; `--expect-head HEAD` compares it with a head you recorded; `--file FILE` checks that a file the case wrote is recorded at or before that head |
-| `close` | Re-hash every evidence file, check the journal's chain, record the case as closed, and print the journal head | |
+| `verify` | Re-hash every evidence file against the manifest, compare `manifest.jsonl` with its record in the journal (the newest at or before `--expect-head`, or else at or before the head this computer recorded), then check the journal's chain | `--journal` checks the journal alone, writing nothing; `--expect-head HEAD` compares it with a head you recorded; `--file FILE` checks that a file the case wrote is recorded at or before that head |
+| `close` | Re-hash every evidence file, compare `manifest.jsonl` with its record in the journal, check the journal's chain, record the case as closed, and print the journal head | |
 
 ## Limits
 
@@ -137,7 +137,7 @@ uv run pytest
 
 The suite runs in parallel with pytest-xdist. Add `-n 0` to run one test at a time, as `print` output and a debugger need.
 
-Tests marked `lab` run the real tools on local copies of public datasets, chiefly the Stolen Szechuan Sauce, at the paths the tests name, and are skipped when those copies are absent. Tests marked `browser` drive the installed Microsoft Edge through Playwright against small synthetic cases; set `GLESSNER_BROWSER_CHANNEL=chrome` to use Chrome. Tests marked `lint` run ruff and ESLint. To skip a group, deselect its marker:
+Tests marked `lab` run the real tools on local copies of public datasets, chiefly the Stolen Szechuan Sauce, at the paths the tests name, and are skipped when those copies are absent. Tests marked `browser` drive the installed Microsoft Edge through Playwright against small synthetic cases; set `GLESSNER_BROWSER_CHANNEL=chrome` to use Chrome. Set `GLESSNER_REQUIRE_BROWSER=1` to make a missing browser fail these tests instead of skipping them, as CI does. Tests marked `lint` run ruff and ESLint. To skip a group, deselect its marker:
 
 ```bash
 uv run pytest -m "not lab"

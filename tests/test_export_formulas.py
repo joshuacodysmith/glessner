@@ -9,7 +9,7 @@ from pathlib import Path
 import duckdb
 from conftest import SEC, T0
 
-from glessner.events import NO_EXTENSION_FETCH
+from glessner.events import NO_EXTENSION_FETCH, Event, load
 from glessner.export import FORMULA_STARTS, TIMELINE_COLUMNS, spreadsheet_sql, spreadsheet_text
 from glessner.server import App, api_export, api_host, api_indicators, api_mark
 
@@ -112,7 +112,7 @@ def test_indicators_csv_writes_formula_text_as_text(synthetic_case):
         api_mark(app, {"uids": [rdp], "value": "malicious"})
         found = api_indicators(app, {})
         raw = Path(found["path"]).read_bytes().decode("utf-8")
-        assert raw.startswith("type,value,marked_events,first_seen,last_seen\r\n")
+        assert raw.startswith("type,value,marked_events,first_seen,last_seen,note\r\n")
         _, *rows = read_csv(found["path"])
         assert [(r[0], r[1], r[2]) for r in rows] == [
             ("IP address", "194.61.24.102", "1"), ("Account", "\t@SUM(1,1)", "1"), ("File", '\t-2+3;\t=1+1;"\t@x', "1")]
@@ -120,6 +120,46 @@ def test_indicators_csv_writes_formula_text_as_text(synthetic_case):
         for row in rows:
             for cell in row:
                 assert_no_formula(cell)
+    finally:
+        app.con.close()
+
+
+def test_each_timeline_export_keeps_a_flow_id_or_a_uid_out_of_the_community_id_column(synthetic_case):
+    """In the timeline CSV and JSONL of every scope, a community ID is the only value of network.community_id. A Suricata
+    record with only a flow ID has it in network.flow_id, and a Zeek record with a uid and no community ID has it in
+    zeek.uid, which only a Zeek record has, so another sensor's uid field is not read; a record with both a community ID and
+    a flow ID keeps each in its own column, and a Windows event has all three empty. The three columns follow event.severity
+    in that order and come before url.full."""
+    suricata = [Event(ts_us=T0 + 70 * SEC, ts_desc="dns", artifact="suricata", source_file="eve.json", source_record="1",
+                      message="dns lookup", log_channel="dns", extra={"flow_id": "12", "uid": "CnotZeek"}),
+                Event(ts_us=T0 + 71 * SEC, ts_desc="alert", artifact="suricata", source_file="eve.json", source_record="2",
+                      message="alert", log_channel="alert", extra={"flow_id": "11", "community_id": "1:abc="})]
+    zeek = Event(ts_us=T0 + 72 * SEC, ts_desc="dns", artifact="zeek", source_file="dns.log", source_record="1",
+                 message="query", log_channel="dns", extra={"uid": "CabC1"})
+    load(synthetic_case.db_path, suricata, host="network", tool="suricata", tool_version="8.0.7", run_id="r20",
+         replaces_sources=["eve.json"], staging_dir=synthetic_case.folder)
+    load(synthetic_case.db_path, [zeek], host="network", tool="import", tool_version="t", run_id="r21",
+         replaces_sources=["dns.log"], staging_dir=synthetic_case.folder)
+    app = App(synthetic_case, for_work=True)
+    try:
+        by_record = {(a, r): u for u, a, r in app.con.execute(
+            "SELECT event_uid, artifact, source_record FROM events WHERE artifact IN ('suricata', 'zeek')").fetchall()}
+        rdp = uid_at(app, T0)
+        api_mark(app, {"uids": [*by_record.values(), rdp], "value": "malicious"})
+        expected = {by_record["suricata", "1"]: ("", "12", ""), by_record["suricata", "2"]: ("1:abc=", "11", ""),
+                    by_record["zeek", "1"]: ("", "", "CabC1"), rdp: ("", "", "")}
+        columns = ("network.community_id", "network.flow_id", "zeek.uid")
+        span = ["event.severity", *columns, "url.full"]
+        window = {"start": T0 - 10 * SEC, "end": T0 + 3600 * SEC}
+        for scope in ({"marks": "all", **window}, {"marks": "marked"}, {"marks": "flagged"}):
+            csv_rows = read_csv(api_export(app, {"format": "csv", **scope})["path"])
+            as_csv = [dict(zip(csv_rows[0], row, strict=True)) for row in csv_rows[1:]]
+            as_jsonl = read_jsonl(api_export(app, {"format": "jsonl", **scope})["path"])
+            for names in (csv_rows[0], list(as_jsonl[0])):
+                assert names[names.index("event.severity"):][:len(span)] == span, scope
+            for written in (as_csv, as_jsonl):
+                got = {r["event_uid"]: tuple(r[c] for c in columns) for r in written if r["event_uid"] in expected}
+                assert got == expected, scope
     finally:
         app.con.close()
 

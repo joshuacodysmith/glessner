@@ -94,6 +94,7 @@ IDS_BY_FORMAT = {
     },
 }
 IDS_BY_FORMAT[3] = IDS_BY_FORMAT[2]   # format 3 seals the journal and changes no event ID
+IDS_BY_FORMAT[4] = IDS_BY_FORMAT[3]   # format 4 adds a journal entry and changes no event ID
 
 
 def test_the_format_this_build_writes_has_its_ids_pinned():

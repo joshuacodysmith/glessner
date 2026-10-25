@@ -112,14 +112,15 @@ def ids_of(f: Format1, runs) -> list[str]:
 def test_pins(tmp_path, monkeypatch):
     """The WS01 EvtxECmd run and the AmcacheParser tool run are pinned; the run whose output
     names files elsewhere stays empty with the count; the run whose output changed stays empty and is named; the
-    found-output run and the import are untouched. The step reports its progress, and the seal names the pins. Then the
-    evidence moves, case.yaml names the new folder, and a rebuild keeps the pinned runs' event IDs."""
+    found-output run and the import are untouched. The step reports its progress, and the seal names the pins; the 3 to 4
+    entry follows it. Then the evidence moves, case.yaml names the new folder, and a rebuild keeps the pinned runs' event
+    IDs."""
     f, runs = case_without_run_folders(tmp_path)
     untouched = {name: run_json(f, runs[name]) for name in ("found", "import")}
     stages = []
     monkeypatch.setattr(rekey, "report_stage", lambda stage, done=0, total=0: stages.append((stage, done, total)))
     upgraded(f.case)
-    assert case_format(f.case) == 3
+    assert case_format(f.case) == 4
     records = {r.run_id: r for r in read_runs(f.case)}
     for name in ("evtx", "amcache"):
         assert records[runs[name].run_id].evidence_root == str(f.evidence), name
@@ -127,6 +128,8 @@ def test_pins(tmp_path, monkeypatch):
         assert records[runs[name].run_id].evidence_root == "", name
     assert {name: run_json(f, runs[name]) for name in ("found", "import")} == untouched
     (seal,) = f.upgrades(3)
+    (step,) = f.upgrades(4)
+    assert step["from_format"] == 3 and step["seq"] > seal["seq"] and "pins" not in step
     pins = seal["pins"]
     assert pins["pinned"] == sorted([runs["evtx"].run_id, runs["amcache"].run_id])
     unpinned = pins["unpinned_runs"]
@@ -150,7 +153,7 @@ def test_pins(tmp_path, monkeypatch):
 def test_a_run_the_parser_refuses_is_left_unpinned_and_named_and_the_step_goes_on(tmp_path, monkeypatch):
     """An exception from today's parser reading an older run's output is caught: otherwise one run it refuses would stop
     the step at every open and the case could never open. The run is left as it was and named with
-    the reason, as a run naming files elsewhere is; the other pins and the seal go on."""
+    the reason, as a run naming files elsewhere is; the other pins, the seal, and the 3 to 4 step go on."""
     f, runs = case_without_run_folders(tmp_path)
     name = runs["evtx"].parser
 
@@ -160,8 +163,10 @@ def test_a_run_the_parser_refuses_is_left_unpinned_and_named_and_the_step_goes_o
 
     monkeypatch.setitem(rekey.PARSERS, name, refuses)
     upgraded(f.case)
-    assert case_format(f.case) == 3
+    assert case_format(f.case) == 4
     (seal,) = f.upgrades(3)
+    (step,) = f.upgrades(4)
+    assert step["from_format"] == 3 and step["seq"] > seal["seq"]
     assert seal["pins"]["unpinned_runs"][runs["evtx"].run_id] == (
         "its output can't be read by this build (ValueError: today's parser refuses this older output)")
     assert runs["amcache"].run_id in seal["pins"]["pinned"]
@@ -340,7 +345,9 @@ def test_the_fill(tmp_path, monkeypatch):
     upgraded(whole)
     assert columns_of(whole) == fresh and the_rest(whole) == rest and state_of(whole) == state
     entries = [json.loads(line) for line in (whole.folder / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
-    (seal,) = [e for e in entries if e["action"] == "case_upgrade"]
+    upgrades = [e for e in entries if e["action"] == "case_upgrade"]
+    assert [(e["from_format"], e["to_format"]) for e in upgrades] == [(2, 3), (3, 4)]   # the seal, then the 3 to 4 step
+    seal = upgrades[0]
     total = sum(per_host.values())   # rows: two of the fixtures' rows share an ID
     assert seal["columns"] == {"account_key": total, "hashes": total}
     assert f"Filled the account key and the hashes for {total:,} loaded events, for Same account and Same hash." in (
@@ -376,7 +383,9 @@ def test_the_fill(tmp_path, monkeypatch):
     monkeypatch.setattr(rekey, "report_stage", lambda stage, done=0, total=0: stages.append((stage, done, total)))
     upgraded(half)
     entries = [json.loads(line) for line in (half.folder / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
-    (seal,) = [e for e in entries if e["action"] == "case_upgrade"]
+    upgrades = [e for e in entries if e["action"] == "case_upgrade"]
+    assert [(e["from_format"], e["to_format"]) for e in upgrades] == [(2, 3), (3, 4)]   # the seal, then the 3 to 4 step
+    seal = upgrades[0]
     assert seal["columns"] == {"account_key": still, "hashes": still}
     assert [s for s in stages if s[0] == FILLING] == [(FILLING, n, len(hosts) - 1) for n in range(1, len(hosts))]
     assert columns_of(half) == fresh and the_rest(half) == rest and state_of(half) == state

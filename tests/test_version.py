@@ -84,7 +84,10 @@ def git(cwd, *args):
 
 @pytest.fixture
 def checkout(tmp_path, monkeypatch, fresh_build):
-    """A checkout of a workspace, with a package folder and a file outside it; the build reads the package folder."""
+    """A checkout of a workspace, with a package folder and a file outside it; the build reads the package folder. The
+    build waits longer for git than the app does, since on a loaded machine git's three calls can together take longer
+    than the app's wait, which gives the plain version whatever git would have said."""
+    monkeypatch.setattr(version, "GIT_TIMEOUT_S", 60)
     repo = tmp_path / "repo"
     package = repo / "src" / "pkg"
     package.mkdir(parents=True)
@@ -364,13 +367,13 @@ def set_format(case, value):
 
 
 def test_new_cases_write_the_format_and_one_without_it_is_format_1(synthetic_case, tmp_path, monkeypatch):
-    assert CASE_FORMAT == 3 and settings_file(synthetic_case)["case_format"] == 3
-    assert open_case(synthetic_case.folder).settings.case_format == 3
+    assert CASE_FORMAT == 4 and settings_file(synthetic_case)["case_format"] == CASE_FORMAT
+    assert open_case(synthetic_case.folder).settings.case_format == CASE_FORMAT
     set_format(synthetic_case, None)   # as a case made before the format number was recorded
     assert open_case(synthetic_case.folder).settings.case_format == 1
-    monkeypatch.setattr(case_module, "CASE_FORMAT", 4)   # a later build writes its own format
+    monkeypatch.setattr(case_module, "CASE_FORMAT", CASE_FORMAT + 1)   # a later build writes its own format
     later = case_module.create_case(tmp_path / "later", "Later", synthetic_case.evidence, "cody")
-    assert later.settings.case_format == 4 and settings_file(later)["case_format"] == 4
+    assert later.settings.case_format == CASE_FORMAT + 1 and settings_file(later)["case_format"] == CASE_FORMAT + 1
 
 
 def test_a_newer_format_is_refused_by_the_command_line_and_the_start_page(synthetic_case, fake_build, capsys):
@@ -378,9 +381,9 @@ def test_a_newer_format_is_refused_by_the_command_line_and_the_start_page(synthe
     data = settings_file(synthetic_case)
     data["a_later_setting"] = "a newer build's"   # read only after the format check, which names the problem instead
     (synthetic_case.folder / "case.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
-    said = (f"is a case of format 4, and this build of glessner ({FAKE}) reads formats up to 3. Open it with a "
-            "build that reads format 4.")
-    with pytest.raises(CaseError, match=r"of format 4, and this build .* reads formats up to 3\."):
+    said = (f"is a case of format {CASE_FORMAT + 1}, and this build of glessner ({FAKE}) reads formats up to "
+            f"{CASE_FORMAT}. Open it with a build that reads format {CASE_FORMAT + 1}.")
+    with pytest.raises(CaseError, match=rf"of format {CASE_FORMAT + 1}, and this build .* reads formats up to {CASE_FORMAT}\."):
         open_case(synthetic_case.folder)
     assert main(["runs", str(synthetic_case.folder)]) == 2
     assert said in capsys.readouterr().err
@@ -427,9 +430,10 @@ def test_copy_case_carries_the_source_s_format(synthetic_case, tmp_path, monkeyp
 def test_an_older_format_is_upgraded_at_the_server_s_open_and_journaled(synthetic_case, monkeypatch, fake_build):
     """The upgrade hook, with steps made up for the test: the server's case open runs each step from the case's format
     up, journals the fields it gives, then the build, and writes the new number; the next open runs none. A step can
-    hold what it opened until the entry and the number are written. The made-up step runs after the seal, from format
-    3 to 4, so its entry is an ordinary chained one."""
+    hold what it opened until the entry and the number are written. The made-up step runs from this build's format to
+    the next, after the seal, so its entry is an ordinary chained one."""
     held = []
+    later = CASE_FORMAT + 1
 
     @contextlib.contextmanager
     def step(case):
@@ -438,18 +442,19 @@ def test_an_older_format_is_upgraded_at_the_server_s_open_and_journaled(syntheti
         yield {"text": "Wrote upgraded.txt.", "extra": 1}
         held.append((settings_file(case)["case_format"], read_entries(case.folder / "journal.jsonl")[-1]["action"]))
 
-    monkeypatch.setattr(case_module, "CASE_FORMAT", 4)
-    monkeypatch.setattr(case_module, "UPGRADES", {3: step})
+    monkeypatch.setattr(case_module, "CASE_FORMAT", later)
+    monkeypatch.setattr(case_module, "UPGRADES", {CASE_FORMAT: step})
     App(synthetic_case).con.close()   # the command line's App upgrades nothing
-    assert settings_file(synthetic_case)["case_format"] == 3
+    assert settings_file(synthetic_case)["case_format"] == CASE_FORMAT
     for _ in range(2):
         hub = Hub(open_case(synthetic_case.folder))
         hub.app.con.close()
-    assert held == ["open", (4, "case_upgrade")]   # released after the entry and the number
-    assert settings_file(synthetic_case)["case_format"] == 4 and hub.app.case.settings.case_format == 4
+    assert held == ["open", (later, "case_upgrade")]   # released after the entry and the number
+    assert settings_file(synthetic_case)["case_format"] == later and hub.app.case.settings.case_format == later
     entries = [e for e in read_entries(synthetic_case.folder / "journal.jsonl") if e["action"] in ("case_open", "case_upgrade")]
     assert [e["action"] for e in entries] == ["case_upgrade", "case_open"] and entries[0]["extra"] == 1
-    assert "prev" in entries[0] and describe(entries[0]) == "Upgraded the case from format 3 to 4: Wrote upgraded.txt."
-    monkeypatch.setattr(case_module, "CASE_FORMAT", 5)   # a format with no step to it
-    with pytest.raises(CaseError, match="no upgrade from case format 4"):
+    assert "prev" in entries[0] and describe(entries[0]) == (
+        f"Upgraded the case from format {CASE_FORMAT} to {later}: Wrote upgraded.txt.")
+    monkeypatch.setattr(case_module, "CASE_FORMAT", later + 1)   # a format with no step to it
+    with pytest.raises(CaseError, match=f"no upgrade from case format {later}"):
         Hub(open_case(synthetic_case.folder))

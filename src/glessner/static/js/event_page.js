@@ -65,20 +65,128 @@ export const HISTORY_OPEN_KEY = 'glessner.historyOpen';   // and History
 export const NOT_RAW = new Set(['extra', 'hits', 'mark', 'notes', 'suggestions', 'evidence_sha256', 'offset_us', 'adjusted_ts_us',
                                 'pair', 'clock', 'tags', 'tag_suggestions', 'split', 'provenance', 'pivots', 'id_changed',
                                 'id_also_named', 'unplaced', 'followup', 'rejection_notes',
-                                'account_key', 'hashes', 'caveat', 'findings']);
+                                'account_key', 'hashes', 'caveat', 'findings', 'host_clock']);
+
+// A table's entry for a key read from the evidence or the server, which may name a property every object has, such as
+// constructor; undefined when the table doesn't hold the key itself.
+const lookup = (table, key) => (table && Object.hasOwn(table, key) ? table[key] : undefined);
 
 // Counts the pages asked of the Details panel, so only the latest draws. A page that draws when its request answers,
 // such as an Event page, a search, or To investigate, claims the panel when asked; claimDetails returns a check that no
 // later page has claimed it since. setPage claims it for any other page it draws, such as Export. A shift-click on
 // stacked events keeps the focus, and the focused event's page would replace their list a moment later; a search that
 // answers late would replace the Event page opened after it, and To investigate, Rules, or the audit trail opened after it.
+// The check of a page's redraw after an action (settleRedraw) also fails while a question is open on the page, which the
+// redraw would take away; the page then notes the claims again and owes the redraw, which runs once the question has left.
 let detailsTurn = 0;
-export const claimDetails = () => { const turn = ++detailsTurn; return () => turn === detailsTurn; };
+export const claimDetails = () => {
+  const turn = ++detailsTurn;
+  return () => {
+    if (turn !== detailsTurn) return false;
+    if (turn !== settling || !asking()) return true;
+    drawn.claims = turn;
+    drawn.held = true;
+    return false;
+  };
+};
 // The claims made so far, read without claiming: a page that has drawn can tell later whether one was asked for since.
 export const detailsClaims = () => detailsTurn;
 // Whether the panel still shows the page with this key. A page's action, such as Accept all or Remove, redraws the page
 // when it answers, and the answer would replace whatever page the analyst asked for meanwhile.
 export const showingPage = (key) => $('details').dataset.key === key;
+
+// An action on a page, such as Accept all, Remove, or a note, redraws that page when the server answers, so the page shows
+// the change. A page asked for meanwhile keeps the panel: the redraw waits for no page asked for since the claims the
+// page on screen last noted, when it drew and when an action on it started. A page left and opened again while the
+// action was out redraws once more, when the action answers or when it draws, if its read went out before the answer.
+// An action can redraw only the part of the page it changed, such as the list a tag came from. When the page can't draw
+// that part as the action answers, it draws it when it next draws, whenever its read went out, since the page's read may
+// not read the part again: an Event page draws its pivot's list from the rows it kept.
+// A question open on the page, such as a second group's Accept all, holds the redraw, which would take the question
+// away. The page redraws once the question has left it, however it left: answered, canceled, or drawn over by the page
+// itself, as a tick in a list draws the list again. A redraw whose read is out when a question opens is held as its read
+// answers. A refusal in the question's place asks nothing and holds nothing.
+let answers = 0;                  // actions answered, on any page
+const answeredOn = new Map();     // page key: the number of the last action answered on that page that redraws all of it
+const owedParts = new Map();      // page key: how to draw the part of the page an action changed, until the page can
+// The page on screen, as it last noted itself. `held` says a question held the read of its redraw.
+let drawn = { key: null, read: 0, claims: 0, redraw: null, held: false };
+let settling = 0;                 // the claim of the last redraw that followed an action
+
+// Whether a question (confirm.js's askConfirm) is open on the page in the Details panel. A refusal in its place is an
+// alert, not a group.
+const asking = () => $('detailsBody').querySelector('.confirm-block[role="group"]') !== null;
+// Whether the page on screen, with this key, is owed a redraw of all of it
+const owedWhole = (key) => drawn.held || (answeredOn.get(key) || 0) > drawn.read;
+const owes = (key) => owedWhole(key) || owedParts.has(key);
+new MutationObserver(() => { if (drawn.key && owes(drawn.key) && !asking()) settlePage(drawn.key); })
+  .observe($('detailsBody'), { childList: true, subtree: true });
+
+// Called as a page's read goes out; what it returns is called once the page has drawn, with the page's key and how to
+// draw it again with the same options.
+export function pageRead() {
+  const read = answers;   // the actions answered before the read, which it is sure to show
+  return (key, redraw) => {
+    drawn = { key, read, claims: detailsClaims(), redraw, held: false };
+    settlePage(key);
+  };
+}
+
+// Called as an action on the page with this key goes out; what it returns is called once the server has answered, and
+// passes `redraw` to pageAnswered.
+export function pageAction(key) {
+  if (drawn.key === key && showingPage(key)) drawn.claims = detailsClaims();
+  return (redraw = true) => pageAnswered(key, redraw);
+}
+
+// Note that an action has answered for the page with this key, as what pageAction returns does, for a page the action
+// didn't note as it went out, such as the Event page of an event opened while a host change was out. It doesn't note the
+// page's claims, so a page asked for since the page drew keeps the panel. Redraws the page, unless `redraw` is false,
+// which leaves the redraw to the caller (settleRedraw); a function draws the part the action changed in place of the
+// whole page, such as the list a tag came from. Returns whether the page can draw now: the panel shows it, no page was
+// asked for since, and no question is open on it. One still loading redraws as it draws, and one under a question once
+// the question has left.
+export function pageAnswered(key, redraw = true) {
+  answers += 1;
+  if (typeof redraw === 'function') owedParts.set(key, redraw);
+  else answeredOn.set(key, answers);
+  return settlePage(key, redraw !== false);
+}
+
+// Run `redraw`, a page's redraw after an action on it answered, as settlePage does and as a caller does when what
+// pageAction returned, given false, says the page can draw. A question opened before the redraw's read answers holds the
+// redraw. Returns what `redraw` returns.
+export function settleRedraw(redraw) {
+  const before = detailsTurn;
+  const result = redraw();
+  if (detailsTurn !== before) settling = detailsTurn;   // the redraw's read claimed the panel as it went out
+  return result;
+}
+
+// Called when the page on screen has claimed the panel to draw part of itself again from its earlier read, as the Import
+// page's preview does. The page notes the claims again, so an action's redraw still reaches it, and redraws now if an
+// action answered meanwhile.
+export function keepPage(key) {
+  if (drawn.key !== key || !showingPage(key)) return;
+  drawn.claims = detailsClaims();
+  settlePage(key);
+}
+
+// Draw what the page with this key is owed, when the panel shows it, no page was asked for since, and no question is open
+// on it: the whole page, unless `whole` is false, which leaves that to the caller, and the parts actions changed.
+// Returns whether the page could draw.
+function settlePage(key, whole = true) {
+  if (drawn.key !== key || !showingPage(key) || detailsClaims() !== drawn.claims) return false;
+  if (asking() && owes(key)) return false;
+  const redraw = owedWhole(key);
+  drawn.held = false;
+  if (!whole) return true;
+  const part = owedParts.get(key);
+  owedParts.delete(key);
+  if (redraw) settleRedraw(drawn.redraw);
+  if (part) settleRedraw(part);
+  return true;
+}
 
 // Show one page in the Details panel. The panel is a band over one scroller, #detailsBody: the page goes
 // into the body, and the band names the page, with Back and the trail. The scroll position resets only when the page or
@@ -135,16 +243,16 @@ function currentStep() {
   return shown ? S.trailAt : -1;
 }
 
-// Save trail as a note: on the event the trail started from, which may not be the one on screen.
-// It does not go through addNote, whose reload of the start event would claim the panel and draw nothing while another event
-// is shown; the page reloads only when it shows the start event.
+// Save trail as a note: on the event the trail started from, which may not be the one on screen. That event's page
+// redraws only while the panel shows it, as after any note (pageAction).
 async function saveTrail() {
   const start = S.trail[0];
   if (!start) return;
+  const done = pageAction(`event:${start.uid}`);
   try {
     const res = await post('/api/note', { uid: start.uid, text: trailText() });
     reportAction(`Saved the trail as note #${res.seq} on the ${start.short}`, res.server_ms);
-    if (S.focus === start.uid && showingPage(`event:${start.uid}`)) loadDetails(start.uid);
+    done();
   } catch (err) { setStatus(`Note failed: ${err.message}`); }
 }
 
@@ -269,7 +377,7 @@ export function parseExtra(ev) {
 }
 
 export function artifactGroup(ev, extra) {
-  const spec = ARTIFACT_DETAILS[ev.artifact];
+  const spec = lookup(ARTIFACT_DETAILS, ev.artifact);
   if (!spec || !extra) return null;
   const [title, keys] = spec;
   const show = (v) => (typeof v === 'object' ? JSON.stringify(v) : v);
@@ -319,12 +427,21 @@ export function rawFields(ev, extra) {
 
 export const LEVEL_RANK = { critical: 0, high: 1, medium: 2, low: 3, informational: 4 };
 // What a kind of event is called, as /api/meta gives it, or its artifact ID.
-export const artifactName = (id) => (S.meta?.artifact_names || {})[id] || id;
+export const artifactName = (id) => lookup(S.meta?.artifact_names, id) || id;
+
+// An event's pending suggestions as the lists rank them: Malicious, then Suspicious, then Authorized, with ties by source
+// name.
+const SUGGESTION_RANK = { malicious: 0, suspicious: 1, authorized: 2 };
+function pendingSuggestions(ev) {
+  const rank = (x) => lookup(SUGGESTION_RANK, x.value) ?? 3;
+  return ev.suggestions.filter((x) => !x.rejected)
+    .sort((a, b) => rank(a) - rank(b) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
+}
 
 // The badge of the event an Event page shows (also the menu's head): its review state with who marked it and when. An
-// unmarked event with a pending suggestion reads as one, as in the lists.
+// unmarked event with a pending suggestion reads as its most severe one, as in the lists.
 export function eventBadge(ev) {
-  const guess = ev.mark.label === 'Unreviewed' ? ev.suggestions.find((x) => !x.rejected) : null;
+  const guess = ev.mark.label === 'Unreviewed' ? pendingSuggestions(ev)[0] : null;
   return markBadge({ mark: guess ? `Suggested: ${guess.value}` : ev.mark.label, mark_who: ev.mark.who, mark_at: ev.mark.at,
                      suggest_source: guess?.source });
 }
@@ -346,7 +463,8 @@ export function eventSummary(ev) {
     let who = account || 'Unknown account';
     if (ev.source_ip) who += ` from ${ev.source_ip}${ev.source_port ? `, port ${ev.source_port}` : ''}`;
     if (ev.source_workstation && ev.source_workstation !== '-') who += ` (${ev.source_workstation})`;
-    if (ev.logon_type) who += `, ${LOGON_TYPES[ev.logon_type] ? `${LOGON_TYPES[ev.logon_type]} (${ev.logon_type})` : `logon type ${ev.logon_type}`}`;
+    const type = lookup(LOGON_TYPES, ev.logon_type);
+    if (ev.logon_type) who += `, ${type ? `${type} (${ev.logon_type})` : `logon type ${ev.logon_type}`}`;
     lines.push(who);
   }
   const registry = [ev.registry_path, ev.registry_value].filter(Boolean).join(' : ') + (ev.registry_data ? ` = ${ev.registry_data}` : '');
@@ -364,7 +482,7 @@ export function eventSummary(ev) {
 // node, or null when the event has one hit.
 export function hitChips(hits) {
   if (!hits.length) return { lead: [], rest: null };
-  const rank = (h) => LEVEL_RANK[h.level] ?? 9;
+  const rank = (h) => lookup(LEVEL_RANK, h.level) ?? 9;
   const [top, ...others] = [...hits].sort((a, b) => rank(a) - rank(b));
   const chip = (h) => el('span', { class: `chip level-${h.level}`, title: `Hayabusa ${h.level}: ${h.title}` }, `Hayabusa ${h.level}: ${h.title}`);
   const lead = [chip(top)];
@@ -410,7 +528,7 @@ export function verdictZone(ev, uid, n, chosen = null) {
   const heading = el('h3', {}, several ? `Verdict for ${n} selected events` : 'Verdict');
   const tags = tagZone(ev, uid, n);   // ATT&CK tactics and techniques, and the analyst's own tags
   const more = [...readOnlyHint()];
-  const pending = ev.suggestions.filter((x) => !x.rejected);
+  const pending = pendingSuggestions(ev);
   const decision = (x) => el('div', { class: `decision ${x.value}` },
     el('span', {}, el('span', { class: 'lead' }, 'Decision needed:'), ` ${x.source} suggests ${x.value}`),
     button(`Accept as ${markWord(x.value)}`, () => decide('accept', x.source, [uid], { note: note.value }),
@@ -439,7 +557,7 @@ export function verdictZone(ev, uid, n, chosen = null) {
   const finding = findingRow(ev, several ? [...S.selected] : [uid]);   // the findings this event is in, and + Finding
   more.push(...finding.rows);
   for (const x of ev.suggestions.filter((y) => y.rejected)) {
-    const why = (ev.rejection_notes || {})[x.source];   // the note the rejection kept
+    const why = lookup(ev.rejection_notes, x.source);   // the note the rejection kept
     more.push(el('div', { class: 'verdict-row small' }, el('span', { class: 'muted' }, `Rejected: ${x.source} suggested ${x.value}` +
                                                          (why ? `. Note: "${why.text}"` : '')),
                  button('Restore', () => decide('restore', x.source, [uid]), { class: 'quiet' })));
@@ -497,13 +615,28 @@ async function selectedEvents() {
   catch (err) { return { error: err.message, events: [] }; }
 }
 
+const readEvent = (uid, ts = null) => api(eventUrl(uid, ts)).then((res) => res.event);
+
+// The event in focus as the pages that name it read it, such as Save trail and New finding
+const focusEventOf = (uid, ev) => ({ uid, host: ev.host, recorded: ev.ts_us, adjusted: ev.adjusted_ts_us, short: eventShort(ev),
+                                     label: eventLabel(ev) });
+
+// Fill S.focusEvent for the event in focus without drawing its page or claiming the panel, as a reload that comes back
+// to another page does. A failed read leaves it empty, and the pages then say "the selected event".
+export async function fillFocusEvent(uid) {
+  let ev;
+  try { ev = await readEvent(uid); } catch (_) { return; }
+  if (S.focus === uid) S.focusEvent = focusEventOf(uid, ev);
+}
+
 export async function loadDetails(uid, ts = null) {
   const latest = claimDetails();
+  const drew = pageRead();
   const via = S.trailVia;   // set by a click on a pivot's list, or by Back: how the event opened relates to the trail
   S.trailVia = false;
   const n = S.selected.size;
   let ev, chosen;
-  try { [ev, chosen] = await Promise.all([api(eventUrl(uid, ts)).then((res) => res.event), n > 1 ? selectedEvents() : null]); }
+  try { [ev, chosen] = await Promise.all([readEvent(uid, ts), n > 1 ? selectedEvents() : null]); }
   catch (err) {
     if (latest()) setPage('event', [el('p', { class: 'pad' }, `Could not load the event: ${err.message}`)]);
     return;
@@ -517,7 +650,7 @@ export async function loadDetails(uid, ts = null) {
     S.focus = uid = ev.event_uid;
     draw();
   }
-  S.focusEvent = { uid, host: ev.host, recorded: ev.ts_us, adjusted: ev.adjusted_ts_us, short: eventShort(ev), label: eventLabel(ev) };
+  S.focusEvent = focusEventOf(uid, ev);
   trailEvent(uid, ev, via);
   setPairLink(uid, ev);   // the dashed link to its pair, when the clock check paired it with the capture
 
@@ -525,21 +658,29 @@ export async function loadDetails(uid, ts = null) {
   // identity, with the verdict and its one decision beside it; row 2 is the summary, with the other marks beside it.
   // Its left edge takes the color of the current mark. The time's hover has the recorded time and the host's own clock.
   const offsetS = ev.offset_us / 1e6;
+  const offsetText = `${offsetS > 0 ? '+' : ''}${offsetS} s`;
   const kind = eventKind(ev);
+  // A time the host's clock didn't write, such as Autoruns' PE link time, has no clock note and no local time on the
+  // host. The host's offset still moves it, so its chip names that offset, not a clock adjustment.
+  const hostClock = ev.host_clock !== false;
   // An aligned host's plain event: the clock note is the hover of the chip, or of the time when the clock needed no
   // offset, not a row. That cell takes the focus when aligning removed the button that had it (clock.js).
-  const folded = clockFolds(ev);
+  const folded = hostClock && clockFolds(ev);
   const holds = folded ? { 'data-clock': ev.clock.state, tabindex: '-1' } : {};
   const timeTitle = [folded && !offsetS ? clockHover(ev) : '', offsetS ? `Recorded ${fmtUs(ev.ts_us)} UTC` : '',
-                     hostLocalText(ev)].filter(Boolean).join('\n');
+                     hostClock ? hostLocalText(ev) : ''].filter(Boolean).join('\n');
+  const chip = !offsetS ? null
+    : hostClock ? el('span', { class: 'chip', title: `${folded ? `${clockHover(ev)}\n` : ''}Recorded ${fmtUs(ev.ts_us)} UTC`, ...holds },
+                     `${folded ? 'Aligned' : 'Clock adjusted'} ${offsetText}`)
+    : el('span', { class: 'chip', title: `Recorded ${fmtUs(ev.ts_us)} UTC\nThe offset set for ${ev.host} moves every time on ` +
+                                         `${ev.host}, this one too, though ${ev.host}'s clock didn't write it.` },
+         `Host offset ${offsetText}`);
   // The identity line starts with the badge, whose hover says who marked the event and when
   const ident = el('div', { class: 'ev-ident' }, eventBadge(ev),
     el('span', { class: 'time', ...(timeTitle ? { title: timeTitle } : {}), ...(offsetS ? {} : holds) },
        ev.adjusted_ts_us == null ? 'No time' : `${fmtUs(ev.adjusted_ts_us)} UTC`),
     el('span', { class: 'host' }, ev.host),
-    ...(offsetS ? [el('span', { class: 'chip', title: `${folded ? `${clockHover(ev)}\n` : ''}Recorded ${fmtUs(ev.ts_us)} UTC`,
-                                ...holds },
-                      `${folded ? 'Aligned' : 'Clock adjusted'} ${offsetS > 0 ? '+' : ''}${offsetS} s`)] : []),
+    ...(chip ? [chip] : []),
     el('span', { class: 'kind', title: kind }, kind));
   const hits = hitChips(ev.hits);
   const summary = eventSummary(ev).join(' · ');
@@ -550,12 +691,13 @@ export async function loadDetails(uid, ts = null) {
     // Moved by a split by recorded computer: the host folder it came from, and the split's journal entry
     ...(ev.split ? [el('div', { class: 'muted split-from' },
                        `Loaded from ${ev.split.from}, shown on ${ev.host} (split #${ev.split.seq})`)] : []),
-    ...idNotes(ev), ...(folded ? [] : clockNote(ev)), ...(hits.rest ? [hits.rest] : []), ...verdict.more,
+    ...idNotes(ev), ...(folded || !hostClock ? [] : clockNote(ev)), ...(hits.rest ? [hits.rest] : []), ...verdict.more,
   ];
 
   // Left: the evidence, most telling fields first, raw fields last.
   const account = ev.user_name ? (ev.user_domain ? `${ev.user_domain}\\${ev.user_name}` : ev.user_name) : '';
-  const logonType = ev.logon_type && LOGON_TYPES[ev.logon_type] ? `${ev.logon_type} (${LOGON_TYPES[ev.logon_type]})` : ev.logon_type;
+  const typeName = lookup(LOGON_TYPES, ev.logon_type);
+  const logonType = ev.logon_type && typeName ? `${ev.logon_type} (${typeName})` : ev.logon_type;
   const extra = parseExtra(ev);
   const vv = (field, value) => (value === '' || value == null ? null : { [field]: String(value) });   // a View value
   // An account known only by its SID, named from the host's 4624s and 4672s, says so beneath it:
@@ -600,7 +742,7 @@ export async function loadDetails(uid, ts = null) {
     // group; a search highlight inside it opens it for this page, so the match is in view
     foldGroup('Record and source', [
       ['Time meaning', timeMeaning(ev.ts_desc)],
-      ['Recorded time', offsetS ? `${fmtUs(ev.ts_us)} UTC, before the ${offsetS > 0 ? '+' : ''}${offsetS} s clock offset` : ''],
+      ['Recorded time', offsetS ? `${fmtUs(ev.ts_us)} UTC, before the ${offsetText} ${hostClock ? 'clock' : 'host'} offset` : ''],
       ['Event ID', ev.event_code, vv('code', ev.event_code)], ['Provider', ev.event_provider, vv('provider', ev.event_provider)],
       ['Channel', ev.log_channel, vv('channel', ev.log_channel)],
       ['Record ID', ev.record_id], ['Rule', ev.rule_title ? `${ev.rule_title} (${ev.rule_level})` : ''],
@@ -610,7 +752,7 @@ export async function loadDetails(uid, ts = null) {
       ['Tool', [ev.tool, ev.tool_version].filter(Boolean).join(' '), vv('tool', ev.tool)],
       ['Run', ev.run_id, vv('run', ev.run_id)], ['Artifact', ev.artifact, vv('artifact', ev.artifact)],
       ['Evidence file', ev.source_file, vv('file', ev.source_file)],
-      ['Evidence SHA-256', ev.evidence_sha256 || 'not in manifest'], ['Source record', ev.source_record],
+      citedHashRow(ev), ['Source record', ev.source_record],
       ['Event UID', ev.event_uid]], RECORD_OPEN_KEY, { openOnMark: true }),
     rawFields(ev, extra),
     el('h3', {}, 'Notes'),
@@ -646,6 +788,18 @@ export async function loadDetails(uid, ts = null) {
   ], { key: `event:${uid}`, title: `the ${ev.host} event${when}`,
        reopen: () => { S.selected = new Set([uid]); S.focus = uid; S.windowLinks = []; draw(); loadDetails(uid); } });
   renderRelated();
+  drew(`event:${uid}`, () => loadDetails(uid, ts));
+}
+
+// The Record and source fold's hash row: the intake hash the page cites (provenance.files), which for output found in the
+// evidence is the output file's, not the hash of the file the event names, so the row names its file then. With no
+// single file cited, as for a load of several output files, it points to the provenance line, which says why.
+function citedHashRow(ev) {
+  const p = ev.provenance;
+  const files = p.files ?? [ev.source_file];
+  if (p.state === 'error' || files.length !== 1) return ['Evidence SHA-256', 'see the provenance line'];
+  const label = files[0] === ev.source_file ? 'Evidence SHA-256' : `SHA-256 of ${files[0].split('/').pop()}`;
+  return [label, ev.evidence_sha256 || 'not in manifest'];
 }
 
 // Provenance in one line: the tool and run that read the event, the evidence file
@@ -691,12 +845,37 @@ async function goToStep(i) {
   S.focus = step.uid;
   S.windowLinks = [];
   draw();
+  renderBand();   // the band marks the step at once, while its page loads
   if (step.kind === 'search') { runSearch(step.term); return; }
   await loadDetails(step.uid, step.ts ?? null);
   if (step.type === 'pivot') await pivot(step.uid, step.kind, step.seconds, step.ip, step.more || {});
 }
 
-// Returns whether the mark was written, so a list keeps its ticks and note after one that failed.
+// The Event page of the event in focus, as an action noted it (pageAction): a mark, a decision, or a tag redraws it when
+// it answers only while the panel shows it and no page was asked for since. A list's mark or tag redraws the list instead.
+export const focusedPageAction = () => (S.focus ? pageAction(`event:${S.focus}`) : () => false);
+
+// The timeline and counts follow a write the server has answered: the lanes, the window's data, and the counts. The write
+// is done once its answer arrives, so a reload that fails doesn't fail it, and lanes that don't reload don't keep the
+// window's data and the counts from following. Returns the lanes error's message, or '' when the lanes reloaded. A window
+// whose data fails to load says so on the status line itself (data.loadView), which the write's line then replaces.
+export async function reloadTimeline() {
+  let failed = '';
+  try { await reloadLanes(); } catch (err) { failed = err.message; }
+  await fetchView();
+  refreshCounts();
+  return failed;
+}
+
+// The status line's last action for a write, set after the redraw so that it stays. With the message of a reload that
+// failed (reloadTimeline), it says so after what was written, and has no server time, which is the write's.
+export function reportWrite(text, ms, reloadError = '') {
+  if (reloadError) reportAction(`${text}; the timeline didn't reload: ${reloadError}`, null);
+  else reportAction(text, ms);
+}
+
+// Returns whether the mark was written, so a list keeps its ticks and note after one that failed: a mark counts as
+// written once the server has answered, whether or not the timeline then reloads.
 // A hand-picked selection above CONFIRM_ABOVE events asks first, in `host` or the page's confirm slot, and
 // the mark then carries the count the analyst confirmed.
 export async function applyMark(label, note, uids = [...S.selected], { host = null } = {}) {
@@ -707,17 +886,15 @@ export async function applyMark(label, note, uids = [...S.selected], { host = nu
     if (!await askSelection({ action, uids, cls: `mark-${label.toLowerCase()}`, host })) return false;
     consent.confirmed = { count: uids.length };
   }
-  try {
-    const res = await post('/api/mark', { uids, value: MARK_VALUE[label], note, ...consent });
-    await reloadLanes();
-    await fetchView();
-    refreshCounts();
-    // The status line's last action, with the server's time, set after the redraw so that it stays
-    const what = uids.length === 1 ? 'one event' : `${uids.length.toLocaleString()} events`;
-    reportAction(label === 'Unreviewed' ? `Set ${what} back to Unreviewed` : `Marked ${what} ${label}`, res.server_ms);
-    if (S.focus) loadDetails(S.focus);
-    return true;
-  } catch (err) { setStatus(`Mark failed: ${err.message}`); return false; }
+  const done = focusedPageAction();
+  let res;
+  try { res = await post('/api/mark', { uids, value: MARK_VALUE[label], note, ...consent }); }
+  catch (err) { setStatus(`Mark failed: ${err.message}`); return false; }
+  const reloadError = await reloadTimeline();
+  const what = uids.length === 1 ? 'one event' : `${uids.length.toLocaleString()} events`;
+  reportWrite(label === 'Unreviewed' ? `Set ${what} back to Unreviewed` : `Marked ${what} ${label}`, res.server_ms, reloadError);
+  done();
+  return true;
 }
 
 // Accept, reject, or restore one source's suggestions: for the given events, one group of the Suggestions
@@ -726,17 +903,16 @@ export async function applyMark(label, note, uids = [...S.selected], { host = nu
 // events in `uids` and the count the confirm stated in `confirmed`; the status line then says how many the server
 // skipped as decided meanwhile.
 export async function decide(decision, source, uids, { group = null, groupBy = null, fromEvent = !!uids, note = '', confirmed = null } = {}) {
-  try {
-    const body = group != null ? { decision, source, group, group_by: groupBy } : uids ? { decision, source, uids } : { decision, source };
-    if (note.trim()) body.note = note;
-    if (confirmed) body.confirmed = confirmed;
-    const res = await post('/api/suggestion', body);
-    await reloadLanes();
-    await fetchView();
-    refreshCounts();
-    const skipped = res.skipped ? `, ${res.skipped.toLocaleString()} skipped as decided meanwhile` : '';
-    reportAction(`${decision}: ${plural(res.changed, 'event')} (${source})${skipped}`, res.server_ms);   // after the redraw
-    if (fromEvent && S.focus) loadDetails(S.focus);
-    return res;
-  } catch (err) { setStatus(`Suggestion change failed: ${err.message}`); return null; }
+  const done = fromEvent ? focusedPageAction() : () => false;
+  const body = group != null ? { decision, source, group, group_by: groupBy } : uids ? { decision, source, uids } : { decision, source };
+  if (note.trim()) body.note = note;
+  if (confirmed) body.confirmed = confirmed;
+  let res;
+  try { res = await post('/api/suggestion', body); }
+  catch (err) { setStatus(`Suggestion change failed: ${err.message}`); return null; }
+  const reloadError = await reloadTimeline();
+  const skipped = res.skipped ? `, ${res.skipped.toLocaleString()} skipped as decided meanwhile` : '';
+  reportWrite(`${decision}: ${plural(res.changed, 'event')} (${source})${skipped}`, res.server_ms, reloadError);   // after the redraw
+  done();
+  return res;
 }

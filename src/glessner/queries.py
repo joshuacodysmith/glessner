@@ -156,6 +156,9 @@ FIT_KEEP = 0.1      # then takes back those within a tenth of the trimmed span, 
 # binaries with a hash for a time, from 1902 to 2037. On the Szechuan dataset they would stretch Fit case from 2013 to
 # 2020 into 1967 to 2025, so they don't set the window, and stay counted as strays.
 FIT_SETS_WINDOW = f"NOT (e.artifact = 'autoruns' AND e.ts_desc = {sql_literal(AUTORUNS_BUILT)})"
+# Times a host's clock didn't write, by artifact and time meaning: an Autoruns PE link time says when the image was built.
+# The Event page shows no clock note or local time on the host for them.
+NOT_HOST_CLOCK = {("autoruns", AUTORUNS_BUILT)}
 
 
 def fit_range(con: duckdb.DuckDBPyConnection) -> dict:
@@ -321,7 +324,8 @@ def find_event(con: duckdb.DuckDBPyConnection, uid: str, identity: Identity | No
 
 def event_details(con: duckdb.DuckDBPyConnection, uid: str, identity: Identity | None = None,
                   ts: int | None = None) -> dict | None:
-    """One event's columns, clock offset, Hayabusa hits, mark, and suggestions; `ts` as find_event takes it."""
+    """One event's columns, clock offset, whether its host's clock wrote its time, Hayabusa hits, mark, and suggestions;
+    `ts` as find_event takes it."""
     row, names = find_event(con, uid, identity, ts)
     if row is None:
         return None
@@ -329,6 +333,7 @@ def event_details(con: duckdb.DuckDBPyConnection, uid: str, identity: Identity |
     offset = con.execute("SELECT COALESCE(offset_us, 0) FROM hosts WHERE host = ?", [details["host"]]).fetchone()
     details["offset_us"] = offset[0] if offset else 0
     details["adjusted_ts_us"] = None if details["ts_us"] is None else details["ts_us"] + details["offset_us"]
+    details["host_clock"] = (details["artifact"], details["ts_desc"]) not in NOT_HOST_CLOCK
     # By the keys analysis.hit_join matches on, from this event's own values rather than a join that reads every event
     details["hits"] = event_hits(con, details)
     mark = con.execute("SELECT label, note, seq FROM marks WHERE event_uid = ?", [uid]).fetchone()
@@ -464,12 +469,16 @@ def pending_group_uids(con: duckdb.DuckDBPyConnection, source: str, group_by: st
 
 
 # The flagged events: a mark whose event is no longer loaded (analysis.orphan_marks) lists no row, so it isn't counted
-FLAGGED_FROM = "marks m JOIN events e ON e.event_uid = m.event_uid WHERE m.label IN ('Malicious', 'Suspicious')"
+FLAGGED_FROM = ("marks m JOIN events e ON e.event_uid = m.event_uid LEFT JOIN hosts h ON h.host = e.host "
+                "WHERE m.label IN ('Malicious', 'Suspicious')")
+# The worklist's order: adjusted time, an event without one last, and ties by ID so that the list keeps one order
+WORKLIST_ORDER = f"{TS} NULLS LAST, e.event_uid"
 
 
-def flagged_uids(con: duckdb.DuckDBPyConnection) -> list[str]:
-    """The IDs of the Malicious and Suspicious events that are loaded."""
-    return [uid for (uid,) in con.execute(f"SELECT m.event_uid FROM {FLAGGED_FROM}").fetchall()]
+def flagged_events(con: duckdb.DuckDBPyConnection) -> list[tuple[str, int | None, str]]:
+    """The Malicious and Suspicious events that are loaded, in the order investigate lists them, each as its ID, its
+    clock-adjusted time (None for an event without one), and its host."""
+    return con.execute(f"SELECT e.event_uid, {TS}, e.host FROM {FLAGGED_FROM} ORDER BY {WORKLIST_ORDER}").fetchall()
 
 
 def investigate(con: duckdb.DuckDBPyConnection, offset: int = 0, limit: int | None = None) -> list[dict]:
@@ -487,7 +496,7 @@ def investigate(con: duckdb.DuckDBPyConnection, offset: int = 0, limit: int | No
     cur = con.execute(f"""
         SELECT {TS} AS adjusted_ts, COALESCE(h.offset_us, 0) AS offset, m.label, m.note, e.*
         FROM events e JOIN marks m ON m.event_uid = e.event_uid LEFT JOIN hosts h ON h.host = e.host
-        WHERE m.label IN ('Malicious', 'Suspicious') ORDER BY adjusted_ts NULLS LAST, e.event_uid {window}""")
+        WHERE m.label IN ('Malicious', 'Suspicious') ORDER BY {WORKLIST_ORDER} {window}""")
     names = [d[0] for d in cur.description]
     rows = cur.fetchall()
     hits: dict[str, list[dict]] = {}

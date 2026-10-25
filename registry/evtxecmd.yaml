@@ -8,10 +8,16 @@ detect:
   version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
 handles: [evtx]
 input: host_dir
+# EvtxECmd reads only files named *.evtx in the folder it is given, while intake identifies an event log by its
+# signature, so a renamed one is an input the tool never opens. The runner notes the files a run leaves out.
+selects: ["*.evtx"]
 run:
   args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--csvf", "evtxecmd.csv"]
   timeout_minutes: 30
 options: []
 outputs: [evtxecmd.csv]
+# The event maps it reads from its Maps folder: a run records their SHA-256 and names the set by its count of maps.
+tool_files: [Maps]
+rules_label: {kind: count, path: 'Maps\*.map', text: "Maps, {value} maps"}
 parser: evtxecmd_csv
 notes: Output can quote attacker payloads that antivirus quarantines.

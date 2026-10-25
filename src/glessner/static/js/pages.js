@@ -1,11 +1,10 @@
 import { askGroupDecision, markWord } from './confirm.js';
 import { $, api, codePrefix, el, fmtAt, fmtGap, fmtUs, gapTitle, markBadge, markState, PIVOT_LABELS, plural, post, reportAction, RULE_TEMPLATE, S, setStatus } from './core.js';
-import { refreshCounts } from './counts.js';
-import { animateView, fetchView } from './data.js';
+import { animateView } from './data.js';
 import { draw } from './draw.js';
-import { applyMark, button, claimDetails, decide, loadDetails, readOnlyHint, refreshTrail, setPage, shownAt, showingPage } from './event_page.js';
+import { applyMark, button, claimDetails, decide, loadDetails, pageAction, pageRead, readOnlyHint, refreshTrail, reloadTimeline,
+         reportWrite, setPage, settleRedraw, shownAt, showingPage } from './event_page.js';
 import { filterParam } from './filters.js';
-import { reloadLanes } from './lanes.js';
 import { rowQuery } from './pivots.js';
 import { startReview } from './review.js';
 import { showSuggestions } from './suggestions.js';
@@ -26,20 +25,44 @@ let counting = null;              // the counts of the page drawn last; the next
 const countCache = new Map();     // uid and row key to count, kept while the page redraws after a tick
 const COUNT_POOL = 4;             // counts in flight at once, so the timeline's own requests still get through
 
-// The worklist's first page, and after it as many more as `rows` asks for, as when a tick draws the page again with the
-// rows that were on it
-async function readWorklist(rows) {
-  const res = await api('/api/investigate');
+const WORKLIST_READS = 3;         // the most reads of the list that one draw makes when the marked events change under them
+
+// The rows of a worklist answer that `items` doesn't list yet
+function unlisted(items, answer) {
+  const shown = new Set(items.map((item) => item.uid));
+  return answer.items.filter((item) => !shown.has(item.uid));
+}
+
+// Adds to `res.items` the pages that follow the first, up to `rows` rows. Returns false when a page names another total
+// or order than the first: the marked events changed between the requests, so an offset taken from the rows read so far
+// counts from other events.
+async function readFollowing(res, rows) {
   while (res.items.length < Math.min(rows, res.total)) {
     const more = await api(`/api/investigate?offset=${res.items.length}`);
-    if (!more.items.length) break;
-    res.items.push(...more.items);
+    if (more.total !== res.total || more.order !== res.order) return false;
+    const fresh = unlisted(res.items, more);
+    if (!fresh.length) break;
+    res.items.push(...fresh);
+  }
+  return true;
+}
+
+// The worklist's first page, and after it as many more as `rows` asks for, as when a tick draws the page again with the
+// rows that were on it. The pages are of one order: when the marked events change between the requests, the read starts
+// over, up to WORKLIST_READS reads in all. If they keep changing, the rows the last read took before the change are the
+// list, and Show the next goes on from them, or reads the list again if its order has changed since.
+async function readWorklist(rows) {
+  let res;
+  for (let read = 0; read < WORKLIST_READS; read++) {
+    res = await api('/api/investigate');
+    if (await readFollowing(res, rows)) break;
   }
   return res;
 }
 
 export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
   const latest = claimDetails();   // a page asked for after it keeps the panel
+  const drew = pageRead();
   let res;
   try { res = await readWorklist(rows); } catch (err) { setStatus(err.message); return; }
   if (!latest()) return;
@@ -50,6 +73,7 @@ export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
   const loadedAt = new Date();   // what the confirm names as when the page counted
   const items = res.items;
   const total = res.total;
+  const order = res.order;   // names the marked events' order, times, and hosts as the rows were read; an offset counts from it
   const refresh = (opts) => { if (showingPage('investigate')) showInvestigate({ ...opts, rows: items.length }); };
   const pending = res.rules.filter((r) => r.pending > 0 && !r.error);
   const matched = res.rules.filter((r) => !r.error).reduce((n, r) => n + (r.matched || 0), 0);
@@ -68,19 +92,31 @@ export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
     next.hidden = left <= 0;
     next.replaceChildren(...(left > 0 ? [button(`Show the next ${Math.min(left, res.limit).toLocaleString()}`, showNext)] : []));
   };
-  const showNext = async () => {
+  // The button is off from the click until the answer is handled: the offset counts the rows shown, so a second click
+  // would ask for the same page, and both answers would add it.
+  const showNext = async (ev) => {
+    const clicked = ev.currentTarget;
+    clicked.disabled = true;
+    try { await addNext(); } finally { clicked.disabled = false; }
+  };
+  const addNext = async () => {
     let more;
     try { more = await api(`/api/investigate?offset=${items.length}`); } catch (err) { setStatus(err.message); return; }
     if (signal.aborted || !showingPage('investigate')) return;   // the page was drawn again, or left, while the rows came
-    if (more.total !== total || !more.items.length) {
-      // The offset counts from the first marked event, so a mark added or removed since the rows shown were read moves the
-      // rows that follow them: the next page could repeat one shown or skip one, so the page reads the list again
+    const fresh = unlisted(items, more);
+    if (more.total !== total || more.order !== order || !fresh.length) {
+      // The offset counts from the first marked event in the order the rows were read in. A mark added or removed, or a
+      // host's clock offset, an alignment, or a split, since then moves the events that follow the rows shown, or changes
+      // the time or host the rows carry: the next page could repeat one shown, skip one, or put rows from after the change
+      // beside rows from before it, so the page reads the list again, unless a page was asked for meanwhile. A page with
+      // no event that isn't listed already would be asked for again at the same offset.
+      if (!onPage()) return;
       setStatus('The marked events changed since this list was read, so it is listed again.');
       refresh();
       return;
     }
-    items.push(...more.items);
-    list.append(...worklistRows(more.items, refresh));
+    items.push(...fresh);
+    list.append(...worklistRows(fresh, refresh));
     const redrawn = findOf();
     find.box.replaceWith(redrawn.box);
     find.foot.replaceWith(redrawn.foot);
@@ -89,7 +125,7 @@ export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
     followedMeter.replaceWith(newMeter);
     followedMeter = newMeter;
     offerNext();
-    askCounts(more.items, signal, onPage);
+    askCounts(fresh, signal, onPage);
   };
   offerNext();
   const nodes = [
@@ -99,13 +135,14 @@ export async function showInvestigate({ keepCounts = false, rows = 0 } = {}) {
        ...(list ? [next] : []), ...(find ? [find.foot] : [])),
     el('section', { class: 'inv-section' },
        el('div', { class: 'inv-head' }, el('h2', {}, 'Pending suggestions, by rule'), meter(decided, matched, 'decided', 'nothing suggested yet')),
-       ...(pending.length ? pending.map((r) => ruleRow(r, loadedAt, refresh))
+       ...(pending.length ? pending.map((r) => ruleRow(r, loadedAt))
          : [el('p', { class: 'muted' }, matched ? 'Every suggestion is decided.' : 'No rule or tool has suggested a mark yet.')]),
        el('p', { class: 'muted inv-foot' }, 'Review one by one opens each pending event on the Event page with Accept, Reject, and a note: ' +
           'A accepts, R rejects, N goes to the next. Accept all and Reject all ask first.')),
   ];
   setPage('investigate', nodes, { title: 'To investigate', reopen: showInvestigate });
   const onPage = claimDetails();   // setPage claims the panel for a page it draws; the counts go on while this page is on it
+  drew('investigate', () => showInvestigate({ rows: items.length }));
   if (list) {
     stickUnder(list, head);
     askCounts(items, signal, onPage);
@@ -168,12 +205,15 @@ function followedLine(item) {
   return el('div', { class: 'muted inv-followed', title }, text);
 }
 
+// The page draws again once the tick answers, or fails, so the row's line and the meter follow, unless a page was asked
+// for meanwhile. The counts have not changed, so the page keeps them.
 async function followUp(item, done, refresh) {
+  const settle = pageAction('investigate');
   try {
     const res = await post('/api/followup', { uids: [item.uid], done });
     reportAction(done ? 'Marked one event followed up' : 'Cleared Followed up on one event', res.server_ms);
-    refresh({ keepCounts: true });   // the counts have not changed; the row's line and the meter have
-  } catch (err) { setStatus(`Follow-up failed: ${err.message}`); refresh({ keepCounts: true }); }
+  } catch (err) { setStatus(`Follow-up failed: ${err.message}`); }
+  if (settle(false)) settleRedraw(() => refresh({ keepCounts: true }));
 }
 
 // One count beside an event: its pivot's label, then "…" until counted, a blue count that opens the list, or 0 as text
@@ -227,14 +267,15 @@ async function openCount(item, row) {
 
 // One suggestion source with pending suggestions: its name (a link to its Suggestions page), who added it, why it fired,
 // its progress, and its actions. Accept all and Reject all ask first, in the row.
-function ruleRow(r, loadedAt, refresh) {
+function ruleRow(r, loadedAt) {
   const row = el('div', { class: 'rule', 'data-source': r.id });
   const act = async (decision) => {
     const uids = await askGroupDecision({ decision, source: r.id, value: r.suggest, uids: r.uids || [], total: r.pending, listed: 0,
                                           first: r.first || [], loadedAt, showAll: () => showSuggestions(r.id, '', r.pending), host: row });
     if (!uids) return;
+    const settle = pageAction('investigate');
     await decide(decision, r.id, uids, { confirmed: { count: uids.length }, fromEvent: false });
-    refresh();   // the page then lists what is left, unless another page was asked for meanwhile
+    settle();   // the page then lists what is left, unless another page was asked for meanwhile
   };
   const done = (r.matched || 0) - r.pending;
   const description = String(r.description || '').split(/\s+/).join(' ');
@@ -255,39 +296,35 @@ function ruleRow(r, loadedAt, refresh) {
   return row;
 }
 
+const RULE_WRITTEN = { add: 'Added the rule', change: 'Saved the rule', remove: 'Removed the rule' };
+
 export async function showRules() {
   const latest = claimDetails();
+  const drew = pageRead();
   let res;
   try { res = await api('/api/rules'); } catch (err) { setStatus(err.message); return; }
   if (!latest()) return;
   const editor = el('textarea', { rows: '9', cols: '90', spellcheck: 'false' });
   editor.value = RULE_TEMPLATE;
   const message = el('p', { class: 'muted' });
-  const save = async (op) => {
-    try {
-      await post('/api/rule', { op, text: editor.value });
-      await reloadLanes();
-      await fetchView();
-      if (showingPage('rules')) showRules();   // not over a page asked for meanwhile
-      refreshCounts();
-    }
-    catch (err) { message.textContent = err.message; }
+  // A rule added, changed, or removed: the timeline and counts follow, and the page redraws, not over a page asked for
+  // meanwhile. The rule is written once the server has answered, so a timeline that doesn't reload is said on the status
+  // line, and the page still redraws.
+  const write = async (body) => {
+    const done = pageAction('rules');
+    try { await post('/api/rule', body); } catch (err) { message.textContent = err.message; return; }
+    const reloadError = await reloadTimeline();
+    done();
+    if (reloadError) reportWrite(RULE_WRITTEN[body.op], null, reloadError);
   };
+  const save = (op) => write({ op, text: editor.value });
   const rows = res.rules.map((r) => el('tr', {},
     el('td', {}, r.id), el('td', {}, r.error ? `Error: ${r.error}` : `suggests ${r.suggest}`),
     el('td', {}, `${r.matched.toLocaleString()} matched, ${r.pending.toLocaleString()} pending`),
     el('td', {}, r.builtin ? 'built-in' : `added by ${r.who}`),
     el('td', {}, ...(r.editable ? [
       el('button', { type: 'button', onclick: () => { editor.value = r.text; } }, 'Edit'), ' ',
-      el('button', { type: 'button', onclick: async () => {
-        try {
-          await post('/api/rule', { op: 'remove', id: r.id });
-          await reloadLanes();
-          await fetchView();
-          if (showingPage('rules')) showRules();
-          refreshCounts();
-        }
-        catch (err) { message.textContent = err.message; } } }, 'Remove')] : []))));
+      el('button', { type: 'button', onclick: () => write({ op: 'remove', id: r.id }) }, 'Remove')] : []))));
   setPage('rules', [
     el('h2', {}, 'Suggestion rules'),
     el('p', { class: 'muted' }, 'Rules suggest a mark; you accept or reject each suggestion. Fields: any event column, ' +
@@ -298,11 +335,13 @@ export async function showRules() {
        el('button', { type: 'button', onclick: () => save('add') }, 'Add rule'),
        el('button', { type: 'button', onclick: () => save('change') }, 'Save changes to existing rule')),
     message], { title: 'Rules', reopen: showRules });
+  drew('rules', showRules);
 }
 
 export async function addNote(uid, text) {
   if (!text.trim()) return;
-  try { await post('/api/note', { uid, text }); loadDetails(uid); } catch (err) { setStatus(`Note failed: ${err.message}`); }
+  const done = pageAction(`event:${uid}`);
+  try { await post('/api/note', { uid, text }); done(); } catch (err) { setStatus(`Note failed: ${err.message}`); }
 }
 
 // A pivot draws only if it is the latest asked and the panel still shows its event's page: one that answers after the
@@ -419,6 +458,16 @@ function reachLine(kind, res, more, seconds) {
     `not the whole ±${seconds} s window. For the rest, ${rest}. Hover an offset for the exact seconds.`);
 }
 
+// Whether the panel shows the Event page of pivot `p`'s event with the list `p` asked for: the same kind, window, and
+// address, narrowed the same way (to a source, the case-wide scope, a fixed name, or unreviewed events). The label and
+// the row the pivot was taken from aren't part of it.
+function listShown(p) {
+  const now = S.pivotResult;
+  if (!now || S.focus !== p.uid || !showingPage(`event:${p.uid}`)) return false;
+  return ['uid', 'kind', 'seconds', 'ip'].every((k) => (now[k] ?? null) === (p[k] ?? null))
+    && ['source', 'scope', 'name', 'unreviewed'].every((k) => (now.more?.[k] ?? null) === (p.more?.[k] ?? null));
+}
+
 export function renderRelated() {
   const box = $('relatedList');
   const p = S.pivotResult;
@@ -438,8 +487,11 @@ export function renderRelated() {
   // The find box is kept by the pivot, so a new pivot on the page starts it empty; a cut list says how far it reaches
   const find = { page: `event:${uid}`, name: `pivot:${JSON.stringify([kind, seconds, ip, more])}`, covers: 'The heading still covers',
                  listed: res.limited ? res.events.length : null, total: res.total ?? null, more: 'events' };
-  const { buttons, list, find: found } = markableList(res.events, checked, renderRelated, () => pivot(uid, kind, seconds, ip, more, true),
-                                                      { column, via: true, find });
+  // After a mark or a tag, the list is read again only while its Event page still shows it: a pivot taken in its place,
+  // or the list cleared, while the change was out stays as the analyst left it
+  const again = async () => { if (listShown(p)) await pivot(uid, kind, seconds, ip, more, true); };
+  const { buttons, list, find: found } = markableList(res.events, checked, renderRelated, again,
+                                                      { column, via: true, find, afterTag: again });
   const hidden = S.viewSpec ? res.events.filter((e) => !e.shown).length : 0;
   const value = pivotValue(kind, res);
   const header = el('div', { class: 'actions sticky-head' },   // fixed at the list's top while it scrolls
@@ -613,7 +665,9 @@ export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-
 // grid: tick, review-state badge, time, offset, host, and the event, then the `column`, as { head, value(e) }, at the
 // right with a heading row, such as which end an address was on. The
 // heading row is the list's first row and sticks under its head (see stickUnder). `rerender` redraws the list after a
-// tick; `afterMark` refreshes it after marks are written. `label(e)` gives the nodes of the event cell and `highlight(text)`
+// tick; `afterMark` refreshes it after marks are written, given a function that redraws the page the list is on unless a
+// page has been asked for since (pageAction's), and `afterTag` after a tag from its Tag button, by the same rule (applyTags
+// in tags.js). `label(e)` gives the nodes of the event cell and `highlight(text)`
 // those of the host cell, which search uses to mark its terms. `offsets` false leaves out the offset column, as a search,
 // which has no event to measure from; left out, it is drawn when a row has a gap. `via` is true for the lists of a pivot's
 // trail, a pivot's own and a search run from the trail: an event opened from one continues the trail. The list a count opened
@@ -622,19 +676,21 @@ export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-
 // buttons, and the head says how many ticked rows the find hides.
 export function markableList(events, checked, rerender, afterMark, { label = null, column = null, hiddenTag = 'hidden',
                                                                       highlight = (t) => [t], offsets = null, via = false,
-                                                                      find = null } = {}) {
+                                                                      find = null, afterTag = null } = {}) {
   const all = events.length > 0 && events.every((e) => checked.has(e.uid));   // not by count: another list may share the ticks
-  const note = el('input', { type: 'text', class: 'mark-note', 'aria-label': 'Note for the mark',
-                             placeholder: checked.size ? `Note for marking ${plural(checked.size, 'event')} (optional)`
-                                                       : 'Note for the mark (optional)' });
+  // The placeholder is the box's only visible label, and a crowded row shrinks the box to its minimum width, so it is
+  // short with any number ticked; the count the note goes with is in the box's hover and name, as on the Event page.
+  const noteFor = checked.size ? `Note for marking ${plural(checked.size, 'event')} (optional)` : 'Note for the mark (optional)';
+  const note = el('input', { type: 'text', class: 'mark-note', placeholder: 'Note (optional)', title: noteFor, 'aria-label': noteFor });
   note.value = listNotes.get(checked) || '';
   note.addEventListener('input', () => listNotes.set(checked, note.value));
   const markChecked = async (label) => {
     if (!checked.size) { setStatus('Tick the events to mark first.'); return; }
+    const done = pageAction($('details').dataset.key);   // the page the list is on
     if (!await applyMark(label, note.value, [...checked])) return;   // the ticks and the note stay for another try
     checked.clear();
     listNotes.delete(checked);
-    await afterMark();
+    await afterMark(done);
   };
   let shown = null;   // the uids the find shows, or null with no find
   const everyShownTicked = () => shown.size > 0 && [...shown].every((uid) => checked.has(uid));
@@ -659,7 +715,7 @@ export function markableList(events, checked, rerender, afterMark, { label = nul
     button(checked.size ? `Tag ${checked.size} as...` : 'Tag as...', (e) => {
       if (!checked.size) { setStatus('Tick the events to tag first.'); return; }
       const r = e.currentTarget.getBoundingClientRect();
-      openTagPicker([...checked], r.left, r.bottom + 2);
+      openTagPicker([...checked], r.left, r.bottom + 2, new Set(), { after: afterTag });
     })];
   const withOffset = offsets ?? events.some((e) => e.gap_s != null);
   // The heading row has no tick box: "Mark" spans the tick's column and the badge's, so it lines up with both

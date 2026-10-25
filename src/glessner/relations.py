@@ -2,8 +2,11 @@
 
 4624 type 3 and type 10 logons draw from the logon's source to the host that recorded it. The
 source resolves by IP first, because a 4624's WorkstationName is unreliable: type 10 logons
-often record the target's own name there, and Kerberos network logons leave it blank. 4648
-(explicit credentials) draws from the host that recorded it to its TargetServerName.
+often record the target's own name there, and Kerberos network logons leave it blank. The name is read only when the
+logon records no address, or one that isn't a real source (loopback, link-local, or unspecified, as is_remote says) and
+resolves to no host. A real address never falls back to the name, so a logon from outside the case that records the
+target's name, or any other, stays an outside source. 4648 (explicit credentials) draws from the host that recorded it
+to its TargetServerName.
 
 Every logon in the case is resolved once per host identity's lookup of names and addresses, into the derived table
 logon_links. The timeline reads a window's links from it with their clock-adjusted times and lanes (queries.view_links),
@@ -25,7 +28,10 @@ from .identity import Identity
 # The logons that can draw a link, from EvtxECmd or the event XML reader. One without a time is on no timeline.
 LOGON_WHERE = ("e.artifact = 'evtx' AND e.ts_us IS NOT NULL "
                "AND ((e.event_code = '4624' AND e.logon_type IN ('3', '10')) OR e.event_code = '4648')")
-LINKS_SQL = """
+# A 4624 from logon_rows `r`, joined to its address in logon_ips `i`, whose source resolves by its WorkstationName: it
+# has no address, or one that isn't a real source and names no host.
+NAME_FALLBACK = "(r.source_ip = '' OR (NOT i.remote AND i.host IS NULL))"
+LINKS_SQL = f"""
     CREATE OR REPLACE TABLE logon_links AS
     WITH r AS (
         SELECT *, CASE WHEN user_domain <> '' THEN user_domain || '\\' || user_name ELSE user_name END AS account,
@@ -37,14 +43,15 @@ LINKS_SQL = """
                '4648 explicit credentials' AS kind, 'recorded host' AS via, r.ts_us
         FROM r JOIN logon_names n ON n.name = r.target_server
         WHERE r.event_code = '4648' AND n.host <> r.host),
-    -- 4624: from its source, by IP first and by WorkstationName when there's none; a source outside the case is its IP,
-    -- when that's a real address. A host logging on to itself draws nothing.
+    -- 4624: from its source, by IP first, and by WorkstationName when there's no IP or one that isn't a real address
+    -- and resolves to no host; a source outside the case is its IP, when that's a real address. A host logging on to
+    -- itself draws nothing.
     logons AS (
         SELECT r.event_uid, COALESCE(i.host, n.host, r.source_ip) AS source_host, r.host AS target_host,
                i.host IS NULL AND n.host IS NULL AS outside, r.account, r.machine, '4624 type ' || r.logon_type AS kind,
-               CASE WHEN r.source_ip <> '' THEN 'ip' ELSE 'name' END AS via, r.ts_us
+               CASE WHEN n.host IS NOT NULL THEN 'name' ELSE 'ip' END AS via, r.ts_us
         FROM r LEFT JOIN logon_ips i ON i.ip = r.source_ip
-             LEFT JOIN logon_names n ON r.source_ip = '' AND n.name = r.source_workstation
+             LEFT JOIN logon_names n ON n.name = r.source_workstation AND {NAME_FALLBACK}
         WHERE r.event_code = '4624' AND (i.host IS NOT NULL OR n.host IS NOT NULL OR i.remote)
           AND COALESCE(i.host, n.host, '') <> r.host)
     SELECT * FROM explicit UNION ALL SELECT * FROM logons"""
@@ -74,11 +81,12 @@ def build_logon_links(con: duckdb.DuckDBPyConnection, identity: Identity, cache:
         FROM events e WHERE {LOGON_WHERE}""")
     ips = [ip for (ip,) in con.execute(
         "SELECT DISTINCT source_ip FROM logon_rows WHERE event_code = '4624' AND source_ip <> ''").fetchall()]
-    names = [name for (name,) in con.execute(
-        "SELECT source_workstation FROM logon_rows WHERE event_code = '4624' AND source_ip = '' "
-        "UNION SELECT target_server FROM logon_rows WHERE target_server IS NOT NULL").fetchall()]
     con.execute("CREATE OR REPLACE TEMP TABLE logon_ips (ip VARCHAR, host VARCHAR, remote BOOLEAN)")
     insert_columns(con, "logon_ips", ips, map(identity.resolve_ip, ips), map(is_remote, ips))
+    names = [name for (name,) in con.execute(
+        "SELECT r.source_workstation FROM logon_rows r LEFT JOIN logon_ips i ON i.ip = r.source_ip "
+        f"WHERE r.event_code = '4624' AND {NAME_FALLBACK} "
+        "UNION SELECT target_server FROM logon_rows WHERE target_server IS NOT NULL").fetchall()]
     con.execute("CREATE OR REPLACE TEMP TABLE logon_names (name VARCHAR, host VARCHAR)")
     insert_columns(con, "logon_names", names, map(identity.resolve_name, names))
     con.execute(LINKS_SQL)

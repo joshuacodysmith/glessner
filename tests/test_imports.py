@@ -4,9 +4,10 @@ import json
 
 import duckdb
 import pytest
+from chain_fixtures import format3_case
 from conftest import nested_list
 
-from glessner.case import create_case
+from glessner.case import create_case, open_case
 from glessner.events import connect
 from glessner.imports import (
     MappingError,
@@ -22,6 +23,7 @@ from glessner.imports import (
     sniff,
 )
 from glessner.intake import add_new, intake, read_manifest, sha256_file
+from glessner.rekey import upgraded
 from glessner.runner import read_runs, rebuild
 from glessner.timezones import ZoneClock, ZoneError, parse_time, resolve_zone
 
@@ -487,3 +489,22 @@ def test_an_import_that_commits_and_then_fails_its_check_refreshes_the_case(tmp_
         assert api_search(app, {"q": ["hello"]})["total"] == 1
     finally:
         app.con.close()
+
+
+def test_an_import_records_the_lines_that_were_not_records_once_the_case_is_at_format_4(case):
+    """alerts.jsonl holds one line that isn't JSON. A case below format 4 keeps run.json in the shape the builds of its
+    format read, so an import or a rebuild there records no count; at format 4 a rebuild records it for the import made
+    before, and a new import records its own, 0 for a file whose every line is a record."""
+    below = format3_case(case)
+    mapping = guess_mapping(sniff(below, "SIEM/alerts.jsonl"))
+    alerts = run_import(below, "SIEM/alerts.jsonl", mapping, zones={})
+    assert (alerts.status, alerts.loaded_rows, alerts.rows_skipped) == ("ok", 2, None)
+    rebuild(below)
+    saved = lambda record: json.loads((case.runs_folder / record.run_id / "run.json").read_text(encoding="utf-8"))
+    assert not {"tool_files", "rows_skipped", "tool_check"} & set(saved(alerts))
+    at_4 = upgraded(open_case(case.folder))
+    assert at_4.settings.case_format == 4
+    rebuild(at_4)
+    assert saved(alerts)["rows_skipped"] == 1 and "tool_files" not in saved(alerts)
+    forti = run_import(at_4, "FIREWALL/fortigate.log", {"preset": "fortinet"}, zones={})
+    assert (forti.status, forti.rows_skipped, saved(forti)["rows_skipped"]) == ("ok", 0, 0)

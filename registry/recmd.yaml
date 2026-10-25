@@ -15,5 +15,9 @@ run:
   timeout_minutes: 60
 options: []
 outputs: [recmd.csv]
+# The plugins it loads from its Plugins folder: a run records their SHA-256, with the batch file its arguments name, and
+# names the set by the batch file's version.
+tool_files: [Plugins]
+rules_label: {kind: version_line, path: 'BatchExamples\DFIRBatch.reb', text: "DFIRBatch.reb {value}"}
 parser: recmd_csv
 notes: ""

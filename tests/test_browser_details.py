@@ -9,13 +9,27 @@ from conftest import SEC, T0, WS_LOG, logon
 from test_browser_design import computed, near, open_event, token
 from test_browser_frame import no_tool_scan, paint
 from test_browser_pivots import COUNTED, INSTALL, pv, select, uid, walk
-from test_browser_smoke import browser, case_menu, clock_page, event_point, page, served_page, to_timeline  # noqa: F401
+from test_browser_smoke import (  # noqa: F401
+    RECORD_REQUESTS,
+    browser,
+    case_menu,
+    clock_page,
+    event_point,
+    page,
+    served_page,
+    to_timeline,
+)
 from test_clock import accepted, flow
+from test_found_output_sources import FOUND, KAPE, OTHER_HOST, SYSTEM_LOG, evtxecmd_run, found_case
+from test_found_output_sources import load as load_found
 from test_pivots import RDP, load_events, pcase, pcase_events  # noqa: F401
+from test_timezones import add_zone
 
 from glessner.events import Event, load
-from glessner.intake import intake
-from glessner.server import api_mark
+from glessner.imports import run_import
+from glessner.intake import intake, manifest_hashes
+from glessner.parsers.autoruns import BUILT
+from glessner.server import api_mark, api_rule
 
 pytestmark = pytest.mark.browser
 READY = "() => window.__ready === true && window.__app.S.data !== null"
@@ -727,3 +741,203 @@ def test_a_long_case_name_and_state_keep_the_case_panel_on_one_row(browser, synt
             p.wait_for_timeout(100)
             assert box(p, "header")["height"] <= 50, (size, box(p, "header"))
         assert p.locator("#caseName").evaluate("(n) => n.scrollWidth > n.clientWidth")   # cut, so the ellipsis shows
+
+
+# The page's own badge and verdict zone for an unreviewed event with these suggestions: the badge's hover, and each
+# pending decision's words, the one beside the identity first.
+DECISIONS = """async (suggestions) => {
+    const page = await import('/js/event_page.js');
+    const ev = { mark: { label: 'Unreviewed' }, suggestions, tags: [], tag_suggestions: [], findings: [],
+                 rejection_notes: {} };
+    const { zone, more } = page.verdictZone(ev, 'x', 1);
+    const decisions = [...zone.querySelectorAll('.decision'), ...more.filter((n) => n.matches?.('.decision'))];
+    return { badge: page.eventBadge(ev).title, decisions: decisions.map((d) => d.querySelector('span').textContent) };
+}"""
+
+
+def test_the_badge_and_the_first_decision_are_the_most_severe_pending_suggestion(browser, synthetic_case):  # noqa: F811
+    """An event with several pending suggestions reads as its most severe one, as the lists read it: Malicious, then
+    Suspicious, then Authorized, with ties by source name. The verdict zone puts that decision beside the identity and the
+    others below it in the same order. A rule named before Hayabusa that suggests Authorized doesn't come first on a
+    real Event page."""
+    def rule(app):
+        api_rule(app, {"op": "add", "text": "id: admin_tools\nsuggest: authorized\nwhen: {field: event_code, equals: '4624'}\n"})
+
+    for p in served_page(browser, synthetic_case, setup=rule):
+        two = p.evaluate(DECISIONS, [{"value": "authorized", "source": "admin_tools", "rejected": False},
+                                     {"value": "suspicious", "source": "hayabusa", "rejected": False}])
+        assert two == {"badge": "Unreviewed, with a pending Suspicious suggestion from hayabusa",
+                       "decisions": ["Decision needed: hayabusa suggests suspicious",
+                                     "Decision needed: admin_tools suggests authorized"]}
+        many = p.evaluate(DECISIONS, [{"value": "authorized", "source": "a_rule", "rejected": False},
+                                      {"value": "suspicious", "source": "z_rule", "rejected": False},
+                                      {"value": "malicious", "source": "b_rule", "rejected": True},
+                                      {"value": "suspicious", "source": "m_rule", "rejected": False},
+                                      {"value": "malicious", "source": "q_rule", "rejected": False}])
+        assert many["badge"] == "Unreviewed, with a pending Malicious suggestion from q_rule"
+        assert [d.split(": ")[1].split()[0] for d in many["decisions"]] == ["q_rule", "m_rule", "z_rule", "a_rule"]
+        rdp = p.evaluate("() => window.__app.S.data.events.find((e) => e.code === '4624' && e.hit >= 3).uid")
+        p.evaluate("(u) => window.__app.select(u, false)", rdp)
+        line = p.locator(f"#details[data-key='event:{rdp}'] .verdict-line")
+        line.wait_for()
+        assert p.locator("#details .ev-ident .badge").get_attribute("title") == (
+            "Unreviewed, with a pending Suspicious suggestion from hayabusa")
+        assert line.locator(".decision > span").inner_text() == "Decision needed: hayabusa suggests suspicious"
+        assert p.locator("#details .ev-head-more .decision > span").inner_text() == (
+            "Decision needed: admin_tools suggests authorized")
+
+
+# The page's own reads of its tables for values named after a property every object has, constructor and __proto__: an
+# artifact's name and fields, an event log record's logon type, a Hayabusa level, and a rejected suggestion's source
+# with no note
+ODD_KEYS = """async () => {
+    const page = await import('/js/event_page.js');
+    return ['constructor', '__proto__'].map((key) => {
+        const logon = { artifact: 'evtx', message: 'An account was successfully logged on', user_name: 'admin',
+                        logon_type: key };
+        const hits = page.hitChips([{ level: key, title: 'odd' }, { level: 'high', title: 'known' }]);
+        const ev = { mark: { label: 'Unreviewed' }, suggestions: [{ value: 'suspicious', source: key, rejected: true }],
+                     tags: [], tag_suggestions: [], findings: [], rejection_notes: {} };
+        const rejected = page.verdictZone(ev, 'x', 1).more.map((n) => n.querySelector?.('span.muted')?.textContent || '')
+          .filter((t) => t.startsWith('Rejected'));
+        return { summary: page.eventSummary(logon), lead: hits.lead[0].textContent, rejected, name: page.artifactName(key),
+                 group: page.artifactGroup({ artifact: key }, {}) };
+    });
+}"""
+
+
+def test_an_event_whose_values_name_a_built_in_property_reads_as_written(browser, synthetic_case):  # noqa: F811
+    """An import whose artifact is named constructor, with a logon type of constructor, opens on an Event page that
+    reads both as written, rather than as a property every JavaScript object has. So do an artifact's name, an event log
+    record's logon type, a Hayabusa level, and a rejected suggestion's source named constructor or __proto__."""
+    (synthetic_case.evidence / "DC01" / "odd.csv").write_text(
+        "Time,LogonType,Message\n2020-09-19T03:25:00Z,constructor,an odd logon\n", encoding="utf-8", newline="")
+    intake(synthetic_case)
+    mapping = {"format": "csv", "delimiter": ",", "header": True, "artifact": "constructor",
+               "time": {"columns": ["Time"], "format": "ymd", "zone": "UTC"},
+               "fields": {"logon_type": "LogonType", "message": "Message"}, "host": {"from": "folder"},
+               "message": "{Message}", "ignore": []}
+    record = run_import(synthetic_case, "DC01/odd.csv", mapping, zones={})
+    assert record.status == "ok", record.reason
+    found = {}
+    setup = lambda app: found.update(uid=app.con.execute(
+        "SELECT event_uid FROM events WHERE artifact = 'constructor'").fetchone()[0])
+    for p in served_page(browser, synthetic_case, setup=setup):
+        assert p.evaluate(ODD_KEYS) == [{"summary": [f"admin, logon type {key}"], "lead": "Hayabusa high: known",
+                                         "rejected": [f"Rejected: {key} suggested suspicious"], "name": key, "group": None}
+                                        for key in ("constructor", "__proto__")]
+        p.evaluate(RECORD_REQUESTS)
+        p.evaluate("(u) => window.__app.select(u, false)", found["uid"])
+        p.wait_for_function("() => window.__taken.some((path) => path.startsWith('/api/event?'))")
+        assert p.errors == []
+        head = p.locator(f"#details[data-key='event:{found['uid']}'] .ev-ident")
+        assert head.locator(".kind").inner_text().startswith("constructor")
+        logon_type = p.locator("#details .ev-facts dt", has_text="Logon type").locator("xpath=following-sibling::dd[1]")
+        assert logon_type.evaluate("(dd) => dd.firstChild.textContent") == "constructor"
+        assert p.evaluate("window.__app.S.focusEvent.label") == "constructor on DC01"
+
+
+# Whether a text box shows its whole placeholder: as drawn, and at the narrowest width the page lets it shrink to
+PLACEHOLDER_FITS = "(i) => { i.value = i.placeholder; const fits = i.scrollWidth <= i.clientWidth; i.value = ''; return fits; }"
+NARROWEST_FITS = f"""(i) => {{
+    const style = i.style.cssText;
+    i.style.flex = 'none';
+    i.style.width = getComputedStyle(i).minWidth;
+    const fits = ({PLACEHOLDER_FITS})(i);
+    i.style.cssText = style;
+    return fits;
+}}"""
+
+
+def test_a_list_note_box_shows_its_whole_placeholder(browser, synthetic_case):  # noqa: F811
+    """A list's note box beside its mark buttons is labeled by its placeholder until a row is ticked. On a search's list
+    at 1400 by 900, with matches the View hides and so a button to show them, the row is crowded and the box shrinks;
+    a find on the list changes Select all to "Select the N shown". The box shows its whole placeholder either way, and
+    would at the narrowest the page lets it shrink to."""
+    for p in served_page(browser, synthetic_case):
+        p.evaluate("() => import('/js/view.js').then((m) => m.addViewValue({ host: 'DC01' }))")
+        p.wait_for_function("() => window.__app.S.filterId !== null && !window.__app.S.windowPending")
+        p.locator("#search").fill("code:4624")
+        p.locator("#search").press("Enter")
+        p.locator("#searchShowHidden").wait_for()
+        head = p.locator("#details[data-page='search'] .sticky-head")
+        note = head.locator(".mark-note")
+        assert note.get_attribute("placeholder").startswith("Note")
+        assert note.evaluate(PLACEHOLDER_FITS)
+        head.locator(".find input").fill("DC01")
+        head.locator("button", has_text=re.compile(r"^Select the \d+ shown$")).wait_for()
+        assert note.evaluate(PLACEHOLDER_FITS)
+        assert note.evaluate(NARROWEST_FITS)
+
+
+PE_BUILT = 1_200_000_000 * SEC   # 2008-01-10 21:20:00 UTC
+
+
+@pytest.fixture
+def pe_time(synthetic_case):
+    """An Autoruns entry on DC01 dated by its image's PE link time, and DC01's time zone, in the case before clock_page
+    serves it."""
+    image = "C:\\Windows\\System32\\coreupdater.exe"
+    entry = Event(ts_us=PE_BUILT, ts_desc=BUILT, artifact="autoruns", source_file="DC01/autoruns.csv", source_record="5",
+                  message=f"Services: coreupdater | {image}", file_path=image,
+                  extra={"Category": "Services", "Entry": "coreupdater", "Image Path": image})
+    load(synthetic_case.db_path, [entry], host="DC01", tool="autoruns", tool_version="t", run_id="pe", replaces_sources=[],
+         staging_dir=synthetic_case.folder)
+    add_zone(synthetic_case, "DC01", 1, {"TimeZoneKeyName": "Pacific Standard Time", "Bias": "480"})
+
+
+@pytest.mark.usefixtures("pe_time")
+def test_a_time_the_hosts_clock_did_not_write_has_no_clock_note_or_local_time(clock_page):  # noqa: F811
+    """An Autoruns PE link time says when the image was built, not anything DC01's clock wrote, so its header has no clock
+    note and no local time on DC01, while an event log record on DC01 has both. An offset typed for DC01 still moves the
+    time, and the chip says so, with the recorded time in its hover; the Recorded time row calls it the host's offset.
+    Raw fields don't list the server's flag for such a time."""
+    p = clock_page
+    pe = p.hub.app.con.execute("SELECT event_uid FROM events WHERE artifact = 'autoruns'").fetchone()[0]
+    select(p, p.evaluate(PLAIN_DC01))
+    assert p.locator("#details .ev-clock").count() == 1
+    assert "Local time on DC01" in p.locator("#details .ev-ident .time").get_attribute("title")
+    p.evaluate("(u) => window.__app.select(u, false)", pe)
+    ident = p.locator(f"#details[data-key='event:{pe}'] .ev-ident")
+    ident.wait_for()
+    assert p.locator("#details .ev-clock").count() == 0
+    assert "Local time on" not in (ident.locator(".time").get_attribute("title") or "")
+    assert ident.locator(".chip").count() == 0
+    case_menu(p, "hostsButton")
+    offset = p.locator("#hostsTable tr[data-host='DC01'] input[type=number]")
+    offset.fill("86400")
+    offset.dispatch_event("change")
+    p.wait_for_function("() => window.__app.S.meta.hosts.find((h) => h.host === 'DC01').offset_seconds === 86400")
+    p.evaluate("(u) => window.__app.select(u, false)", pe)
+    p.locator("#details .ev-ident .time", has_text="2008-01-11 21:20:00.000000 UTC").wait_for()
+    chip = p.locator("#details .ev-ident .chip")
+    assert chip.inner_text() == "Host offset +86400 s"
+    assert "Recorded 2008-01-10 21:20:00.000000 UTC" in chip.get_attribute("title")
+    assert "Local time on" not in (p.locator("#details .ev-ident .time").get_attribute("title") or "")
+    assert p.locator("#details .ev-clock").count() == 0
+    recorded = p.locator("#details dt", has_text=re.compile(r"^Recorded time$")).locator("xpath=following-sibling::dd[1]")
+    assert recorded.evaluate("(dd) => dd.textContent") == "2008-01-10 21:20:00.000000 UTC, before the +86400 s host offset"
+    assert p.locator("#details dt", has_text=re.compile(r"^host_clock$")).count() == 0   # not one of Raw fields
+
+
+FOLD_HASH = """() => [...document.querySelectorAll('#details .ev-facts dt')].filter((dt) => dt.textContent.includes('SHA-256'))
+    .map((dt) => [dt.textContent, dt.nextElementSibling.textContent])"""   # the Record and source fold's hash row
+
+
+def test_the_record_fold_names_the_file_whose_hash_it_cites(browser, tmp_path):  # noqa: F811
+    """An event of output found in the evidence names a file its load never read. The Record and source fold gives the
+    hash of the output file its run read, under that file's name, and when the run read several output files, it points
+    to the provenance line. An event of a tool's run gives its own evidence file's hash as Evidence SHA-256."""
+    case = found_case(tmp_path)
+    runs = {"tool": evtxecmd_run(case), "one": load_found(case, "WS02", OTHER_HOST[0]),
+            "several": load_found(case, "WS01", FOUND, KAPE)}
+    hashes = manifest_hashes(case)
+    expected = {"tool": ["Evidence SHA-256", hashes[SYSTEM_LOG]],
+                "one": ["SHA-256 of 20240514_EvtxECmd_Output.csv", hashes[OTHER_HOST[0]]],
+                "several": ["Evidence SHA-256", "see the provenance line"]}
+    events = {name: uid(case, f"run_id = '{record.run_id}'") for name, record in runs.items()}
+    for p in served_page(browser, case):
+        for name, event in events.items():
+            select(p, event)
+            p.wait_for_selector(f"#details[data-key='event:{event}'] .ev-facts")
+            assert p.evaluate(FOLD_HASH) == [expected[name]], name

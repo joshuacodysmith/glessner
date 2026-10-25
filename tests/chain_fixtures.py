@@ -1,5 +1,6 @@
 """Synthetic chained journals for the journal chain tests: lines that name the line before them, written as the
-journal writes them, so a test can change one byte and see the break."""
+journal writes them, so a test can change one byte and see the break. Also cases set back to an older format, as an
+older build made or left them."""
 
 import hashlib
 import json
@@ -7,9 +8,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
-from glessner.journal import ZERO, line_bytes
+from glessner import case as case_module
+from glessner import journal as journal_module
+from glessner.case import Case, open_case
+from glessner.journal import ZERO, Journal, line_bytes, start_chain
+from glessner.server import App
 
 AT = "2026-10-17T02:14:09.118204Z"
 BUILD = "0.2.0+1a2b3c4"
@@ -107,6 +113,29 @@ def as_format(folder: Path, value: int, journal: bytes = b"") -> None:
     (folder / "case.yaml").write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     (folder / "journal.jsonl").write_bytes(journal)
     forget(folder)
+
+
+def format3_case(case: Case) -> Case:
+    """`case`, a new case with nothing after case_created, as a format 3 build made it: case.yaml at format 3, and a
+    chain that starts with case_created naming that case.yaml, whose head is recorded outside the case. Its evidence and
+    events database stay as they are."""
+    as_format(case.folder, 3)
+    case = open_case(case.folder)
+    start_chain(case, "cli")
+    return case
+
+
+def worked_at_format_3(case: Case, marks: int = 4) -> bytes:
+    """The case opened for work by a format 3 build, which journals its case_open, as BUILD, and the built-in rules,
+    then `marks` marks with a note; the journal's bytes."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(case_module, "CASE_FORMAT", 3)
+        patch.setattr(journal_module, "build_id", lambda: BUILD)
+        App(open_case(case.folder), for_work=True).con.close()
+        journal = Journal(open_case(case.folder))
+        for i in range(marks):
+            journal.append("mark", targets=[f"{i:032x}"], value="suspicious", note="first look")
+    return (case.folder / "journal.jsonl").read_bytes()
 
 
 def append_unchained(folder: Path, action: str, *, who="cody", **payload) -> dict:

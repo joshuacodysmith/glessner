@@ -5,17 +5,23 @@ endpoint, a View's search worded through Term.describe, and the cut in the trail
 
 import csv
 import json
+import re
 from pathlib import Path
 
+import pytest
+from chain_fixtures import AT, chained, note, unchained
 from conftest import NETWORK_CAPTURE, SEC, T0
+from pivot_key_fixtures import AUTORUNS_COLUMNS, autoruns_row, csv_file, folder_of, run
 from test_server import login, request
 
+from glessner import server
 from glessner.audit import cut_name, describe, file_words, read_entries
 from glessner.caveats import table
 from glessner.events import Event, load
 from glessner.export import NO_SUMMARY, SECTIONS, _local, _md, indicators
 from glessner.filters import describe as describe_filter
 from glessner.filters import normalize, view_terms
+from glessner.heads import forget
 from glessner.journal import JOURNAL_FILE, replay
 from glessner.parsers import PARSERS, ParseContext
 from glessner.server import (
@@ -134,7 +140,7 @@ def test_the_report_has_its_seven_sections_with_the_analysts_words_and_the_head(
         integrity = section(text, 6)
         assert "No intake manifest exists, so evidence hashes were not checked." in integrity
         assert "Journal: " in integrity and "consistent: each names the one before it." in integrity
-        assert "| `r1` | evtxecmd | t | DC01 | 5 |" in section(text, 7) and "Written by glessner " in section(text, 7)
+        assert "| `r1` | evtxecmd | t | DC01 | 5 |  |" in section(text, 7) and "Written by glessner " in section(text, 7)
         written = entries(synthetic_case)[-1]
         assert (written["kind"], written["rows"], written["scope"]) == ("report", 2, {"marks": "flagged"})
         assert f"Journal head when written: `{written['journal_head']}` (entry #{written['head_seq']})" in integrity
@@ -263,17 +269,121 @@ def test_indicators_come_only_from_malicious_marks_and_parsed_fields(synthetic_c
         with Path(api_indicators(app, {})["path"]).open(encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
         assert rows[0] == {"type": "IP address", "value": "194.61.24.102", "marked_events": "1",
-                           "first_seen": "2020-09-19T03:21:48.000000Z", "last_seen": "2020-09-19T03:21:48.000000Z"}
+                           "first_seen": "2020-09-19T03:21:48.000000Z", "last_seen": "2020-09-19T03:21:48.000000Z", "note": ""}
         assert {(r["type"], r["value"]) for r in rows} == set(found)
     finally:
         app.con.close()
 
 
-def test_network_rows_carry_d45s_columns_and_windows_rows_keep_theirs(synthetic_case):
+SYSTEM_TOOL_NOTE = "In the Windows folder: may be a system tool the attacker used. Check before you block it."
+POWERSHELL = "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe"
+
+
+def test_a_windows_system_tool_stays_among_the_indicators_with_a_note_on_its_row(synthetic_case, tmp_path):
+    """An Autoruns Run-key entry marked Malicious whose target is powershell.exe lists the path as a File value, in the
+    table, indicators.csv, and the report, with a note that it may be a system tool the attacker used. A file outside the
+    Windows folders, marked the same way, has no note."""
+    out = folder_of(tmp_path, "autoruns")
+    csv_file(out / "autoruns.csv", AUTORUNS_COLUMNS, [
+        autoruns_row("Updater", POWERSHELL, f"{POWERSHELL} -nop -w hidden -c iex"),
+        autoruns_row("Dropped", "c:\\users\\public\\updater.exe", "c:\\users\\public\\updater.exe -q")])
+    load(synthetic_case.db_path, run("autoruns_csv", out, root=tmp_path), host="DC01", tool="autoruns", tool_version="t",
+         run_id="r20", replaces_sources=[], staging_dir=out)
+    app = App(synthetic_case, for_work=True)
+    try:
+        uids = [r[0] for r in app.con.execute("SELECT event_uid FROM events WHERE artifact = 'autoruns'").fetchall()]
+        assert len(uids) == 2
+        api_mark(app, {"uids": uids, "value": "malicious"})
+        files = {g["value"]: g["note"] for g in indicators(app.con, uids, app.identity) if g["type"] == "File"}
+        assert files == {POWERSHELL: SYSTEM_TOOL_NOTE, "c:\\users\\public\\updater.exe": ""}
+        with Path(api_indicators(app, {})["path"]).open(encoding="utf-8", newline="") as f:
+            rows = {(r["type"], r["value"]): r["note"] for r in csv.DictReader(f)}
+        assert rows[("File", POWERSHELL)] == SYSTEM_TOOL_NOTE and rows[("File", "c:\\users\\public\\updater.exe")] == ""
+        text = Path(api_report(app, {})["path"]).read_text(encoding="utf-8")
+        listed = section(text, SECTIONS.index("Indicators") + 1).splitlines()
+        assert "| Type | Value | Marked events | First seen | Last seen | Note |" in listed
+        row = lambda value: next(line for line in listed if line.startswith(f"| File | `{value}` | 1 | "))
+        assert row(POWERSHELL).endswith(f" | {SYSTEM_TOOL_NOTE} |")
+        assert row("c:\\users\\public\\updater.exe").endswith(" |  |")
+    finally:
+        app.con.close()
+
+
+def test_the_note_marks_a_file_in_the_windows_system_folders_whatever_its_case_slashes_or_drive(synthetic_case):
+    """The Windows folder's own files and everything below its System32, SysWOW64, and Sysnative folders count, on any
+    drive, with either slash after a drive or SYSVOL, in any case, and as an MFT, a prefetch file, or a variable writes
+    them. The Windows folder's other folders, which a dropped file can sit in, and look-alike names do not, and neither
+    does a name with no folder, a path with no root, or one that starts with a single forward slash."""
+    noted = [
+        "C:\\Windows\\System32\\cmd.exe", "c:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "c:/windows/system32/cmd.exe", "C:/Windows\\SysWOW64/cmd.exe", "D:\\Windows\\Sysnative\\cmd.exe",
+        "C:\\Windows\\explorer.exe", ".\\Windows\\System32\\cmd.exe", "\\Windows\\System32\\cmd.exe",
+        "%SystemRoot%\\System32\\cmd.exe", "\\\\?\\C:\\Windows\\System32\\cmd.exe",
+        "\\VOLUME{01d6a1b2c3d4e5f6-12345678}\\WINDOWS\\SYSTEM32\\CMD.EXE",
+        # The forms the registry, SRUM, and Security log parsers write: a device path, a domain controller's system volume,
+        # NT's \??\ and \SystemRoot, a variable, a shell path, and a doubled backslash
+        "\\Device\\HarddiskVolume3\\Windows\\System32\\cmd.exe", "\\device\\harddiskvolume2\\windows\\system32\\svchost.exe",
+        "SYSVOL\\Windows\\System32\\services.exe", "sysvol\\windows\\explorer.exe", "SYSVOL/Windows/System32/services.exe",
+        "sysvol/windows\\explorer.exe", "\\??\\C:\\Windows\\System32\\cmd.exe",
+        "\\SystemRoot\\System32\\drivers\\evil.sys", "%windir%\\system32\\cmd.exe", "This PC\\C:\\Windows\\System32\\cmd.exe",
+        "C:\\Windows\\\\System32\\cmd.exe"]
+    plain = [
+        "C:\\Windows\\Temp\\evil.exe", "C:\\Windows\\Tasks\\evil.exe", "C:\\Users\\Public\\Windows\\System32\\cmd.exe",
+        "C:\\Temp\\cmd.exe", "C:\\Windows\\System32x\\cmd.exe", "C:\\Windowsold\\System32\\cmd.exe", "cmd.exe",
+        "C:\\Program Files\\Windows\\cmd.exe", "SYSVOL\\Temp\\Windows\\cmd.exe", "SYSVOLX\\Windows\\System32\\cmd.exe",
+        "\\Device\\HarddiskVolume3\\Temp\\cmd.exe", "\\??\\C:\\Users\\Public\\cmd.exe",
+        # A path that starts with one forward slash is a URL or Unix path, as in Suricata's file names, and one with no root
+        # names no volume: neither says which folder it is in
+        "/Windows/System32/cmd.exe", "Windows\\System32\\cmd.exe", "SYSVOL/Temp/Windows/cmd.exe"]
+    app = App(synthetic_case, for_work=True)
+    try:
+        rdp = uid_at(app, T0)
+        for path in (*noted, *plain):
+            app.con.execute("UPDATE events SET file_path = ? WHERE event_uid = ?", [path, rdp])
+            files = {g["value"]: g["note"] for g in indicators(app.con, [rdp], app.identity) if g["type"] == "File"}
+            assert files == {path: SYSTEM_TOOL_NOTE if path in noted else ""}, path
+    finally:
+        app.con.close()
+
+
+def test_the_report_names_a_who_that_is_not_a_string_as_the_audit_trail_does(synthetic_case):
+    """Format 2's reader gives a line as written, so a line under the seal can hold a who that is a list, an object, a
+    number, or null. The report names it by the JSON text the audit trail lists, in a note, in who added or edited a
+    finding, and in who retired one, and the report is written."""
+    app = App(synthetic_case, for_work=True)
+    try:
+        rdp = uid_at(app, T0)
+    finally:
+        app.con.close()
+    finding = {"action": "finding", "at": AT}
+    (synthetic_case.folder / JOURNAL_FILE).write_bytes(chained([], before=unchained(
+        {"seq": 1, "at": AT, "who": "cody", "action": "mark", "targets": [rdp], "value": "malicious"},
+        note(2, uid=rdp, text="seen on the wire", who=["cody", "ann"]),
+        {**finding, "seq": 3, "who": {"by": "cody"}, "op": "add", "title": "Added by an object", "severity": "High",
+         "targets": [rdp]},
+        {**finding, "seq": 4, "who": 5, "op": "add", "title": "Edited by null", "severity": "High", "targets": []},
+        {**finding, "seq": 5, "who": None, "op": "edit", "finding": 4, "narrative": "Changed."},
+        {**finding, "seq": 6, "who": None, "op": "add", "title": "Retired by a list", "severity": "Low", "targets": []},
+        {**finding, "seq": 7, "who": ["bob"], "op": "retire", "finding": 6})))
+    forget(synthetic_case.folder)
+    app = App(synthetic_case, for_work=True)
+    try:
+        text = Path(api_report(app, {})["path"]).read_text(encoding="utf-8")
+    finally:
+        app.con.close()
+    who = lambda value: _md(json.dumps(value))
+    assert f"   - Note ({AT}, {who(['cody', 'ann'])}): seen on the wire" in text
+    assert f"; added 2026-10-17 02:14 UTC by {who({'by': 'cody'})}." in text
+    assert "; edited 2026-10-17 02:14 UTC by null." in text   # not the empty name that str() of None would give
+    assert f"Retired by a list (retired 2026-10-17 02:14 UTC by {who(['bob'])})" in text
+
+
+def test_network_rows_carry_their_own_columns_and_windows_rows_keep_theirs(synthetic_case):
     """A network record's row names its signature as rule.name with rule.id and event.severity, its type as
-    event.dataset in place of winlog.channel, the connection as network.community_id (the community ID, else the flow
-    ID), and url.full, dns.question.name, tls.server.name, and client.mac from its data; a Windows event keeps
-    winlog.channel and Hayabusa's title in rule.name, with the network columns empty."""
+    event.dataset in place of winlog.channel, its connection as network.community_id (a community ID and nothing else),
+    network.flow_id (Suricata's flow ID), or zeek.uid (Zeek's uid), and url.full, dns.question.name, tls.server.name, and
+    client.mac from its data; a Windows event keeps winlog.channel and Hayabusa's title in rule.name, with the network
+    columns empty."""
     load_eve(synthetic_case)
     fast = Event(ts_us=T0 + 70 * SEC, ts_desc="Alert", artifact="ids_alert", source_file="fast.log", source_record="1",
                  message="[1:2001:1] ET TEST Leak", log_channel="Attempted Information Leak",
@@ -289,22 +399,27 @@ def test_network_rows_carry_d45s_columns_and_windows_rows_keep_theirs(synthetic_
         with Path(res["path"]).open(encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
         by = {r["event.dataset"]: r for r in rows if r["event.dataset"]}
-        net = ("network.community_id", "url.full", "dns.question.name", "tls.server.name", "client.mac", "rule.id",
-               "event.severity")
+        net = ("network.community_id", "network.flow_id", "zeek.uid", "url.full", "dns.question.name", "tls.server.name",
+               "client.mac", "rule.id", "event.severity")
         assert set(by) == {f"suricata.{k}" for k in ("alert", "dns", "http", "tls", "dhcp", "fileinfo")} | {
             "ids_alert.alert", "zeek.http"}
         assert all(r["winlog.channel"] == "" for r in by.values())
         alert, dns, http = by["suricata.alert"], by["suricata.dns"], by["suricata.http"]
-        assert (alert["rule.name"], alert["rule.id"], alert["event.severity"], alert["network.community_id"]) == (
-            "GPL ATTACK_RESPONSE id check returned root", "2100498", "2", "1:abc=")
-        assert (dns["dns.question.name"], dns["network.community_id"]) == ("update.evil.example", "12")
-        assert (http["url.full"], http["network.community_id"]) == ("http://203.0.113.80/payload.exe", "11")
+        # The community ID stays in its column when the sensor wrote one, with the flow ID beside it; a record with only a flow ID
+        # leaves the community ID empty
+        assert (alert["rule.name"], alert["rule.id"], alert["event.severity"], alert["network.community_id"],
+                alert["network.flow_id"]) == ("GPL ATTACK_RESPONSE id check returned root", "2100498", "2", "1:abc=", "11")
+        assert (dns["dns.question.name"], dns["network.community_id"], dns["network.flow_id"]) == (
+            "update.evil.example", "", "12")
+        assert (http["url.full"], http["network.community_id"], http["network.flow_id"]) == (
+            "http://203.0.113.80/payload.exe", "", "11")
         # An imported fast alert's channel is its classification, so its dataset is the alert; Zeek's http.log gives its uid,
         # host and URI
         fast, zeek = by["ids_alert.alert"], by["zeek.http"]
         assert (fast["rule.name"], fast["rule.id"], fast["event.severity"], fast["winlog.channel"]) == (
             "ET TEST Leak", "2001", "2", "")
-        assert (zeek["network.community_id"], zeek["url.full"]) == ("CabC1", "http://evil.example/a.exe")
+        assert (zeek["network.community_id"], zeek["network.flow_id"], zeek["zeek.uid"], zeek["url.full"]) == (
+            "", "", "CabC1", "http://evil.example/a.exe")
         assert by["suricata.tls"]["tls.server.name"] == "c2.example"
         assert by["suricata.dhcp"]["client.mac"] == "00:26:55:32:a9:17"
         rdp = next(r for r in rows if r["event_uid"] == uid_at(app, T0))
@@ -477,3 +592,169 @@ def test_the_addresses_that_name_no_host_are_no_indicator():
         assert _local(left_out), left_out
     for kept in ("203.0.113.80", "10.0.0.5", "2001:db8::1", "update.evil.example", "239.1"):
         assert not _local(kept), kept
+
+
+MAPS = {"EvtxECmd.exe": "12" * 32, "Maps/": "34" * 32}   # what a format 4 run of EvtxECmd records
+RECMD = {"ReCmd.exe": "56" * 32, "Plugins/": "78" * 32}
+
+
+def method_part(text):
+    """The Method section's table rows and what follows them."""
+    return section(text, 7)
+
+
+def test_the_method_table_gives_each_run_s_rule_set_and_lists_the_tool_files_of_each_distinct_set_once(synthetic_case):
+    """The Rules column follows Events. A run's label is what its record holds; a tool run of a tool whose registry entry
+    has a rules_label, with no tool_files, says "not recorded"; found output, a run with no record, and a tool with no
+    rules_label and no label say nothing, and so does an import, which no registry entry names. Under the table each
+    distinct set of tool files is listed once with the runs that recorded it, a folder by its path and a /."""
+    from test_overview import run_record
+
+    load_eve(synthetic_case)
+    fast = Event(ts_us=T0 + 70 * SEC, ts_desc="Alert", artifact="ids_alert", source_file="fast.log", source_record="1",
+                 message="[1:2001:1] ET TEST Leak", log_channel="Attempted Information Leak",
+                 extra={"signature": "ET TEST Leak", "sid": "2001", "priority": "2"})
+    load(synthetic_case.db_path, [fast], host="network", tool="import", tool_version="t", run_id="r7",
+         replaces_sources=["fast.log"], staging_dir=synthetic_case.folder)
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, rules="Maps, 456 maps", tool_files=MAPS)
+    run_record(synthetic_case, "r2", "evtxecmd", "DESKTOP", "ok", 5, rules="Maps, 456 maps", tool_files=MAPS)
+    run_record(synthetic_case, "r3", "recmd", "DC01", "ok", 1)   # made before format 4
+    run_record(synthetic_case, "r4", "recmd", "DESKTOP", "ok", 1, rules="DFIRBatch.reb 2.22", tool_files=RECMD)
+    run_record(synthetic_case, "r5", "hayabusa", "DC01", "ok", 1, from_output=True)
+    run_record(synthetic_case, "r6", "suricata", "network", "ok", 6, rules="ET Open 11310")
+    run_record(synthetic_case, "r7", "import", "network", "ok", 1, parser="import")
+    app = App(synthetic_case, for_work=True)
+    try:
+        for text in (Path(api_report(app, {})["path"]).read_text(encoding="utf-8"), api_report_preview(app, {})["text"]):
+            method = method_part(text)
+            assert "| Run | Tool | Version | Host | Events | Rules |\n|---|---|---|---|---|---|\n" in method
+            rows = {line.split("|")[1].strip(" `"): line for line in method.splitlines() if line.startswith("| `r")}
+            assert rows["r1"] == "| `r1` | evtxecmd | t | DC01 | 5 | Maps, 456 maps |"
+            assert rows["r2"] == "| `r2` | evtxecmd | t | DESKTOP | 3 | Maps, 456 maps |"
+            assert rows["r3"].endswith("| recmd | t | DC01 | 2 | rules not recorded |")
+            assert rows["r4"].endswith("| recmd | t | DESKTOP | 2 | DFIRBatch.reb 2.22 |")
+            assert rows["r5"].endswith("| hayabusa | t | DC01 | 1 |  |")
+            assert rows["r6"] == "| `r6` | suricata | 8.0.7 | network | 6 | ET Open 11310 |"
+            assert rows["r7"] == "| `r7` | import | t | network | 1 |  |"
+            _, _, files_part = method.partition("Files each tool ran with")
+            assert files_part.startswith(", as its runs recorded them, by SHA-256. A path that ends in / is a folder, hashed "
+                                         "as the lines `sha256sum` prints for its files, by their paths in the folder with "
+                                         "forward slashes, sorted in code point order, leaving out a .git folder and links.\n\n")
+            first = "- Runs `r1`, `r2`:\n  - `EvtxECmd.exe`: `" + "12" * 32 + "`\n  - `Maps/`: `" + "34" * 32 + "`\n"
+            second = "- Run `r4`:\n  - `Plugins/`: `" + "78" * 32 + "`\n  - `ReCmd.exe`: `" + "56" * 32 + "`\n"
+            assert files_part.endswith(first + second) and not any(f"`{run}`" in files_part for run in ("r3", "r5", "r6", "r7"))
+    finally:
+        app.con.close()
+
+
+def test_a_run_record_the_report_cannot_read_fails_it_naming_the_file(synthetic_case):
+    """A run.json this build refuses fails the Method table as it fails the Case overview: by the file's name, before
+    the evidence is re-hashed, anything is written, or anything is journaled. A case with an intake manifest, whose report
+    would otherwise re-hash its evidence, gains no line in verification.jsonl for a report that is never written."""
+    from test_overview import rewrite_record, run_record
+
+    from glessner.case import CaseError
+    from glessner.intake import intake
+
+    for name in ("Security.evtx", "System.evtx"):
+        (synthetic_case.evidence / "DC01" / name).write_bytes(b"ElfFile\x00" + name.encode())
+    intake(synthetic_case)
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_files=MAPS)
+    rewrite_record(synthetic_case, "r1", tool_files=["EvtxECmd.exe"])
+    app = App(synthetic_case, for_work=True)
+
+    def recorded():
+        file = synthetic_case.verification_path
+        return file.read_bytes() if file.exists() else b""
+
+    try:
+        before, verified = len(entries(synthetic_case)), recorded()
+        for call in (api_report, api_report_preview):
+            with pytest.raises(CaseError, match=r"r1[\\/]run\.json has a tool_files that isn't a JSON object"):
+                call(app, {})
+        with pytest.raises(CaseError, match=r"run\.json has a tool_files"):
+            server.api_overview(app, {})   # the Case overview fails the same way
+        assert len(entries(synthetic_case)) == before
+        assert recorded() == verified
+        assert not (synthetic_case.folder / "exports").exists() or not list((synthetic_case.folder / "exports").glob("report_*"))
+    finally:
+        app.con.close()
+
+
+def report_hashes(text):
+    """Each marked event's evidence SHA-256 as the report's Source line gives it, or None for a line that gives no hash,
+    by event ID, and that line."""
+    found, source = {}, ""
+    for line in text.splitlines():
+        if line.startswith("   - Source: "):
+            source = line
+        elif line.startswith("   - Event ID: `"):
+            match = re.search(r"evidence SHA-256 `([0-9a-f]{64})`", source)
+            found[line.removeprefix("   - Event ID: `").removesuffix("`")] = (match.group(1) if match else None, source)
+    return found
+
+
+def test_the_report_cites_the_hash_the_event_page_does_for_an_event_of_found_output(tmp_path):
+    """The Event page cites the intake hash of the output file a found-output load read, not of the file the event
+    names, which the load never read, and cites none for a load of several files or one whose run record is gone. The
+    report's hash for each such event is the page's, whether the file the event names is in the manifest or not, and its
+    line names the output file, or says why it gives none. An event of a tool's run cites the file it names."""
+    from test_found_output_sources import FOUND, KAPE, LOG, OTHER_HOST, OUTSIDE, SYSTEM_LOG, evtxecmd_run, found_case, load
+
+    from glessner.runner import read_run
+
+    case = found_case(tmp_path)
+    direct = evtxecmd_run(case)
+    names_a_listed_file = load(case, "WS02", OTHER_HOST[0])   # its rows name WS01's Security log, which the manifest lists
+    names_an_outside_file = load(case, "WS02", OUTSIDE[0])    # its rows name a path on the collecting machine
+    several = load(case, "WS01", FOUND, KAPE)
+    app = App(case, for_work=True)
+    try:
+        uids = {}
+        for name, record in (("tool", direct), ("listed", names_a_listed_file), ("outside", names_an_outside_file),
+                             ("several", several)):
+            uids[name] = app.con.execute("SELECT event_uid FROM events WHERE run_id = ? ORDER BY event_uid LIMIT 1",
+                                         [record.run_id]).fetchone()[0]
+        api_mark(app, {"uids": list(uids.values()), "value": "suspicious"})
+        report = Path(api_report(app, {})["path"]).read_text(encoding="utf-8")
+        cited = report_hashes(report)
+        for text in (report, api_report_preview(app, {})["text"]):
+            assert report_hashes(text) == cited
+        page = {name: server.api_event(app, {"uid": [uid]})["event"]["provenance"] for name, uid in uids.items()}
+        for name, uid in uids.items():
+            assert cited[uid][0] == (page[name]["sha256"] or None), name   # the page's, event by event
+        assert cited[uids["tool"]][0] == app.manifest[SYSTEM_LOG]
+        output = read_run(case, names_a_listed_file.run_id).inputs[0]
+        assert cited[uids["listed"]][0] == app.manifest[output] != app.manifest[LOG]
+        assert f"evidence SHA-256 `{app.manifest[output]}` (of the output file `{output}`)" in cited[uids["listed"]][1]
+        outside = read_run(case, names_an_outside_file.run_id).inputs[0]
+        assert cited[uids["outside"]][0] == app.manifest[outside]
+        assert cited[uids["several"]] == (None, cited[uids["several"]][1])
+        assert "no evidence SHA-256: the load read 2 output files and doesn't record which one the event came from" in (
+            cited[uids["several"]][1])
+        assert "not in manifest" not in report
+    finally:
+        app.con.close()
+
+
+def test_the_report_gives_no_hash_for_an_event_of_found_output_whose_run_record_is_gone(tmp_path):
+    """Without its run's record nothing says which output file the load read, so the Event page cites none, and the
+    report says that instead of giving the hash of the file the event names, or "not in manifest"."""
+    import shutil
+
+    from test_found_output_sources import FOUND, found_case, load
+
+    case = found_case(tmp_path)
+    record = load(case, "WS01", FOUND)
+    shutil.rmtree(case.runs_folder / record.run_id)
+    app = App(case, for_work=True)
+    try:
+        uid = app.con.execute("SELECT event_uid FROM events WHERE run_id = ? LIMIT 1", [record.run_id]).fetchone()[0]
+        api_mark(app, {"uids": [uid], "value": "suspicious"})
+        assert server.api_event(app, {"uid": [uid]})["event"]["provenance"]["sha256"] == ""
+        text = Path(api_report(app, {})["path"]).read_text(encoding="utf-8")
+        found, line = report_hashes(text)[uid]
+        assert found is None and "no evidence SHA-256: the run's record is gone, so the output the event was read from " \
+            "is unknown." in line
+    finally:
+        app.con.close()

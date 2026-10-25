@@ -415,3 +415,28 @@ def test_lab_szechuan_autoruns_load_with_both_persistence_entries():
             ("Services", "coreupdater", BUILT, "\\windows\\system32\\coreupdater.exe"))]
     finally:
         shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_a_group_of_autoruns_csvs_imported_one_by_one_sums_the_rows_each_import_skipped(tmp_path):
+    """The Tools page counts a CSV imported on the Import page as loaded, and a group's imports are one run each, so the
+    group's counts of rows loaded and rows skipped are the sums over its files, not the last import's."""
+    from glessner.imports import preview, run_import
+    from glessner.runner import _write_record
+
+    second = "DC01/autoruns/autorunsc-dc01-b.csv"
+    ev = tmp_path / "evidence"
+    (ev / "DC01" / "autoruns").mkdir(parents=True)
+    for rel in (AUTORUNS_CSV, second):
+        (ev / rel).write_bytes(autoruns_bytes())
+    case = create_case(tmp_path / "case", "Autoruns", ev, "cody")
+    intake(case)
+    for rel, skipped in ((AUTORUNS_CSV, 2), (second, 3)):
+        mapping = preview(case, rel)["mapping"]
+        mapping = {**mapping, "time": {**mapping["time"], "columns": ["Time"], "format": "mdy", "zone": "-07:00"}}
+        record = run_import(case, rel, mapping, zones={})
+        assert (record.status, record.loaded_rows) == ("ok", 7), record.reason
+        record.rows_skipped = skipped
+        _write_record(case.runs_folder / record.run_id, record)
+    [group] = [g for g in found_outputs(case, load_registry(), {}) if g["key"] == "autoruns_csv"]
+    assert (group["status"], group["files"]) == ("loaded", 2)
+    assert (group["loaded"]["rows"], group["loaded"]["skipped"]) == (14, 5)

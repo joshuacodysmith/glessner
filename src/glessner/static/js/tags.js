@@ -6,7 +6,7 @@ import { attackPicker } from './attack.js';
 import { askSelection, CONFIRM_ABOVE } from './confirm.js';
 import { $, api, el, plural, post, reportAction, S, setStatus } from './core.js';
 import { fetchView } from './data.js';
-import { button, loadDetails } from './event_page.js';
+import { button, focusedPageAction, pageAction } from './event_page.js';
 import { reloadLanes } from './lanes.js';
 import { closeQuickMenu, menuItem, placeMenu } from './quick_menu.js';
 import { renderViewPanel } from './view.js';
@@ -30,8 +30,15 @@ export function tagLabel(key) {
 
 const shown = (text) => (text.includes(':') ? tagLabel(text) : text);
 
-// A hand-picked selection above CONFIRM_ABOVE events asks first, and the tag then carries the count confirmed.
-export async function applyTags(uids, { add = [], remove = [], via = '' } = {}) {
+// The Event page of the event in focus, when the change covers it: it redraws once the change answers, while the panel
+// shows it (focusedPageAction)
+const focusedTagged = (uids) => (S.focus && uids.includes(S.focus) ? focusedPageAction() : () => false);
+
+// A hand-picked selection above CONFIRM_ABOVE events asks first, and the tag then carries the count confirmed. `after`
+// redraws the list the tag came from, on the page the panel shows as the tag goes out, by that page's rule for an
+// action's redraw of a part of it (pageAnswered): at once while the panel shows the page with no page asked for since
+// and no question open on it, and otherwise when the page next draws or the question has left it.
+export async function applyTags(uids, { add = [], remove = [], via = '', after = null } = {}) {
   const n = uids.length === 1 ? 'one event' : `${uids.length} events`;
   const consent = {};
   if (uids.length > CONFIRM_ABOVE) {
@@ -39,27 +46,33 @@ export async function applyTags(uids, { add = [], remove = [], via = '' } = {}) 
     if (!await askSelection({ action, uids })) return false;
     consent.confirmed = { count: uids.length };
   }
+  const done = focusedTagged(uids), listed = after ? pageAction($('details').dataset.key) : null;
   let res;
   try { res = await post('/api/tag', { uids, add, remove, ...(via ? { via } : {}), ...consent }); }
   catch (err) { setStatus(`Tag failed: ${err.message}`); return false; }
-  await afterTagChange(uids);
+  await afterTagChange(done, listed && (() => listed(after)));
   reportAction(add.length ? `Tagged ${n}: ${add.map(shown).join(', ')}` : `Removed from ${n}: ${remove.map(shown).join(', ')}`, res.server_ms);
   return true;
 }
 
 export async function decideTagSuggestions(uids, keys, decision) {
+  const done = focusedTagged(uids);
   let res;
   try { res = await post('/api/tag_suggestion', { uids, tags: keys, decision }); }
   catch (err) { setStatus(`Change failed: ${err.message}`); return; }
-  await afterTagChange(uids);
+  await afterTagChange(done);
   reportAction(`${decision === 'dismissed' ? 'Dismissed' : 'Restored'}: ${keys.map(tagLabel).join(', ')}`, res.server_ms);
 }
 
-async function afterTagChange(uids) {
+// `listed` settles the list the change came from (applyTags). It runs before done(), whose redraw of the focused Event
+// page claims the panel: a pivot's list on that page, whose rows can include the event in focus, still has its rows read
+// again.
+async function afterTagChange(done, listed = null) {
   // Tactic lanes and a View on tags depend on tags, so the lanes reload; the counts in the View panel follow.
   if (S.groupby.includes('tactic') || S.filterId) await reloadLanes();
   await fetchView();
-  if (S.focus && uids.includes(S.focus)) loadDetails(S.focus);
+  if (listed) listed();
+  done();
   if (!$('viewPanel').hidden) {
     try { S.tagCounts = await api('/api/tags'); } catch (_) { /* the panel keeps its old counts */ }
     renderViewPanel();
@@ -68,8 +81,8 @@ async function afterTagChange(uids) {
 
 // The tag picker, in the shared popup menu: the 15 tactics, a technique picked from the ATT&CK list, or the analyst's own
 // tag. `current` holds the keys the one event being tagged already has, so a click on one of those tactics removes it, and
-// the technique list leaves those techniques out.
-export async function openTagPicker(uids, x, y, current = new Set()) {
+// the technique list leaves those techniques out. `after` is applyTags'.
+export async function openTagPicker(uids, x, y, current = new Set(), { after = null } = {}) {
   closeQuickMenu();
   if (!uids.length) { setStatus('Select or tick the events to tag first.'); return; }
   const token = S.menuToken;
@@ -80,20 +93,20 @@ export async function openTagPicker(uids, x, y, current = new Set()) {
   const many = uids.length > 1;
   const tactics = S.meta.tactics.map((t) => {
     const key = `tactic:${t.id}`, on = !many && current.has(key);
-    return menuItem(on ? `✓ ${t.name}` : t.name, () => applyTags(uids, on ? { remove: [key] } : { add: [key] }),
+    return menuItem(on ? `✓ ${t.name}` : t.name, () => applyTags(uids, on ? { remove: [key], after } : { add: [key], after }),
                     { title: on ? `${t.id}; click to remove` : t.id, cls: on ? 'on' : '' });
   });
   const had = many ? [] : [...current].filter((k) => k.startsWith('technique:')).map((k) => k.slice(10));
   const technique = attackPicker((id) => {
     closeQuickMenu();
-    applyTags(uids, { add: [`technique:${id}`] });
+    applyTags(uids, { add: [`technique:${id}`], after });
   }, had);
   const mine = el('input', { type: 'text', placeholder: 'Your own tag', size: '16', list: 'ownTagList', 'aria-label': 'Your own tag' });
   const add = () => {
     const value = mine.value.trim();
     if (!value) { mine.focus(); return; }
     closeQuickMenu();
-    applyTags(uids, { add: [`tag:${value}`] });
+    applyTags(uids, { add: [`tag:${value}`], after });
   };
   mine.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') add(); });
   const menu = $('quickMenu');

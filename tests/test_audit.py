@@ -109,9 +109,12 @@ def test_the_command_line_close_reads_as_what_the_re_hash_found(synthetic_case):
     # Then what the close's full check of the journal found
     chain = lambda n: (f" The journal's {n} {'entry' if n == 1 else 'entries'} before this one {'was' if n == 1 else 'were'} "
                        "consistent: each names the one before it. They match the head this app recorded.")
-    assert matched == "Closed the case. All 2 evidence files match the intake manifest." + chain(entries[-2]["seq"] - 1)
+    # Then what it found of manifest.jsonl, which intake took in here without the journal
+    none = " No journal entry recorded manifest.jsonl's hash."
+    assert matched == "Closed the case. All 2 evidence files match the intake manifest." + chain(entries[-2]["seq"] - 1) + none
     assert mismatched == ("Closed the case. The evidence doesn't match the intake manifest: DC01/System.evtx: SHA-256 "
-                          "changed. The case folder's verification.jsonl lists every problem." + chain(entries[-1]["seq"] - 1))
+                          "changed. The case folder's verification.jsonl lists every problem." + chain(entries[-1]["seq"] - 1)
+                          + none)
     text = markdown(entries, "Synthetic", {})
     assert matched in text and mismatched in text and '"hash_check"' not in text
     # One file, more than three problems, and a value from before the close recorded its file count
@@ -121,6 +124,9 @@ def test_the_command_line_close_reads_as_what_the_re_hash_found(synthetic_case):
     assert describe(many) == ("Closed the case. The evidence doesn't match the intake manifest: f0: missing; f1: missing; "
                               "f2: missing; and more. The case folder's verification.jsonl lists every problem.")
     assert describe({**one, "value": {"hash_check": "ok"}}) == "Closed the case. The evidence matches the intake manifest."
+    grown = {**one, "value": {"hash_check": "ok", "evidence_files": 1, "manifest": {"state": "grew", "seq": 4}}}
+    assert describe(grown) == ("Closed the case. Its 1 evidence file matches the intake manifest. manifest.jsonl had grown "
+                               "past its record in the journal, entry #4.")
 
 
 def test_an_undo_of_one_event_reads_in_the_singular(synthetic_case):

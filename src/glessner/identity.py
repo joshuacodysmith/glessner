@@ -52,12 +52,19 @@ class Identity:
         return self.lookup.get(ip) if ip else None
 
     def resolve_name(self, name: str) -> str | None:
-        """A host by a computer name, or by an address written where a name goes, as a 4648's TargetServerName is
-        when the account connected to an IP."""
-        name = name.strip() if name else ""
-        if not name:
-            return None
-        # Only text with a colon or a leading digit can be an address, and a failed parse costs about 17 times the
-        # lookup, which runs for every logon a view or a refresh links
-        ip = normalize_ip(name) if ":" in name or name[0].isdigit() else ""
-        return self.lookup.get(ip or name.split(".")[0].upper())
+        """A host by a computer name, or by an address written where a name goes, read as lookup_key reads it."""
+        key = lookup_key(name)
+        return self.lookup.get(key) if key else None
+
+
+def lookup_key(name: str) -> str:
+    """The key a computer name finds its host by in Identity.lookup: an address written where a name goes, as a 4648's
+    TargetServerName is when the account connected to an IP, in normalize_ip's form; otherwise the name's first label
+    in upper case. Empty for a blank name."""
+    name = name.strip() if name else ""
+    if not name:
+        return ""
+    # Only text with a colon or a leading digit can be an address, and a failed parse costs about 17 times the
+    # lookup, which runs for every logon a view or a refresh links
+    ip = normalize_ip(name) if ":" in name or name[0].isdigit() else ""
+    return ip or name.split(".")[0].upper()

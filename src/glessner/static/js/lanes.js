@@ -1,5 +1,5 @@
 import { clockBadges } from './clock.js';
-import { $, api, el, KEY_LABEL, LANE_FOLDS_CASES, LANE_FOLDS_KEY, MARK_ORDER, OUTSIDE_GROUP, S } from './core.js';
+import { $, api, el, KEY_LABEL, LANE_FOLDS_CASES, LANE_FOLDS_KEY, MARK_ORDER, OUTSIDE_GROUP, S, showControls } from './core.js';
 import { refreshViewStatus } from './data.js';
 import { refreshDivider } from './dividers.js';
 import { draw } from './draw.js';
@@ -36,8 +36,10 @@ export function buildTree() {
       const id = JSON.stringify(keys);
       let node = nodes.get(id);
       if (!node) {
-        // A user lane keys on the account's lower-case name and shows its usual spelling
-        const label = (S.laneNames[S.groupby[d]] || {})[keys[d]] ?? String(keys[d]);
+        // A user lane keys on the account's lower-case name and shows its usual spelling. A key is evidence text, so
+        // the names are read as own properties: a user named constructor would otherwise read Object's.
+        const names = S.laneNames[S.groupby[d]] || {};
+        const label = Object.hasOwn(names, keys[d]) ? names[keys[d]] : String(keys[d]);
         node = { id, label, depth: d, children: [], count: 0, keys, key: S.groupby[d] };
         nodes.set(id, node);
         parent.children.push(node);
@@ -139,7 +141,7 @@ export function layoutRows() {
     const isGroup = row.children.length > 0;
     const div = el('div', { class: isGroup ? 'row group' : 'row', title: row.key ? `${KEY_LABEL[row.key]}: ${row.label}` : row.label });
     div.style.paddingLeft = `${4 + row.depth * 14}px`;
-    div.append(el('span', { class: 'twisty' }, isGroup ? (isFolded(row) ? '▸' : '▾') : ''), row.label);
+    div.append(el('span', { class: 'twisty' }, isGroup ? (isFolded(row) ? '▸' : '▾') : ''), showControls(row.label));
     if (row.count != null) div.append(el('span', { class: 'count' }, row.count.toLocaleString()));
     const guess = guessBadge(row);
     if (guess) div.append(guess);
@@ -171,8 +173,15 @@ export function sourceRow(host, targetKeys, hostIdx) {
   return best ? rowOfKeys(best.keys) : undefined;
 }
 
+// Counts the reloads asked for. An answer for an earlier filter or lane preset can come back after a later one's, and
+// drawn, it would put back the lanes and counts that change replaced, or lanes keyed by another preset's fields. It is
+// dropped, and its call still resolves, as a caller chains its view's fetch on it.
+let lanesTurn = 0;
+
 export async function reloadLanes() {
+  const turn = ++lanesTurn;
   const res = await api(`/api/lanes?groupby=${S.groupby.join(',')}${filterParam()}`);
+  if (turn !== lanesTurn) return;
   S.lanes = res.lanes;
   S.laneNames = res.names || {};
   // The state line's counts, for the filter this answer applied; what the lanes can't count follows

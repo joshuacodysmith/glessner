@@ -6,6 +6,7 @@ import threading
 from urllib.parse import urlsplit
 
 import pytest
+from conftest import close_first
 from test_browser_smoke import LOAD_TIMEOUT_MS, PAGE_TIMEOUT_MS, VIEWPORT, browser, served_page  # noqa: F401
 
 from glessner.server import LINK_USED, Hub, serve_hub
@@ -43,6 +44,7 @@ def test_a_link_used_already_opens_nothing_in_a_browser_with_no_session(browser,
     """The first browser trades the token. A second browser profile that opens the same link has no session in storage,
     so the page shows the server's words and draws no case data; a reload of the first browser still has its session."""
     server, hub, url = serve_hub(Hub(synthetic_case), 0)
+    hang_up = close_first(server)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     contexts = [browser.new_context(viewport=VIEWPORT), browser.new_context(viewport=VIEWPORT)]
     try:
@@ -62,8 +64,9 @@ def test_a_link_used_already_opens_nothing_in_a_browser_with_no_session(browser,
         first.wait_for_function(READY)
         assert first.locator("#caseChanged").count() == 0
     finally:
+        server.shutdown()
+        hang_up()
         for context in contexts:
             context.close()
-        server.shutdown()
         server.server_close()
         hub.app.con.close()

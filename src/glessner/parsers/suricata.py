@@ -56,6 +56,7 @@ def parse_suricata_eve(ctx: ParseContext) -> Iterator[Event]:
                 if former != key:
                     event.former = (source, former)
                 yield event
+        ctx.skipped.append(dropped)
         if dropped:
             name = source if ctx.files else (f"{path.name} for {source}" if source else path.name)
             ctx.notes.append(f"{SKIPPED_NOTE}{dropped:,} {'line' if dropped == 1 else 'lines'} of {name}: not a JSON record, "

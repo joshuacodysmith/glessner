@@ -8,7 +8,7 @@ import pytest
 from test_runner import fake_spec, with_spec
 
 from glessner.case import create_case
-from glessner.identify import LNK_CLSID, LNK_HEADER_SIZE, REGF_MAGIC
+from glessner.identify import EVTX_MAGIC, LNK_CLSID, LNK_HEADER_SIZE, REGF_MAGIC
 from glessner.intake import add_new, current_entries, intake
 from glessner.runner import RunError, build_argv, inputs_without, plan_runs, run
 from glessner.tools import DetectedTool, load_registry
@@ -34,10 +34,61 @@ def selecting_tool(tmp_path):
     return with_spec(tool, args=tool.spec.args[:-1] + ("ok",))
 
 
-def test_the_registry_names_the_patterns_lecmd_and_pecmd_read():
+SELECTING = {"lecmd": ("*.lnk",), "pecmd": ("*.pf",), "evtxecmd": ("*.evtx",), "hayabusa": ("*.evtx",)}
+
+
+def test_the_registry_names_the_patterns_the_tools_read():
     specs = load_registry()
-    assert (specs["lecmd"].selects, specs["pecmd"].selects) == (("*.lnk",), ("*.pf",))
-    assert all(not spec.selects for key, spec in specs.items() if key not in ("lecmd", "pecmd"))
+    assert {key: spec.selects for key, spec in specs.items() if spec.selects} == SELECTING
+
+
+EVTX = EVTX_MAGIC + bytes(60)
+
+
+def evtx_case(tmp_path):
+    """HOST holds two event logs by signature, one named Security.evtx and one renamed; ONLY holds renamed ones alone."""
+    evidence = tmp_path / "evidence"
+    for host, names in (("HOST", ("Security.evtx", "Backup.evtx.bak")), ("ONLY", ("a.evtx.bak", "b.log"))):
+        (evidence / host).mkdir(parents=True)
+        for name in names:
+            (evidence / host / name).write_bytes(EVTX)
+    case = create_case(tmp_path / "case", "Selects", evidence, "cody")
+    intake(case)
+    return case
+
+
+@pytest.mark.parametrize("tool_id", ["evtxecmd", "hayabusa"])
+def test_a_plan_names_the_event_logs_the_tool_would_not_read(tmp_path, tool_id):
+    case = evtx_case(tmp_path)
+    tool = DetectedTool(load_registry()[tool_id], Path("tool.exe"), "1.0")
+    plans = {plan.host: plan for plan in plan_runs(case, tool)}
+    assert plans["HOST"].inputs == ("HOST/Backup.evtx.bak", "HOST/Security.evtx")   # every identified log stays an input
+    assert plans["HOST"].left_out == ("HOST/Backup.evtx.bak",)
+    assert plans["ONLY"].left_out == plans["ONLY"].inputs == ("ONLY/a.evtx.bak", "ONLY/b.log")
+
+
+@pytest.mark.parametrize("tool_id", ["evtxecmd", "hayabusa"])
+def test_a_run_on_a_host_with_a_renamed_event_log_notes_it(tmp_path, tool_id):
+    """The fake tool reads *.evtx as the registry's tools do, and selects what the registry's entry selects."""
+    case = evtx_case(tmp_path)
+    base = fake_spec(tmp_path)
+    tool = with_spec(base, selects=load_registry()[tool_id].selects, args=base.spec.args[:-1] + ("ok",))
+    (plan,) = plan_runs(case, tool, ["HOST"])
+    record = run(case, plan)
+    assert record.status == "ok" and record.inputs == ["HOST/Backup.evtx.bak", "HOST/Security.evtx"]
+    assert record.notes == ["1 file that intake identified for Fake was not read: it reads only files named *.evtx in a "
+                            "folder, and this one is named otherwise: HOST/Backup.evtx.bak."]
+
+
+@pytest.mark.parametrize(("tool_id", "name"), [("evtxecmd", "EvtxECmd"), ("hayabusa", "Hayabusa")])
+def test_a_host_whose_event_logs_are_all_renamed_is_refused_before_anything_is_made(tmp_path, tool_id, name):
+    case = evtx_case(tmp_path)
+    tool = DetectedTool(load_registry()[tool_id], Path("tool.exe"), "1.0")
+    (plan,) = plan_runs(case, tool, ["ONLY"])
+    with pytest.raises(RunError, match=rf"{name} wasn't run on ONLY: it reads only files named \*\.evtx, and the 2 files "
+                                       r"intake identified for it are named otherwise: ONLY/a\.evtx\.bak; ONLY/b\.log\."):
+        run(case, plan)
+    assert not case.runs_folder.exists() or list(case.runs_folder.iterdir()) == []
 
 
 def test_a_plan_names_the_identified_files_the_tool_would_not_read(tmp_path):

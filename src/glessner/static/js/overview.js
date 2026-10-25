@@ -3,12 +3,12 @@
 // and its integrity. /api/overview computes it (overview.py); a number that stands for events opens them.
 
 import { showAudit } from './audit.js';
-import { $, api, el, fmtUs, plural, post, S, setStatus } from './core.js';
+import { $, api, el, fmtUs, plural, post, S, sentence, setStatus } from './core.js';
 import { animateView } from './data.js';
 import { draw } from './draw.js';
-import { button, claimDetails, headCopy, loadDetails, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, headCopy, loadDetails, pageRead, setPage } from './event_page.js';
 import { filterParam } from './filters.js';
-import { refreshCaseState, showTab } from './frame.js';
+import { mismatchFound, refreshCaseState, showTab } from './frame.js';
 import { openHost } from './hosts.js';
 import { jumpTo, markableList, stickUnder } from './pages.js';
 import { searchTerm, typedSearch } from './search.js';
@@ -70,20 +70,22 @@ async function openView(marks, values, title) {
 // The events a number opened, in the Details panel as a search's matches are: a tick for each, and the mark buttons,
 // so they can be reviewed and triaged where they were clicked into. The ticks start over for another number.
 // `filterId` is the filter registered for the number's View, and `latest` checks the claim on the panel made when the
-// number was clicked or the list asked to draw again.
+// number was clicked or the list asked to draw again. A mark draws the list again once it is written, unless a page was
+// asked for since the mark was (pageAction, which markableList notes as the mark goes out).
 const opened = { key: '', checked: new Set() };
 
 async function listOpened(title, filterId, latest) {
   if (!latest()) return;
   const key = `opened:${title}`;
   if (opened.key !== key) { opened.key = key; opened.checked = new Set(); }
+  const drew = pageRead();
   let res;
   try { res = await api(`/api/view_events?filter=${filterId}`); }
   catch (err) { setStatus(`The events didn't load: ${err.message}`); return; }
   if (!latest()) return;
   const reopen = () => listOpened(title, filterId, claimDetails());
   const render = () => {
-    const { buttons, list } = markableList(res.events, opened.checked, render, () => (showingPage(key) ? reopen() : null));
+    const { buttons, list } = markableList(res.events, opened.checked, render, (done) => done());
     const head = el('div', { class: 'sticky-head' }, el('h2', {}, title),
       el('div', { class: 'actions' }, el('strong', {}, plural(res.total, 'event')), ...(res.total ? buttons : [])));
     stickUnder(list, head);
@@ -93,6 +95,7 @@ async function listOpened(title, filterId, latest) {
       res.total ? list : el('p', {}, 'No event is in this set now.'))], { key, title, reopen });
   };
   render();
+  drew(key, reopen);
 }
 
 function startHere(res) {
@@ -216,7 +219,8 @@ function holds(res) {
     el('td', {}, `${h.role}${h.guessed ? ' (guessed)' : ''}`),
     el('td', {}, h.os || 'Not recorded'),
     el('td', { class: 'num' }, h.events ? num(h.events, () => openView([], [{ host: h.host }], `${h.host}: all events`), `Show ${h.host}'s events on the timeline`) : '0',
-       ...(h.untimed ? [el('div', { class: 'muted' }, `and ${h.untimed.toLocaleString()} without a time`)] : [])),
+       ...(h.untimed ? [el('div', { class: 'muted' }, `and ${h.untimed.toLocaleString()} without a time`)] : []),
+       ...(h.skipped ? [el('div', { class: 'muted' }, `and ${h.skipped.toLocaleString()} skipped`)] : [])),
     el('td', {}, h.first == null ? '' : `${when(h.first)} to ${when(h.last)}`),
     el('td', { title: h.kinds.map((k) => `${k.label}: ${plural(k.events, 'event')}`).join('\n') }, evidence(h)),
     el('td', { class: h.clock.flag ? 'flag' : '', title: h.clock.reason }, h.clock.text),
@@ -254,7 +258,7 @@ function errorList(entries) {
 function gaps(g) {
   const items = [
     ...g.runs.map((r) => el('li', { 'data-run': r.run_id }, el('span', { class: 'warn' }, `${r.name} on ${r.host || 'no host'}:`),
-      r.status === 'failed' ? ` failed${r.reason ? `: ${r.reason}` : ''}. ` : ` ran and loaded nothing${r.reason ? `. ${r.reason}` : ''}. `,
+      ` ${sentence(r.status === 'failed' ? `failed${r.reason ? `: ${r.reason}` : ''}` : `ran and loaded nothing${r.reason ? `. ${r.reason}` : ''}`)} `,
       button('See the run', () => { showTab('timeline'); showTools(false, { run: r.run_id }); }, { class: 'linklike' }))),
     ...(g.unidentified ? [el('li', {}, el('span', { class: 'warn' }, `${plural(g.unidentified, 'file')} intake could not identify,`),
       ' kept in the manifest and hashed. ',
@@ -288,12 +292,12 @@ const FULL_REASONS = { 'case close': "at the case's close", 'full check when wri
 
 // A file intake couldn't read stays unverified once it can be read, as it has no intake hash, and so do the files of a
 // folder it couldn't list, so with either in the case the match is of the files with an intake hash, not of every
-// readable one
+// readable one. A re-hash that didn't match names its problems and manifest.jsonl's verdict against its record.
 function integrity(i) {
   const full = i.last_full;
   const matched = i.unreadable || i.unlisted ? 'every file with an intake hash matched' : 'every readable file matched';
   const rehash = full ? `${full.at.slice(0, 10)}, ${FULL_REASONS[full.reason] || full.reason}: ` +
-    (full.result === 'ok' ? matched : plural(full.problems, 'problem')) : 'none yet';
+    (full.result === 'ok' ? matched : mismatchFound(full)) : 'none yet';
   const field = (label, value, attrs = {}) => el('span', attrs, `${label}: `, el('b', {}, value));
   // Problems found since the last full re-hash that matched, which a later run's check can't clear. A file a check
   // couldn't read had no hash compared, so it is counted apart from a changed one; with both, the date is the newest's.
@@ -319,6 +323,9 @@ function integrity(i) {
        (i.unreadable ? `; ${i.unreadable.toLocaleString()} could not be read` : '') +
        (i.unlisted ? `; ${plural(i.unlisted, 'folder')} could not be listed` : '')),
     ...found, ...lines, field('Last full re-hash', rehash, { id: 'ovRehash' }),
+    // manifest.jsonl against its record in the journal, from case format 4
+    ...(i.manifest ? [field('manifest.jsonl', i.manifest.text,
+                            { id: 'ovManifest', ...(i.manifest.warn ? { class: 'warn' } : {}) })] : []),
     i.journal ? journalRow(i.journal) : field('Journal', plural(i.journal_entries, 'entry', 'entries')),
     field('Times shown', i.times), field('Build', i.build));
 }

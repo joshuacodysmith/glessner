@@ -34,6 +34,9 @@ class ParseContext:
     # A case format whose key rule the parser gives each event too, in Event.former, for that format's upgrade
     # (parsers.FORMER_RULES, rekey.py); 0 for none
     former: int = 0
+    # For a parser that counts what it makes no event of (parsers.COUNTS_SKIPPED): a count for each file it read, in the
+    # order read, 0 for a file it made an event of every row or line of
+    skipped: list[int] = field(default_factory=list)
 
 
 LOCAL_TIME_NOTE = "Local times read in "   # a note the next load replaces (runner.load_output)

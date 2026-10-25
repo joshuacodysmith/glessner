@@ -387,9 +387,12 @@ button > .count.pending, button > .count.review { border: 1px solid var(--suspic
 /* "Technique" above the box, so the box and its list take the menu's width and a technique's name reads on one line */
 #quickMenu .menu-technique { display: grid; gap: 2px; padding: 2px 12px 4px; }
 #quickMenu .menu-technique .attack-input input[type="text"] { width: 100%; }
-/* Two lines kept for the hint, whose words change as the list comes and as the analyst types, so the menu placed at its
-   first size doesn't grow past the window's foot */
-#quickMenu .menu-technique .attack-hint { min-height: 2.8em; }
+/* The hint's words change as the list comes and as the analyst types. A hint that sized the menu would widen it after
+   placement, into the window's edge, so the hint has a fixed width and the menu keeps the width and the right edge it
+   was placed with. 34em of the hint's 12 px, with the box's padding, is inside the menu's max-width, and holds the
+   usual wording on one line. Two lines kept for the hint, which its usual wordings fit, so the menu placed at its first
+   size doesn't grow past the window's foot; a long query quoted in the no-match line can take a third */
+#quickMenu .menu-technique .attack-hint { width: 34em; min-height: 2.8em; }
 /* An address row's View menu: its View choices check when in the View filter, and the search item lines up. */
 #quickMenu button[role="menuitemcheckbox"] { display: block; width: 100%; padding: 3px 12px; border: 0; border-radius: 0;
                                              background: transparent; text-align: left; }
@@ -994,8 +997,12 @@ header .grow { flex: 1 1 auto; }
 .ov-dot { display: inline-block; width: 9px; height: 9px; margin-right: 4px; border-radius: 2px; vertical-align: -1px; }
 .ov-dot.malicious { background: var(--malicious); } .ov-dot.suspicious { background: var(--suspicious); }
 .ov-dot.authorized { background: var(--authorized); }
-.ov-stats { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 4px 16px; margin-top: 10px; }
+/* The labels take the width they need, up to what leaves the values 40% of the box, so the longest label wraps rather
+   than pushing the values past the section's edge */
+.ov-stats { display: grid; grid-template-columns: auto minmax(40%, 1fr); gap: 4px 16px; margin-top: 10px; }
 .ov-stats > :nth-child(odd) { color: var(--muted); }
+/* The last pair, Your last action, spans both columns: its value is a sentence, too long for the value column */
+.ov-stats > :nth-last-child(-n+2) { grid-column: 1 / -1; }
 .ov-table { width: 100%; border-collapse: collapse; }
 .ov-table th { padding: 3px 6px; text-align: left; font-size: 11.5px; font-weight: 600; color: var(--muted);
                border-bottom: 1px solid var(--line); }

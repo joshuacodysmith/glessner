@@ -1,4 +1,4 @@
-import { $, codePrefix, cut, DRAG_THRESHOLD_PX, el, fmtUs, HIT_PX, markBadge, markState, plural, ROW_H, S, WHEEL_MAX_PX, WHEEL_PX_PER_DOUBLING, WHEEL_UNIT_PX } from './core.js';
+import { $, codePrefix, cut, DRAG_THRESHOLD_PX, el, fmtUs, HIT_PX, markBadge, markState, plural, ROW_H, S, showControls, WHEEL_MAX_PX, WHEEL_PX_PER_DOUBLING, WHEEL_UNIT_PX } from './core.js';
 import { cancelAnimation, densityMode, scheduleFetch, zoomAtArrow, zooms, zoomToCell } from './data.js';
 import { draw } from './draw.js';
 import { claimDetails, loadDetails, setPage } from './event_page.js';
@@ -48,11 +48,12 @@ function tickHost(e, row) {
 
 // The tooltip's content as nodes: an event leads with its review state, kind, and host on one line, and the
 // time and message under it. The state is a word, so it has no badge. A density bar and a logon arrow keep their text.
+// The evidence in it, the message, host names, and accounts, shows its bidi controls.
 export function describe(hit, row = -1) {
   if (hit.kind === 'event') {
     const e = hit.e;
     return [el('div', { class: 'l1' }, `${markState(e.mark).word} · ${tickKind(e)} · ${tickHost(e, row)}`),
-            `${fmtUs(e.ts)} UTC · ${e.msg}${e.hit >= 3 ? ' · Hayabusa hit' : ''}`];
+            showControls(`${fmtUs(e.ts)} UTC · ${e.msg}${e.hit >= 3 ? ' · Hayabusa hit' : ''}`)];
   }
   if (hit.kind === 'cell') return [`${plural(hit.count, 'event')}\n${fmtUs(hit.from)} to ${fmtUs(hit.to)} UTC` +
                                    (hit.hit >= 3 ? '\nIncludes a Hayabusa hit at medium or above' : '') + '\nClick to zoom in'];
@@ -60,7 +61,7 @@ export function describe(hit, row = -1) {
   const who = l.accounts ? l.accounts.join(', ') : l.account;
   const when = l.count > 1 ? `${fmtUs(l.ts)} UTC, the middle one` : `${fmtUs(l.ts)} UTC`;
   const kinds = l.kinds ? l.kinds.join(', ') : `${l.kind}, source by ${l.via}`;
-  return [`${l.source} -> ${l.target}${l.count > 1 ? ` (${l.count} logons)` : ''}\n${who}\n${kinds}\n${when}` +
+  return [showControls(`${l.source} -> ${l.target}${l.count > 1 ? ` (${l.count} logons)` : ''}\n${who}\n${kinds}\n${when}`) +
           (!l.uid ? '\nClick to zoom in' : densityMode() ? '\nClick to select this logon and zoom in to it' : '')];
 }
 

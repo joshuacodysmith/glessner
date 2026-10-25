@@ -12,14 +12,32 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
+from typing import NamedTuple
 
 import duckdb
 
 from . import heads
 from .case import CASE_FORMAT, FIRST_CHAINED, JOURNAL_FILE, Case, CaseError, copy_case, create_case, open_case
 from .events import connect, from_us
-from .intake import add_new, check_files, current_entries, intake, matched_text, read_manifest, unverified_text
+from .intake import (
+    ManifestCheck,
+    add_new,
+    check_files,
+    current_entries,
+    first_unvouched,
+    intake,
+    manifest_missing,
+    manifest_state,
+    manifest_text,
+    matched_text,
+    read_manifest,
+    record_at_head,
+    recorded_manifest,
+    records_manifest,
+    unverified_text,
+)
 from .journal import REPLAY_ERRORS, Journal, JournalError, check, head_of, replay
+from .journal import Check as JournalCheck
 from .line_logs import LAYOUTS
 from .overview import counted_actions, utc_minute
 from .parsers.common import evidence_relative
@@ -32,7 +50,7 @@ UNIDENTIFIED_SHOWN = 25
 CHANGED = "The journal was changed after it was written"   # how Journal.read_only's reason begins
 # What verify prints for a case below format 3, which has no chain to check
 UNCHAINED = ("The journal has no hash chain yet: this case is format {}, and its next open for work, or a command that "
-             "writes, upgrades it to format 3, which starts the chain.")
+             f"writes, upgrades it to format {CASE_FORMAT}, which starts the chain.")
 
 
 class _Version(argparse.Action):
@@ -172,10 +190,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
 
-def _require_intake(case: Case) -> None:
-    """Refuse a command that reads the intake manifest before the case has one, in add_new's words."""
-    if not case.manifest_path.exists():
-        raise CaseError("No intake manifest yet; run intake first.")
+def _require_intake(case: Case, missing: str = "No intake manifest yet; run intake first.") -> None:
+    """Refuse a command that reads the intake manifest before the case has one, in add_new's words (`missing`); a
+    manifest the journal records is missing, not yet to be taken in, and intake refuses it (manifest_missing)."""
+    if case.manifest_path.exists():
+        return
+    path = case.folder / JOURNAL_FILE
+    if records_manifest(case) and path.is_file() and (records := check(path).manifests):
+        raise CaseError(manifest_missing(records))
+    raise CaseError(missing)
 
 
 def cmd_copy_case(args) -> int:
@@ -198,7 +221,19 @@ def cmd_copy_case(args) -> int:
 
 
 def cmd_intake(case: Case, args) -> int:
-    summary = add_new(case) if args.add else intake(case)
+    """Intake, or with --add Add new evidence. On a case whose journal records the manifest (records_manifest), the
+    journal's open for work comes first, and a break refuses before any evidence file is hashed: a bare Journal's
+    read_only misses a missing chain, a head record that names no line, a changed newest line, and bytes after the last
+    LF, which only the open's checks find. The open moves the head recorded outside the case to the newest line, so Add
+    new evidence counts the manifest's record at or before the head as the open found it (add_new's `at_open`). Below
+    that format the command writes nothing to the journal and upgrades nothing."""
+    journal = None
+    if records_manifest(case):
+        journal = Journal(case)
+        journal.open_for_work(record_build=False)
+        if journal.read_only:
+            raise JournalError(journal.read_only)
+    summary = add_new(case, journal, at_open=True) if args.add else intake(case, journal=journal)
     print(f"{plural(summary.files, 'new file' if args.add else 'file')}, {summary.total_bytes / 1e6:,.1f} MB hashed")
     for artifact, count in summary.by_artifact.items():
         print(f"  {artifact:<14} {count:>6,}")
@@ -222,10 +257,14 @@ def cmd_intake(case: Case, args) -> int:
 
 
 def cmd_verify(case: Case, args) -> int:
-    """Re-hash every evidence file, then check the journal. A file intake couldn't read is named as
-    unverified, never counted as matching; it fails nothing, since no later check can give it a hash, even when it is
-    the only file. A manifest with no entry at all leaves nothing to check, which is not a match: the evidence's exit
-    is 1.
+    """Check the journal, then compare manifest.jsonl with its record there and re-hash every evidence file. A file
+    intake couldn't read is named as unverified, never counted as matching; it fails nothing, since no later check can
+    give it a hash, unless no file at all could be checked. Then nothing was verified, which is not a match: the
+    evidence's exit is 1, as it is for a manifest with no entry at all. A manifest that grew past or differs from its
+    record fails as an evidence problem does; one with no record fails nothing; one missing while the journal records it
+    fails with nothing re-hashed. A copy's first record that names why its source couldn't vouch for it is followed by
+    that reason, which fails nothing. The journal is read again after the re-hash: a record written meanwhile, as Add
+    new evidence writes one, fails the check, since the manifest compared may not be the one re-hashed.
     With --journal, only the journal, which needs no evidence and writes nothing, journal.lock included."""
     expect, file = getattr(args, "expect_head", None), getattr(args, "file", None)
     if expect is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", expect):
@@ -233,11 +272,17 @@ def cmd_verify(case: Case, args) -> int:
     if file is not None and not file.is_file():   # before minutes of evidence hashing, and an error, not a traceback
         raise CaseError(f"--file {file} is not a file this command can read.")
     if getattr(args, "journal", False):
-        lines, code, _ = journal_verify(case, expect, file)
-        print("\n".join(lines))
-        return code
+        verified = journal_verify(case, expect, file)
+        print("\n".join(verified.lines))
+        return verified.code
+    verified = journal_verify(case, expect, file)
+    manifest = _manifest_check(case, verified)
+    if manifest is not None and manifest.missing:   # nothing to re-hash the evidence against
+        print(manifest_text(manifest))
+        print("\n".join(verified.lines))
+        return 1
     _require_intake(case)
-    found = check_files(case, reason="manual full verification")
+    found = check_files(case, reason="manual full verification", manifest=manifest)
     unread = unverified_text(found.unverified, shown=len(found.unverified))
     code = 0
     if found.problems:
@@ -249,32 +294,76 @@ def cmd_verify(case: Case, args) -> int:
         code = 1
     elif unread:
         print(f"{matched_text(found.checked)} {unread}")
+        code = int(not found.checked)   # intake hashed none of the files, and no later check can give one a hash
     elif found.checked:
         print("All evidence files match the manifest.")
     else:
         print("No evidence file to check: the intake manifest lists none.")
         code = 1
-    lines, journal_code, unchained = journal_verify(case, expect, file)
-    print("\n".join(lines))
+    if manifest is not None:
+        print(manifest_text(manifest))
+        code = max(code, int(manifest.failed))
+        if moved := _record_moved(case, verified.found):
+            print(moved)
+            code = 1
+    print("\n".join(verified.lines))
     # A case below format 3 has no chain to check until its upgrade, so its exit is the evidence's
-    return code if unchained else max(code, journal_code)
+    return code if verified.unchained else max(code, verified.code)
 
 
-def journal_verify(case: Case, expect: str | None, file: Path | None) -> tuple[list[str], int, bool]:
+class JournalVerified(NamedTuple):
+    """journal_verify's answer: its lines, its exit, whether the journal is a case's below format 3, which has no chain
+    yet, and the full check with the head it compared, in words, None when it compared none."""
+    lines: list[str]
+    code: int
+    unchained: bool
+    found: JournalCheck | None = None
+    against: str | None = None
+
+
+def _manifest_check(case: Case, verified: JournalVerified) -> ManifestCheck | None:
+    """verify's ManifestCheck, None for a case whose journal doesn't record the manifest or can't be read: the record at
+    or before the head the journal's check compared, by line (record_at_head), as --file counts a file's record. A
+    manifest.jsonl that is gone while the journal holds a record of it is missing."""
+    if not records_manifest(case) or verified.found is None:
+        return None
+    found, against = verified.found, verified.against
+    record, later = record_at_head(found, against is not None)
+    return ManifestCheck(manifest_state(case, record), record["seq"] if record else None, later, against,
+                         against is None or found.expected is not None,
+                         not case.manifest_path.exists() and bool(found.manifests),
+                         unvouched=first_unvouched(found.manifests))
+
+
+def _record_moved(case: Case, before: JournalCheck) -> str:
+    """What verify says when the journal's newest manifest record isn't the one its first check read: Add new evidence
+    wrote one during the re-hash, so the manifest compared may not be the one re-hashed. "" when it is the same."""
+    path = case.folder / JOURNAL_FILE
+    if not path.is_file():
+        return ""
+    after = check(path).manifests
+    newest = after[-1]["seq"] if after else None
+    if newest is None or newest == (before.manifests[-1]["seq"] if before.manifests else None):
+        return ""
+    return (f"Entry #{newest} recorded manifest.jsonl while this check ran, so the manifest compared may not be the one "
+            "re-hashed. Run verify again when no Glessner program is adding evidence.")
+
+
+def journal_verify(case: Case, expect: str | None, file: Path | None) -> JournalVerified:
     """The journal's full check in words: every break by line
     and entry, each break on record, where the expected head is, or this computer's recorded head without one, the
     head, and with `file` whether a record of it comes at or before that head. Returns the lines, the exit (0
-    only when consistent and the file covered), and whether the journal is a case's below format 3, which has no chain
-    yet. Writes nothing: no Journal object, which creates a missing journal file, and journal.check opens journal.lock
-    read-only, only when it exists."""
+    only when consistent and the file covered), whether the journal is a case's below format 3, which has no chain
+    yet, and the check with the head it compared. Writes nothing: no Journal object, which creates a missing journal
+    file, and journal.check opens journal.lock read-only, only when it exists."""
     path = case.folder / JOURNAL_FILE
     if not path.is_file():
-        return [f"No {JOURNAL_FILE} in {case.folder}, so there's no journal to check."], 1, False
+        return JournalVerified([f"No {JOURNAL_FILE} in {case.folder}, so there's no journal to check."], 1, False)
     record = None if expect else heads.read(case.folder)
     against = expect or (record["head"] if record else None)
     found = check(path, against, keep=True)
     if not found.chain.chained and case.settings.case_format < FIRST_CHAINED:
-        return [UNCHAINED.format(case.settings.case_format)], 1, True
+        return JournalVerified([UNCHAINED.format(case.settings.case_format)], 1, True)
     named = "the expected head" if expect else "the head this computer recorded"
     lines = []
     for p in found.problems:
@@ -324,7 +413,7 @@ def journal_verify(case: Case, expect: str | None, file: Path | None) -> tuple[l
         text, covered = _file_record(file, found, against, named)
         lines.append(text)
         code = max(code, int(not covered))
-    return lines, code, False
+    return JournalVerified(lines, code, False, found, named if against else None)
 
 
 def _file_record(file: Path, found, against: str | None, named: str) -> tuple[str, bool]:
@@ -649,9 +738,9 @@ def cmd_runs(case: Case, args) -> int:
 
 
 def _rebuild(case: Case) -> tuple[list, int]:
-    """Rebuild, printing each note it adds to a run: a run it left out, or loaded with output files it recorded no hash
-    for. Returns the runs it read and how many it left out, which rebuild and copy-case count apart
-    and exit 1 for: a left-out run is not a rebuilt one."""
+    """Rebuild, printing each note it adds to a run: a run it left out, one loaded with output files it recorded no hash
+    for, or found output loaded with files beside it that the manifest doesn't list. Returns the runs it read and how
+    many it left out, which rebuild and copy-case count apart and exit 1 for: a left-out run is not a rebuilt one."""
     left_out = 0
 
     def note(record, text: str) -> None:
@@ -761,22 +850,33 @@ class OpenProgress:
 
 
 def _serve_open(case: Case):
-    """The Hub with `case` open, saying in the command window what the open is doing as it goes."""
+    """The Hub with `case` open, saying in the command window what the open is doing as it goes, and, for a case of an
+    earlier format, the format the open left it at."""
     from .server import Hub
 
     print(f"Opening {case.settings.name!r} from {case.folder}.", flush=True)
-    if (found := case.settings.case_format) < CASE_FORMAT:
+    found = case.settings.case_format
+    if found < CASE_FORMAT:
+        # The steps up to the chain read every run and rewrite events. The later ones journal, and read and reload runs
+        # only for found output that was loaded while case.yaml named the evidence through a link
+        slow = (" The upgrade runs once, and on a large case it takes a while; each step is listed as it starts."
+                if found < FIRST_CHAINED else "")
         print(f"It is at case format {found}, from an earlier build, so this open upgrades it to format {CASE_FORMAT} "
-              "first. The upgrade runs once, and on a large case it takes a while; each step is listed as it starts.",
-              flush=True)
+              f"first.{slow}", flush=True)
     with OpenProgress() as progress:
         hub = Hub(case, report=progress)
         progress.finish()
+    if found < CASE_FORMAT:
+        reached = hub.app.case.settings.case_format
+        print(f"It is now at case format {reached}, which older builds can't open." if reached == CASE_FORMAT else
+              f"Its journal is read-only, so it stays at case format {reached} and opens read-only; the Case overview "
+              "says why.", flush=True)
     return hub
 
 
 def cmd_serve(case: Case | None, args) -> int:
-    from .server import PREFERRED_PORT, Hub, serve_hub  # imported here so other commands don't load the server
+    # imported here so other commands don't load the server
+    from .server import PREFERRED_PORT, SHUTDOWN_WAIT_SECONDS, Hub, serve_hub
 
     # Without a case, the start page: recent cases, a new case, or a copy. A case opened later from there,
     # or the one given here, can be switched from the page's Cases button.
@@ -802,15 +902,19 @@ def cmd_serve(case: Case | None, args) -> int:
         pass
     finally:
         server.server_close()
-        if hub.app:
-            hub.app.con.close()
+        if running := hub.close():
+            one = running == 1
+            print(f"{plural(running, 'request')} {'was' if one else 'were'} still running when the "
+                  f"{SHUTDOWN_WAIT_SECONDS:g} second wait for {'it' if one else 'them'} ended, so the events database was "
+                  f"closed under {'it' if one else 'them'}.", file=sys.stderr)
     return 0
 
 
 def _open_app(case: Case):
     """The server's case state, without HTTP: derived tables, identity, and built-in rules. The case is upgraded first,
-    since a format 3 journal takes no entry until its chain has started; while
-    another program has the case open, the upgrade or the App's connection refuses, before anything is written."""
+    since a journal from before format 3 takes no entry until its chain has started, and each later format's step
+    journals itself; while another program has the case open, the upgrade or the App's connection refuses, before
+    anything is written."""
     from .server import App
 
     if not case.db_path.exists():
@@ -905,13 +1009,19 @@ def head_after(result: dict) -> str:
 def cmd_close(case: Case, args) -> int:
     """Full re-hash of the evidence against the intake manifest at case close, recorded in the journal.
 
-    Closing does not lock the case: the analyst can keep working, and can close again later. An older case is upgraded
-    before the re-hash, since a format 3 journal takes no entry until its chain has started; beside a running server of
-    this build the case is format 3 already, and the entry takes its turn under the journal's lock.
+    Closing does not lock the case: the analyst can keep working, and can close again later. A case from before format 3
+    is upgraded before the re-hash, since its journal takes no entry until its chain has started. A case with the chain
+    stays at its format: its journal takes the entry, and close works beside a running server, which holds the events
+    database a later format's step needs, such as a server of an earlier build or one whose case stayed at format 3
+    with a read-only journal. The entry takes its turn under the journal's lock. On a case whose journal records the
+    manifest, manifest.jsonl is compared with its record before the re-hash, and a manifest that grew past or differs
+    from its record fails the close as an evidence problem does; the entry records the comparison. The record counts
+    at or before the head recorded outside the case as the open found it, since the open moves that head to the newest
+    line, past any record appended after it.
     """
-    if not case.manifest_path.exists():
-        raise CaseError("No intake manifest; run intake before closing the case.")
-    case = upgraded(case)
+    _require_intake(case, "No intake manifest; run intake before closing the case.")
+    if case.settings.case_format < FIRST_CHAINED:
+        case = upgraded(case)
     # The open's checks, then the full check and the recorded head, before the re-hash, so a broken chain is refused
     # before minutes of hashing
     journal = Journal(case)
@@ -919,19 +1029,21 @@ def cmd_close(case: Case, args) -> int:
     chain, record = journal.full_check()
     if journal.read_only:
         raise JournalError(journal.read_only)
-    found = check_files(case, reason="case close")
+    manifest = recorded_manifest(case, journal, at_open=True)
+    found = check_files(case, reason="case close", manifest=manifest)
     problems, entries, unread = found.problems, found.checked, found.unverified
     result = "ok" if not problems else "mismatch"
     # evidence_files counts the files checked. A file intake couldn't read is counted in unverified, not as matching,
     # and a folder walk couldn't list in unlisted_folders; verification.jsonl names each
     since = chain.chain.on_record[-1]["seq"] if chain.chain.on_record else None
-    entry = journal.append("case_setting", name="closed",
-                           value={"at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "evidence_files": entries,
-                                  "unverified": len(unread) - found.folders, "unlisted_folders": found.folders,
-                                  "hash_check": result, "problems": problems[:50],
-                                  "chain": f"consistent since #{since}" if since else "consistent",
-                                  "head_record": "matched" if record and chain.expected else "none",
-                                  "journal_entries": chain.chain.nonblank + (chain.tail == "missing_lf")})
+    value = {"at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "evidence_files": entries,
+             "unverified": len(unread) - found.folders, "unlisted_folders": found.folders, "hash_check": result,
+             "problems": problems[:50], "chain": f"consistent since #{since}" if since else "consistent",
+             "head_record": "matched" if record and chain.expected else "none",
+             "journal_entries": chain.chain.nonblank + (chain.tail == "missing_lf")}
+    if manifest is not None:
+        value["manifest"] = manifest.key
+    entry = journal.append("case_setting", name="closed", value=value)
     unread_text = unverified_text(unread, shown=len(unread))
     head = (f"Journal head after this close: {head_of(entry)} (entry #{entry['seq']}). Record it outside the case "
             "folder, such as in your case notes or ticket.")
@@ -941,17 +1053,17 @@ def cmd_close(case: Case, args) -> int:
             print(f"  {problem}")
         if unread_text:
             print(unread_text)
-        print(head)
-        return 1
-    if unread_text:
+    elif unread_text:
         print(f"Case closed. {matched_text(entries)} {unread_text} Recorded in the journal.")
     elif not entries:
         print("Case closed. No evidence file was checked: the intake manifest lists none. Recorded in the journal.")
     else:
         each = "The 1 evidence file matches" if entries == 1 else f"All {entries:,} evidence files match"
         print(f"Case closed. {each} the intake manifest. Recorded in the journal.")
+    if manifest is not None:
+        print(manifest_text(manifest))
     print(head)
-    return 0
+    return int(bool(problems) or bool(manifest and manifest.failed))
 
 
 def _parse_utc(text: str) -> int:

@@ -14,6 +14,7 @@ from test_browser_frame import no_tool_scan
 from test_browser_pivots import select
 from test_browser_smoke import (  # noqa: F401
     POINT,
+    RECORD_REQUESTS,
     browser,
     case_menu,
     event_point,
@@ -692,6 +693,11 @@ def test_a_redraw_of_the_same_window_keeps_the_last_action(browser, synthetic_ca
         p.locator("#quickMenu").get_by_role("menuitem", name="Mark Suspicious").click()
         p.wait_for_function(f"() => {STATUS}.startsWith('Marked one event Suspicious · ')")
         p.locator("#filtersButton").click()
+        p.evaluate(RECORD_REQUESTS)
         p.locator("#fpTree").get_by_role("checkbox", name="Show DESKTOP", exact=True).uncheck()
-        p.wait_for_function(f"() => {STATUS}.includes('Sources filtered')")
-        assert re.fullmatch(r"Marked one event Suspicious · \d+ ms \| Sources filtered", p.evaluate(f"() => {STATUS}"))
+        # The window drawn under the filter. A redraw asked for as the panel opened can answer first, under the lanes from
+        # before the change, so the line it gives isn't the one to check.
+        p.wait_for_function("() => window.__taken.some((path) => path.startsWith('/api/view?') && path.includes('&filter='))")
+        # With DESKTOP hidden, DC01's logons from it have no lane to start from, and the view's note says so
+        assert re.fullmatch(r"Marked one event Suspicious · \d+ ms \| Logon links from DESKTOP aren't drawn: [^|]+ \| "
+                            r"Sources filtered", p.evaluate(f"() => {STATUS}"))

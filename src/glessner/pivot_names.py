@@ -118,7 +118,7 @@ def service_branches(names: list[str]) -> list[tuple[str, list]]:
         ("e.log_channel = 'System' AND e.event_code = '7009' AND " + param("param2"), list(names)),
         (f"e.log_channel = 'System' AND e.event_code = '7040' AND ({param('param1')} OR {param('param4')})",
          [*names, *names]),
-        (f"e.event_provider = '{SYSMON}' AND e.event_code IN ('12', '13', '14') AND e.registry_path LIKE '%\\Services\\%'"
+        (f"e.event_provider = '{SYSMON}' AND e.event_code IN ('12', '13', '14') AND e.registry_path ILIKE '%\\Services\\%'"
          f" AND lower(regexp_extract(e.registry_path, '(?i)\\\\Services\\\\([^\\\\]+)', 1)) IN ({marks})", list(names)),
         (f"e.artifact = 'autoruns' AND e.log_channel IN ('Services', 'Drivers') AND ({param('Entry')} OR "
          f"lower(split_part({_json('Description')}, ': ', 1)) IN ({marks}))", [*names, *names]),

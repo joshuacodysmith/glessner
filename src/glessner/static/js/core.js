@@ -94,7 +94,8 @@ export const S = {
   data: null, selected: new Set(), focus: null, related: new Set(), index: [], linkSegs: [],
   windowLinks: [],   // time-window relation: [{uid, gap_s}] around S.focus, drawn dashed
   timer: null, drag: null, linkNote: '', pivotResult: null,
-  linksDrawn: 0, linksFolded: 0,   // the last draw's logon links drawn, and those whose ends fell in one folded group
+  // The last draw's logon links drawn, those whose ends fell in one folded group, and those whose source host had no lane
+  linksDrawn: 0, linksFolded: 0, linksSkipped: 0,
   trail: [], trailAt: -1, trailVia: false,   // the pivot trail of the tab (trail.js), the step on screen, and how the next Event page
   // opens: from a pivot's list (true), by Back ('back'), or neither (false)
   anim: null,   // the window animation in progress: { view, loaded, timer }
@@ -176,7 +177,17 @@ function wholeMatch(pieces, s) {
     && piecesSpan(pieces.slice(1, -1), s.slice(0, end), first.length) !== null;
 }
 
-// Text as nodes, with the highlighted terms in <mark> elements. Text goes in as text nodes, never as HTML.
+// Bidi controls: the marks, embeddings, overrides, and isolates that set the direction of the text around them. Drawn as
+// they are, the override in report<U+202E>fdp.scr reverses what follows it, so the name reads reportrcs.pdf. Text shown to
+// a reader goes through showControls, which writes each control as a visible [U+XXXX]. Values the page reads back or
+// sends, such as an input's value, a data attribute, or copied text, keep the character. Zero-width characters aren't
+// among them: U+200D joins the parts of an emoji in ordinary text.
+const BIDI_CONTROLS = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+export const showControls = (text) => String(text).replace(BIDI_CONTROLS,
+  (c) => `[U+${c.codePointAt(0).toString(16).toUpperCase().padStart(4, '0')}]`);
+
+// Text as nodes, with the highlighted terms in <mark> elements. Text goes in as text nodes, never as HTML. The terms are
+// found in the text as recorded; el and the <mark> show its bidi controls.
 export function marked(text) {
   const s = String(text ?? '');
   if (!S.highlight || !s) return [s];
@@ -200,7 +211,7 @@ export function marked(text) {
     const from = Math.max(a, pos);
     if (from > pos) out.push(s.slice(pos, from));
     const mark = document.createElement('mark');
-    mark.textContent = s.slice(from, b);
+    mark.textContent = showControls(s.slice(from, b));
     out.push(mark);
     pos = b;
   }
@@ -209,15 +220,20 @@ export function marked(text) {
 }
 export const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
+// The attributes a reader sees or hears, which show bidi controls. Every other attribute, such as a value, a data-*
+// attribute, an href, or an id, keeps its value, since the page reads it back or sends it.
+const SHOWN_ATTRS = new Set(['title', 'aria-label', 'placeholder']);
+
+// An element with its attributes and children. A child that isn't a node goes in as text, with its bidi controls shown.
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
     if (k === 'class') node.className = v;
     else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
     else if (k === 'style') node.style.cssText = v;   // the CSP blocks style attributes, not the DOM
-    else node.setAttribute(k, v);
+    else node.setAttribute(k, SHOWN_ATTRS.has(k) ? showControls(v) : v);
   }
-  for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(showControls(c)));
   return node;
 }
 
@@ -343,7 +359,12 @@ export function gapTitle(s) {
 }
 // The window a timeline export covers, as the Findings page's window card names it.
 export const windowText = (view = S.view) => `${fmtMs(view.start)} to ${fmtMs(view.end)} UTC`;
-export const setStatus = (text) => { const s = $('status'); s.textContent = text; s.title = text; };   // its hover, when cut short
+// The status line's text, with its bidi controls shown, and the same as its hover, for a line cut short
+export function setStatus(text) {
+  const s = $('status'), shown = showControls(text ?? '');
+  s.textContent = shown;
+  s.title = shown;
+}
 // The status line: the last action and the server's time for it, then the view's notes after " | ".
 // An action reports itself after its redraw; a redraw of the same window keeps the last action, and a new window is itself
 // the last action, "Window moved" (data.showData). The line holds the action and the view's notes together, so a redraw
@@ -394,6 +415,8 @@ export function markBadge(e) {
 export const cut = (text, n) => (text.length > n ? `${text.slice(0, n)}…` : text);
 // A count and its noun, singular for 1: "1 event", "2 events".
 export const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
+// A sentence that ends in one period: text that already ends in one, as a note or a reason can, takes no second.
+export const sentence = (text) => (text.endsWith('.') ? text : `${text}.`);
 // A list row's event code, before its message. An event log message starts with its event ID, so the code isn't
 // written twice, as "4624 4624 Successful logon".
 export const codePrefix = (e) => (e.code && !String(e.msg ?? '').startsWith(`${e.code} `) ? `${e.code}  ` : '');

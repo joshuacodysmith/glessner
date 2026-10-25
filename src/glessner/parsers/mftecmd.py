@@ -2,8 +2,9 @@
 
 Each MFT record carries four $STANDARD_INFORMATION (0x10) and four $FILE_NAME (0x30) times. Times
 that share a value become one event labeled with MACB letters (Modified, Accessed, Changed, Born),
-as a supertimeline does. Deleted records and timestomping indicators are kept and flagged. A row with no readable time
-makes no event, and the run's notes count such rows.
+as a supertimeline does. Deleted records are kept. The message flags a deleted record, MFTECmd's SI<FN and copied
+marks, and $SI times with zero microseconds. MFTECmd sets SI<FN on most records of an ordinary volume, so the flag
+names the mark and nothing more. A row with no readable time makes no event, and the run's notes count such rows.
 """
 
 from __future__ import annotations
@@ -24,11 +25,15 @@ EXTRA_COLUMNS = ("EntryNumber", "SequenceNumber", "ParentEntryNumber", "ParentSe
 
 def parse_mftecmd(ctx: ParseContext) -> Iterator[Event]:
     dropped = 0
-    for row in (row for path in output_paths(ctx, "mftecmd", OUTPUT_FILE) for row in read_csv_rows(path)):
-        events = list(events_from_row(row, ctx))   # a row has at most eight
-        if not events:
-            dropped += 1
-        yield from events
+    for path in output_paths(ctx, "mftecmd", OUTPUT_FILE):
+        in_file = 0
+        for row in read_csv_rows(path):
+            events = list(events_from_row(row, ctx))   # a row has at most eight
+            if not events:
+                in_file += 1
+            yield from events
+        ctx.skipped.append(in_file)
+        dropped += in_file
     if dropped:
         one = dropped == 1
         ctx.notes.append(f"{SKIPPED_NOTE}{dropped:,} {'row' if one else 'rows'} of MFTECmd's CSV: none of "
@@ -42,7 +47,7 @@ def events_from_row(row: dict[str, str], ctx: ParseContext) -> Iterator[Event]:
     if row.get("InUse") == "False":
         flags.append("deleted")
     if row.get("SI<FN") == "True":
-        flags.append("SI<FN, possible timestomping")
+        flags.append("SI<FN")
     if row.get("uSecZeros") == "True":
         flags.append("SI times have zero microseconds")
     if row.get("Copied") == "True":

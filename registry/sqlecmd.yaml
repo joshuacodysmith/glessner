@@ -21,6 +21,9 @@ run:
   timeout_minutes: 30
 options: []
 outputs: ["*.csv"]
+# The database maps it reads from its Maps folder: a run records their SHA-256 and names the set by its count of maps.
+tool_files: [Maps]
+rules_label: {kind: count, path: 'Maps\*.smap', text: "Maps, {value} maps"}
 empty_result: "SQLECmd's maps matched none of the host's SQLite databases."
 empty_ok: true
 parser: sqlecmd_csv

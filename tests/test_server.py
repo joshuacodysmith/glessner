@@ -9,14 +9,17 @@ import time
 from pathlib import Path
 
 import pytest
-from conftest import DOTTED_QUAD, METASPLOIT, T0, serving
+from conftest import DOTTED_QUAD, METASPLOIT, T0, close_first, serving
 
 from glessner.server import CASE_HEADER, MAX_BODY, SESSION_HEADER, START_GET_ROUTES
 
 
 def request(port, method, path, *, session=None, host=None, body=None, headers=None):
+    """One request on a connection of its own: the answer and its body. The request says Connection: close, and the
+    client closes only after the server has closed its side, so the TIME_WAIT holds the server's one port, which all
+    its connections share, rather than a client port for each connection."""
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    h = {"Host": host or f"127.0.0.1:{port}"}
+    h = {"Host": host or f"127.0.0.1:{port}", "Connection": "close"}
     if session:
         h[SESSION_HEADER] = session
     if headers:
@@ -25,8 +28,11 @@ def request(port, method, path, *, session=None, host=None, body=None, headers=N
     if data is not None:
         h.setdefault("Content-Type", "application/json")
     conn.request(method, path, body=data, headers=h)
-    res = conn.getresponse()
-    payload = res.read()
+    # A reader of its own keeps the socket open after the answer is read, until the server's side has closed
+    with conn.sock.makefile("rb") as rest:
+        res = conn.getresponse()
+        payload = res.read()
+        rest.read()
     conn.close()
     return res, payload
 
@@ -423,6 +429,46 @@ def test_a_page_s_requests_share_one_connection(running):
             assert ask(conn, method, path, headers, body) == (status, None, True), (method, path)
     finally:
         conn.close()
+
+
+def test_the_request_helper_leaves_the_close_to_the_server(running):
+    """request() asks the server to close the connection after its answer, and returns once the server has closed its
+    side, so the server's side holds the TIME_WAIT. A server that kept the connection open would time the helper
+    out."""
+    app, port, _ = running
+    res, payload = request(port, "GET", "/api/meta", session=app.session)
+    assert res.status == 200 and res.getheader("Connection") == "close" and json.loads(payload)
+
+
+def test_close_first_ends_the_server_s_side_of_each_connection(synthetic_case):
+    """close_first's hang-up sends the server's FIN on each connection the server accepted, kept-alive ones included,
+    while the client's side is still open: the client reads the end of the stream at once, where before it the
+    connection stayed open."""
+    import threading
+
+    from glessner.server import serve
+
+    server, app, _ = serve(synthetic_case, 0)
+    hang_up = close_first(server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    try:
+        with (socket.create_connection(("127.0.0.1", port), timeout=10) as one,
+              socket.create_connection(("127.0.0.1", port), timeout=10) as two):
+            for sock in (one, two):
+                sock.sendall(f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode())
+                status, headers, _ = read_answer(sock)
+                assert status.split(b" ")[1] == b"200" and "connection" not in headers   # kept open
+            one.settimeout(0.5)
+            with pytest.raises(TimeoutError):
+                one.recv(1)
+            hang_up()
+            one.settimeout(10)
+            assert one.recv(1) == b"" and two.recv(1) == b""
+    finally:
+        server.shutdown()
+        server.server_close()
+        app.con.close()
 
 
 def test_every_request_on_a_kept_connection_is_checked(running):
@@ -1433,3 +1479,71 @@ def test_an_event_s_tags_are_read_from_a_copy_of_the_journal_s(synthetic_case, m
         assert set(app.journal.state.tags[uid]) == {"tag:lateral-movement", "tactic:TA0002"}
     finally:
         app.con.close()
+
+
+FILES = {"fake.exe": "ab" * 32, "rules/": "cd" * 32}   # what a format 4 run of a tool with a rule set records
+
+
+def test_the_tools_page_says_which_rule_set_its_latest_runs_used_and_how_many_rows_they_dropped(synthetic_case, tmp_path):
+    """A tool's last run is the latest successful run of each host, whose labels the page names, with whether any of those
+    runs recorded no tool files, and the sums of their rows without a time and rows skipped. A run replaced by a later
+    one counts for nothing. A tool run before format 4 didn't record its rules, but Suricata's rules were recorded since
+    format 3, so a tool without a rules_label never reads as not recorded, nor does an import or found output."""
+    from glessner.runner import finish_run, start_run
+    from glessner.toolbox import overview
+
+    specs, detected = fake_tool_case(synthetic_case, tmp_path)
+    plain = specs["fake"]
+    labeled = plain.__class__(**{**plain.__dict__, "rules_label": {"kind": "git", "path": "rules", "text": "Fake rules {value}"}})
+
+    def ran(name, host, **fields):
+        record, folder = start_run(synthetic_case, "fake", name, tool_version="1.0", host=host, inputs=["x"], status="ok",
+                                   loaded_rows=10, **fields)
+        finish_run(folder, record)
+
+    def last_run(spec):
+        tool = detected["fake"].__class__(spec, detected["fake"].executable, detected["fake"].version)
+        (row,) = overview(synthetic_case, {"fake": spec}, {"fake": tool})["tools"]
+        return row["last_run"]
+
+    ran("a", "DC01", rules="Fake rules 0000000", tool_files=FILES, rows_skipped=9, rows_without_time=9)   # replaced below
+    ran("b", "DC01", rules="Fake rules 1111111", tool_files=FILES, rows_skipped=2, rows_without_time=3)
+    ran("c", "DESKTOP")   # made before format 4: no tool_files, and no counts
+    last = last_run(labeled)
+    assert (last["rules"], last["rules_unrecorded"], last["without_time"], last["skipped"]) == (
+        ["Fake rules 1111111"], True, 3, 2)
+    # Another host's later run with a label of its own: both are named, in order, and every run recorded its files
+    ran("d", "DESKTOP", rules="Fake rules 2222222", tool_files=FILES, rows_skipped=4)
+    last = last_run(labeled)
+    assert (last["rules"], last["rules_unrecorded"], last["without_time"], last["skipped"]) == (
+        ["Fake rules 1111111", "Fake rules 2222222"], False, 3, 6)
+    # A tool with no rules_label has nothing to record, whatever its run holds
+    unlabeled = last_run(plain)
+    assert (unlabeled["rules_unrecorded"], unlabeled["rules"]) == (False, ["Fake rules 1111111", "Fake rules 2222222"])
+    ran("e", "WS02", from_output=True)   # a load of found output made no tool run
+    assert last_run(labeled)["rules_unrecorded"] is False
+
+
+def test_a_group_of_found_output_loaded_by_its_parser_says_how_many_rows_it_skipped(tmp_path):
+    """Two EVE files found in the evidence, each ending in a line cut short, load as one run whose count of skipped lines
+    is the sum, which the Tools page shows beside the group's events."""
+    from test_runner import eve_lines
+
+    from glessner.case import create_case
+    from glessner.intake import intake
+    from glessner.runner import load_found_output
+    from glessner.toolbox import found_outputs
+    from glessner.tools import load_registry
+
+    evidence = tmp_path / "evidence"
+    for folder, ids in (("a", [1000, 1001]), ("b", [1002])):
+        (evidence / "SENSOR" / folder).mkdir(parents=True)
+        (evidence / "SENSOR" / folder / "eve.json").write_text(eve_lines(ids) + '{"timestamp": "2024', encoding="utf-8")
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    group = lambda: next(g for g in found_outputs(case, load_registry(), {}) if g["key"] == "suricata_eve")
+    assert group()["status"] == "ready"
+    record = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["SENSOR/a/eve.json", "SENSOR/b/eve.json"])
+    assert (record.status, record.rows_skipped) == ("ok", 2)
+    loaded = group()["loaded"]
+    assert (group()["status"], loaded["rows"], loaded["without_time"], loaded["skipped"]) == ("loaded", 3, 0, 2)

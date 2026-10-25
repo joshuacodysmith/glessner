@@ -25,14 +25,16 @@ from .case import Case
 from .caveats import CAVEAT_COLUMNS, caveat_for, caveats_for
 from .caveats import table as caveat_table
 from .clock import in_segment
-from .events import from_us, id_table
+from .events import from_us, id_table, well_formed
 from .hashes import ALGORITHMS
 from .identity import Identity
-from .intake import Check, check_files, unverified_text
-from .journal import Journal, State, head_of
-from .parsers.common import normalize_ip
+from .intake import Check, check_files, manifest_missing, manifest_text, unverified_text
+from .journal import Journal, State, analyst, head_of
+from .parsers.common import file_key, normalize_ip
 from .pivot_names import extra_of, service_names, task_names
 from .queries import BASE_FROM, BASE_WHERE, MARK_EXPR, TS, event_pairs
+from .runner import FOUND_OUTPUT, RunRecord, read_runs, rules_text
+from .tools import load_registry
 from .version import build_id
 
 SECURITY_SID = "json_extract_string(NULLIF(e.extra, ''), '$.SecurityUserID')"   # set by the EvtxECmd parser
@@ -90,8 +92,10 @@ TIMELINE_COLUMNS = [
     (f"COALESCE(array_to_string(x.titles, '; '), {_data('alert.signature')}, {_data('signature')}, '')", "rule.name"),
     (f"COALESCE({_data('alert.signature_id')}, {_data('sid')}, '')", "rule.id"),
     (f"COALESCE({_data('alert.severity')}, {_data('priority')}, '')", "event.severity"),
-    # The connection: Suricata's community ID when its config writes one, else its flow ID; Zeek's uid
-    (f"COALESCE({_data('community_id')}, {_data('flow_id')}, {_zeek('uid')}, '')", "network.community_id"),
+    # The connection, each identifier in its own column: a community ID, when the sensor's config writes one, and only
+    # that; Suricata's flow ID; Zeek's uid
+    (f"COALESCE({_data('community_id')}, '')", "network.community_id"),
+    (f"COALESCE({_data('flow_id')}, '')", "network.flow_id"), (f"COALESCE({_zeek('uid')}, '')", "zeek.uid"),
     # ECS's url.full carries the scheme; a record with an HTTP host or URL is plain HTTP, so it reads http://
     (f"COALESCE('http://' || NULLIF(COALESCE({_data('http.hostname')}, '') || COALESCE({_data('http.url')}, ''), ''), "
      f"'http://' || NULLIF(COALESCE({_zeek('host')}, '') || COALESCE({_zeek('uri')}, ''), ''), '')", "url.full"),
@@ -299,6 +303,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     # can load several hosts in one run, which then go by host.
     runs = con.execute("SELECT run_id, tool, tool_version, origin_host, count(*) FROM events GROUP BY ALL "
                        "ORDER BY run_id, origin_host").fetchall()
+    records = {r.run_id: r for r in read_runs(case)}   # a record this build can't read fails the report, by its file's name
     splits = con.execute("SELECT origin_host, list(DISTINCT host ORDER BY host) FROM events WHERE host <> origin_host "
                          "GROUP BY 1 ORDER BY 1").fetchall()
     uids = [r[0] for r in rows]
@@ -319,7 +324,9 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     if not rehash:
         check = "The evidence is re-hashed when the report is written, not for a preview."
     elif not case.manifest_path.exists():
-        check = "No intake manifest exists, so evidence hashes were not checked."
+        # Once the journal records manifest.jsonl, a missing one is a change, not a case still waiting for intake
+        check = (manifest_missing(state.manifests) if state.manifests
+                 else "No intake manifest exists, so evidence hashes were not checked.")
     else:
         check = _evidence_check(checked if checked is not None else check_files(case, reason=REPORT_CHECK))
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -346,7 +353,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
         lines.append("No events are marked malicious or suspicious yet.")
     for number, row in enumerate(rows[:listed], 1):
         lines += _event_lines(number, row, identity, state.notes, tagged.get(row[0], []), pairs.get(row[0]), manifest,
-                              in_finding.get(row[0], []))
+                              records, in_finding.get(row[0], []))
     if listed is not None and len(rows) > listed:
         lines += ["", f"The preview lists the first {listed:,} of {len(rows):,} events. Write report lists them all."]
     lines += _tactics_section(rows, tagged)
@@ -359,9 +366,46 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     lines += [heading[6], "", f"Written by glessner {build_id()}. The tool runs loaded in this case, by the host each ran "
               "on; the marks and the findings are the analyst's, and a rule's or a tool's suggestion counts only once the "
               "analyst accepts it.", "",
-              "| Run | Tool | Version | Host | Events |", "|---|---|---|---|---|"]
-    lines += [f"| `{run_id}` | {tool} | {version} | {_md(host)} | {count:,} |" for run_id, tool, version, host, count in runs]
+              "| Run | Tool | Version | Host | Events | Rules |", "|---|---|---|---|---|---|"]
+    specs = load_registry()
+    lines += [f"| `{run_id}` | {tool} | {version} | {_md(host)} | {count:,} | "
+              f"{_md(rules_text(records[run_id], specs)) if run_id in records else ''} |"
+              for run_id, tool, version, host, count in runs]
+    lines += _tool_files_lines(list(dict.fromkeys(run[0] for run in runs)), records)
     return "\n".join(lines) + "\n", len(rows)
+
+
+def _tool_files_lines(run_ids: list[str], records: dict[str, RunRecord]) -> list[str]:
+    """The files the runs in the Method table ran with, each distinct set once with the runs that recorded it, in the
+    order of the first of them. A run with no record, or with none of the files (RunRecord.tool_files), is left out; none
+    of the runs recording any leaves no lines."""
+    by_files: dict[tuple, list[str]] = {}
+    for run_id in run_ids:
+        if run_id in records and records[run_id].tool_files:
+            by_files.setdefault(tuple(sorted(records[run_id].tool_files.items())), []).append(run_id)
+    if not by_files:
+        return []
+    lines = ["", "Files each tool ran with, as its runs recorded them, by SHA-256. A path that ends in / is a folder, hashed "
+                 "as the lines `sha256sum` prints for its files, by their paths in the folder with forward slashes, sorted in "
+                 "code point order, leaving out a .git folder and links.", ""]
+    for files, ids in by_files.items():
+        lines.append(f"- {'Run' if len(ids) == 1 else 'Runs'} {', '.join(f'`{run_id}`' for run_id in ids)}:")
+        lines += [f"  - `{_tick(path)}`: `{sha}`" for path, sha in files]
+    return lines
+
+
+def cited_files(path: str, record: RunRecord | None, tool_version: str) -> list[str]:
+    """The evidence files whose intake hashes an event cites, which the Event page and the report share. `path` is the
+    event's source file, `record` its run's record or None, and `tool_version` its own. A tool's run or an import read the
+    file its event names. Output found in the evidence names the files its tool read, which its load never read, so its
+    event cites the output files its run read and hashed (RunRecord.inputs), or the one the event names when it is one of
+    them, as found Amcache, SRUM, and Autoruns output name their CSV and found Suricata output its EVE file. With no record
+    of its run, which the tool version tells as found output still, it cites none."""
+    from_output = record.from_output if record else tool_version == FOUND_OUTPUT
+    if not from_output:
+        return [path]
+    inputs = [well_formed(p) for p in record.inputs] if record else []
+    return [path] if path in inputs else inputs
 
 
 def _kinds(con: duckdb.DuckDBPyConnection, uids: list[str]) -> dict[str, dict]:
@@ -402,10 +446,10 @@ def _findings_section(con: duckdb.DuckDBPyConnection, findings: list[tuple[int, 
         if f["retired"]:
             reason = f'; reason: "{_md(f["retired"].get("reason") or "")}"' if f["retired"].get("reason") else ""
             retired.append(f"{number}. {_md(f['title'])} (retired {_md(f['retired']['at'][:16].replace('T', ' '))} UTC "
-                           f"by {_md(f['retired']['who'])}{reason})")
+                           f"by {_md(analyst(f['retired']))}{reason})")
             continue
-        when = (f"edited {_md(f['edited']['at'][:16].replace('T', ' '))} UTC by {_md(f['edited']['who'])}" if f["edited"]
-                else f"added {_md(f['added']['at'][:16].replace('T', ' '))} UTC by {_md(f['added']['who'])}")
+        when = (f"edited {_md(f['edited']['at'][:16].replace('T', ' '))} UTC by {_md(analyst(f['edited']))}" if f["edited"]
+                else f"added {_md(f['added']['at'][:16].replace('T', ' '))} UTC by {_md(analyst(f['added']))}")
         n = len(f["targets"])
         lines += [f"### {number}. {_md(f['title'])}", "",
                   f"{_md(f['severity'])}. ATT&CK: {_md(attack.worded(f['techniques'])) if f['techniques'] else 'none given'}. "
@@ -470,6 +514,26 @@ INDICATOR_TYPES = ("IP address", "Domain", "SHA-256", "SHA-1", "MD5", "Account",
 LOGON_PROCESS_CODES = {"4624", "4625"}
 
 
+# The note on a File value in the Windows folder's own files or below its System32, SysWOW64, or Sysnative folders: it
+# may be a system tool the attacker used, which a blocklist built from the file would block.
+SYSTEM_TOOL_NOTE = "In the Windows folder: may be a system tool the attacker used. Check before you block it."
+SYSTEM_FOLDERS = frozenset({"system32", "syswow64", "sysnative"})
+# The registry parser's name for a domain controller's system volume, which file_key reads as a drive letter
+SYSTEM_VOLUME = re.compile(r"^SYSVOL(?=[\\/])", re.IGNORECASE)
+
+
+def _in_windows_folder(path: str) -> bool:
+    """Whether a file path is one of the Windows folder's own files, or is below its System32, SysWOW64, or Sysnative
+    folder, on any drive, in any case, and with either slash. The path is read as the file key reads it (file_key), so a
+    prefetch volume, a device path, NT's \\??\\ and \\SystemRoot, a variable such as %SystemRoot%, and a doubled backslash
+    count; SYSVOL is a domain controller's system volume, as the registry parser reads it. A path that starts with one
+    forward slash is a URL or Unix path, and a path with no root names no volume, so neither counts. The Windows folder's
+    other subfolders, such as Temp and Tasks, where a dropped file can sit, and look-alike names do not count. Everything
+    below System32, SysWOW64, and Sysnative does, such as System32\\Tasks and System32\\spool."""
+    below = file_key(SYSTEM_VOLUME.sub("C:", path)).split("\\")[1:]
+    return len(below) > 1 and below[0] == "windows" and (len(below) == 2 or below[1] in SYSTEM_FOLDERS)
+
+
 def _address(name: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """The address a value is, with an IPv6 zone ("%12") dropped, or None for a name."""
     try:
@@ -492,7 +556,8 @@ def _local(name: str) -> bool:
 
 def indicators(con: duckdb.DuckDBPyConnection, uids: list[str], identity: Identity) -> list[dict]:
     """The indicator values among these events, which the caller takes from the Malicious marks: each as type, value,
-    the number of events carrying it, and the first and last clock-adjusted time seen (None for events with no time).
+    the number of events carrying it, the first and last clock-adjusted time seen (None for events with no time), and a
+    note, "" unless the value is a File in the Windows folder (SYSTEM_TOOL_NOTE).
     Read from parsed fields only, never guessed from free text: the address columns, less the case's own hosts'
     addresses and the local ones (_local); a DNS name, an HTTP host, or a TLS server name from a network record's data; the
     hashes column; the account; the process and file path columns, less a logon's process (LOGON_PROCESS_CODES); and the
@@ -526,7 +591,9 @@ def indicators(con: duckdb.DuckDBPyConnection, uids: list[str], identity: Identi
         values += [("Service", s) for s in service_names(ev)] + [("Task", t) for t in task_names(ev)]
         for kind, value in values:
             key = (kind, value.lower())
-            g = groups.setdefault(key, {"type": kind, "value": value, "events": set(), "first": None, "last": None})
+            note = SYSTEM_TOOL_NOTE if kind == "File" and _in_windows_folder(value) else ""
+            g = groups.setdefault(key, {"type": kind, "value": value, "events": set(), "first": None, "last": None,
+                                        "note": note})
             g["events"].add(uid)
             if ts is not None:
                 g["first"] = ts if g["first"] is None else min(g["first"], ts)
@@ -566,23 +633,23 @@ def _indicators_section(found: list[dict], malicious: int) -> list[str]:
         return lines + ["No event is marked Malicious, so there are no indicators."]
     if not found:
         return lines + ["The events marked Malicious carry no parsed value of these kinds."]
-    lines += ["| Type | Value | Marked events | First seen | Last seen |", "|---|---|---|---|---|"]
+    lines += ["| Type | Value | Marked events | First seen | Last seen | Note |", "|---|---|---|---|---|---|"]
     seen = lambda us: "No time recorded" if us is None else _time(us)
-    lines += [f"| {g['type']} | `{_tick(g['value'])}` | {g['events']:,} | {seen(g['first'])} | {seen(g['last'])} |"
+    lines += [f"| {g['type']} | `{_tick(g['value'])}` | {g['events']:,} | {seen(g['first'])} | {seen(g['last'])} | {g['note']} |"
               for g in found]
     return lines
 
 
 def write_indicators(case: Case, found: list[dict]) -> Path:
-    """The indicators as indicators.csv in exports/: type, value, marked events, first and last seen. Text cells follow
-    the timeline CSV's rule (spreadsheet_text, each quoted); the header is the column names alone, unquoted."""
+    """The indicators as indicators.csv in exports/: type, value, marked events, first and last seen, and the note. Text
+    cells follow the timeline CSV's rule (spreadsheet_text, each quoted); the header is the column names alone, unquoted."""
     path = export_path(case, "indicators", "csv")
     with path.open("w", encoding="utf-8", newline="") as f:
-        csv.writer(f).writerow(["type", "value", "marked_events", "first_seen", "last_seen"])
+        csv.writer(f).writerow(["type", "value", "marked_events", "first_seen", "last_seen", "note"])
         out = csv.writer(f, quoting=csv.QUOTE_NONNUMERIC)
         for g in found:
             out.writerow([spreadsheet_text(v) for v in (g["type"], g["value"], g["events"],
-                                                         *(_iso(us) for us in (g["first"], g["last"])))])
+                                                         *(_iso(us) for us in (g["first"], g["last"])), g["note"])])
     return path
 
 
@@ -592,10 +659,16 @@ def _iso(us: int | None) -> str:
 
 
 def _evidence_check(found: Check) -> str:
-    """What the report's re-hash found. "Every evidence file" only when it checked every one: a file intake couldn't
-    read has no hash, so it can't count as matching. A manifest that lists no file says so, since nothing was there to
-    match. A folder walk couldn't list counts as no file, since how many files it holds is unknown, and has a sentence
-    of its own (unverified_text)."""
+    """What the report's re-hash found (_files_check), then manifest.jsonl against its record in the journal, when the
+    check compared one."""
+    return " ".join(filter(None, (_files_check(found), found.manifest and manifest_text(found.manifest))))
+
+
+def _files_check(found: Check) -> str:
+    """What the report's re-hash found of the evidence files. "Every evidence file" only when it checked every one: a
+    file intake couldn't read has no hash, so it can't count as matching. A manifest that lists no file says so, since
+    nothing was there to match. A folder walk couldn't list counts as no file, since how many files it holds is unknown,
+    and has a sentence of its own (unverified_text)."""
     n, problems, unread = found.checked, found.problems, found.unverified
     total = n + len(unread) - found.folders
     if not n and not unread:
@@ -653,10 +726,12 @@ def _hosts_section(identity: Identity, splits: list[tuple]) -> list[str]:
 
 
 def _event_lines(number: int, row: tuple, identity: Identity, notes: dict[str, list[dict]], tags: list[tuple],
-                 pair: dict | None, manifest: dict[str, str], findings: list[str] = ()) -> list[str]:
+                 pair: dict | None, manifest: dict[str, str], records: dict[str, RunRecord],
+                 findings: list[str] = ()) -> list[str]:
     """One numbered event of the timeline: its time, host, mark, and message, then the findings it supports, its clock,
     notes, Hayabusa rules, tags, source, and ID. `row` is report_text's query's, `tags` the event's (kind, label, ord),
-    `pair` its other half in the clock check, if any, and `findings` the open findings it is linked to, as "1. Title"."""
+    `pair` its other half in the clock check, if any, `records` the case's run records by run ID, and `findings` the open
+    findings it is linked to, as "1. Title"."""
     uid, ts, host, label, note, message, tool, version, run_id, artifact, source, record, rules, offset = row
     lines = [f"{number}. **{'No time recorded' if ts is None else _time(ts)}, {_md(host)}, {label}.** {_md(message)}"]
     if findings:
@@ -668,7 +743,7 @@ def _event_lines(number: int, row: tuple, identity: Identity, notes: dict[str, l
         lines += _clock_lines(identity, host, ts, ts - offset, pair)
     if note:
         lines.append(f"   - Mark note: {_md(note)}")
-    lines += [f"   - Note ({_md(n['at'])}, {_md(n['who'])}): {_md(n['text'])}" for n in notes.get(uid, [])]
+    lines += [f"   - Note ({_md(n['at'])}, {_md(analyst(n))}): {_md(n['text'])}" for n in notes.get(uid, [])]
     if rules:
         lines.append(f"   - Hayabusa: {_md(rules)}")
     if tags:
@@ -677,11 +752,22 @@ def _event_lines(number: int, row: tuple, identity: Identity, notes: dict[str, l
         own = [label for kind, label, _ in tags if kind == "tag"]
         lines.append("   - " + "; ".join(([f"ATT&CK: {_md(', '.join(phases))}"] if phases else []) +
                                          ([f"Tags: {_md(', '.join(own))}"] if own else [])))
-    sha = manifest.get(source or "", "")
     lines.append(f"   - Source: {tool} {version}, run `{run_id}`, {artifact} `{_tick(source)}` record `{_tick(record)}`, "
-                 f"evidence SHA-256 `{sha or 'not in manifest'}`.")
+                 f"{_evidence_hash(cited_files(source or '', records.get(run_id), version), source or '', manifest)}.")
     lines.append(f"   - Event ID: `{uid}`")
     return lines
+
+
+def _evidence_hash(files: list[str], path: str, manifest: dict[str, str]) -> str:
+    """The Source line's words on the evidence hash, given the files the event cites (cited_files): the intake hash of
+    the file the event names, or of the one output file a load of found output read, named as such; none when the load
+    read several files, which don't say which one the event came from, or when its run's record is gone."""
+    if not files:
+        return "no evidence SHA-256: the run's record is gone, so the output the event was read from is unknown"
+    if len(files) > 1:
+        return f"no evidence SHA-256: the load read {len(files)} output files and doesn't record which one the event came from"
+    sha = f"evidence SHA-256 `{manifest.get(files[0], '') or 'not in manifest'}`"
+    return sha if files == [path] else f"{sha} (of the output file `{_tick(files[0])}`)"
 
 
 def _tactics_section(rows: list[tuple], tagged: dict[str, list[tuple]]) -> list[str]:

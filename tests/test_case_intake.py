@@ -419,7 +419,8 @@ def test_add_new_needs_an_intake_first(tmp_path, evidence):
 
 def test_copy_case_starts_a_clean_round_on_the_same_runs(tmp_path, evidence):
     """A copy starts clean: the same evidence, intake, and runs; no marks, tags, or notes. A copy of a format 1 case is
-    upgraded before its rebuild: format 2's step, the seal, and then case_created naming the source's journal."""
+    upgraded before its rebuild: format 2's step, the seal, case_created naming the source's journal, and then the 3 to
+    4 entry."""
     from chain_fixtures import append_unchained, as_format
 
     from glessner.cli import main
@@ -443,10 +444,10 @@ def test_copy_case_starts_a_clean_round_on_the_same_runs(tmp_path, evidence):
     copy = open_case(tmp_path / "blind")
     assert (copy.settings.name, copy.settings.analyst, copy.evidence) == ("Blind round", "tester", source.evidence)
     assert copy.settings.copied_from.startswith(str(source.folder))
-    rekey, seal, created = [json.loads(line) for line in (copy.folder / "journal.jsonl").read_bytes().splitlines()]
-    assert [(e["action"], e.get("to_format")) for e in (rekey, seal, created)] == [
-        ("case_upgrade", 2), ("case_upgrade", 3), ("case_created", None)]
-    assert seal["sealed"]["lines"] == 1 and copy.settings.case_format == 3
+    rekey, seal, created, step = [json.loads(line) for line in (copy.folder / "journal.jsonl").read_bytes().splitlines()]
+    assert [(e["action"], e.get("to_format")) for e in (rekey, seal, created, step)] == [
+        ("case_upgrade", 2), ("case_upgrade", 3), ("case_created", None), ("case_upgrade", 4)]
+    assert seal["sealed"]["lines"] == 1 and copy.settings.case_format == 4 and step["from_format"] == 3
     assert created["copied_from"]["bytes"] == len(before) and created["copied_from"]["folder"] == str(source.folder)
     assert open_case(source.folder).settings.case_format == 1
     assert (copy.folder / "manifest.jsonl").read_bytes() == (source.folder / "manifest.jsonl").read_bytes()

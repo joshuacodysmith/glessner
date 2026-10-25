@@ -39,7 +39,9 @@ def parse_recmd(ctx: ParseContext) -> Iterator[Event]:
         key, value_name = row.get("KeyPath", ""), row.get("ValueName", "")
         data = row.get("ValueData", "")
         description = row.get("Description", "")
-        detail = f" {value_name} = {data}" if value_name else (f" {data}" if data else "")
+        # The Services plugin writes the text "None" as every row's value name, which names no value
+        named = "" if description == "Services" and value_name == "None" else value_name
+        detail = f" {named} = {data}" if named else (f" {data}" if data else "")
         path, path_key = _program(description, key, value_name, data, row.get("ValueData3", ""))
         yield Event(
             ts_us=to_us(row.get("LastWriteTimestamp")),

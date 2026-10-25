@@ -47,14 +47,23 @@ import duckdb
 from .case import Case, write_atomically
 from .events import Event, connect, from_us, load
 from .identify import IMPORTABLE, identify_file, text_encoding
-from .intake import current_entries, file_stamp, read_manifest, verify
+from .intake import PLACEHOLDER, current_entries, file_stamp, placeholders_among, read_manifest, verify
 from .line_logs import BY_LABEL, KV_KEY, LAYOUTS
 from .long_paths import long_path
 from .parsers import LOCAL_TIME
 from .parsers.common import clean, file_key, flatten, ip_and_port, port_number
 from .parsers.evtxecmd import NO_LOGON
 from .runner import IMPORT as TOOL
-from .runner import UNREADABLE, check_result, finish_run, not_reread, read_runs, start_run
+from .runner import (
+    UNREADABLE,
+    check_result,
+    cloud_placeholders_text,
+    finish_run,
+    not_reread,
+    read_runs,
+    records_format_4,
+    start_run,
+)
 from .timezones import (
     DATE_TIME,
     OFFSET,
@@ -463,15 +472,19 @@ PRESETS: dict[str, dict] = {
         "label": "Zeek log", "format": "zeek", "artifact": "zeek",
         "match": {"artifact": "tool_output", "detail": "zeek"},
         "time": [{"columns": ["ts"], "format": "guess", "zone": ""}],   # Unix time, or ISO 8601 when so configured
-        "fields": {"source_ip": ["id.orig_h", "client_addr"], "source_port": "id.orig_p",
-                   "dest_ip": ["id.resp_h", "server_addr"], "dest_port": "id.resp_p",
+        # Zeek joins a nested field's name with a dot, id.orig_h, or with an underscore, id_orig_h, when its scope
+        # separator is set so. A log holds one form, so each field and message part reads both.
+        "fields": {"source_ip": ["id.orig_h", "id_orig_h", "client_addr"], "source_port": ["id.orig_p", "id_orig_p"],
+                   "dest_ip": ["id.resp_h", "id_resp_h", "server_addr"], "dest_port": ["id.resp_p", "id_resp_p"],
                    "user": ["username", "user", "client"], "domain": ["domainname"], "path": ["filename"], "channel": "_path",
                    "code": ["service", "qtype_name", "method", "note"]},
         # One template for every log type: each part shows only where the log has its fields.
-        "message": "[{_path}: ][{id.orig_h}][:{id.orig_p}][ -> {id.resp_h}][:{id.resp_p}][ {proto}][ {service}]"
+        "message": "[{_path}: ][{id.orig_h}][{id_orig_h}][:{id.orig_p}][:{id_orig_p}][ -> {id.resp_h}][ -> {id_resp_h}]"
+                   "[:{id.resp_p}][:{id_resp_p}][ {proto}][ {service}]"
                    "[ {query}][ {qtype_name}][ {method}][ {host}][ {uri}][ {status_code}][ {server_name}][ {note}]"
                    "[ {msg}][ {client_addr}][ {assigned_addr}][ {host_name}][ {mac}][ {certificate.subject}]"
-                   "[ {certStatus}][ {machine}][ {mime_type}][ {filename}][ {md5}][ {conn_state}]",
+                   "[ {certificate_subject}][ {certStatus}][ {machine}][ sections {section_names}][ {mime_type}]"
+                   "[ {filename}][ {md5}][ {conn_state}]",
     },
     "timestamped": {
         "label": "Lines that start with a date and time", "format": "lines", "layout": "timestamped",
@@ -1100,6 +1113,8 @@ def load_import(case: Case, record, folder: Path) -> None:
                   staging_dir=folder)
     record.loaded_rows, record.replaced_rows, record.rows_without_time = result.rows, result.replaced, result.without_time
     record.load_seconds = round(time.perf_counter() - t0, 2)
+    if records_format_4(case):
+        record.rows_skipped = stats.skipped
     zone = (record.mapping["time"].get("zone_resolved") or {}).get("label")
     notes = [f"Times without a zone read as {zone}." if zone else "Times carry their own zone."]
     if stats.skipped:
@@ -1127,14 +1142,33 @@ def _count_lines(path: str, size: int, mtime_ns: int) -> int:
 
 def _evidence_file(case: Case, rel_path: str) -> Path:
     """An evidence file by its manifest path, in extended-length form (long_path), so the file opened is the one the
-    manifest names; refuses paths outside the evidence folder or not in the manifest."""
+    manifest names; refuses paths outside the evidence folder or not in the manifest, and a file that is a cloud
+    placeholder now, since opening it would download it. A manifest file's attributes are read before the path is
+    resolved or opened. Every read of an import's file takes its path from here."""
     root = long_path(case.evidence)
     path = long_path(root, rel_path)
+    in_manifest = rel_path in _manifest_paths(case, *file_stamp(case.manifest_path))
+    if in_manifest and placeholders_among(case, [rel_path]):
+        raise MappingError(_placeholder_refusal(case, rel_path))
     if not path.resolve().is_relative_to(root) or not path.is_file():
         raise MappingError(f"Not an evidence file: {rel_path}")
-    if rel_path not in _manifest_paths(case, *file_stamp(case.manifest_path)):
+    if not in_manifest:
         raise MappingError(f"{rel_path} isn't in the manifest yet; use Add new evidence first.")
     return path
+
+
+def _placeholder_refusal(case: Case, rel_path: str) -> str:
+    """Why the import won't read a manifest file that is a cloud placeholder now: intake hashed it before it became one,
+    recorded it as one, or couldn't read it for another reason, such as a lock."""
+    error = {e.path: e.error for e in current_entries(case)}[rel_path]
+    hashed = not error
+    if hashed:
+        when = "intake hashed it before it became a cloud placeholder"
+    elif error == PLACEHOLDER:
+        when = "intake recorded it as a cloud placeholder"
+    else:
+        when = "intake couldn't read it, and it is a cloud placeholder now"
+    return f"The file wasn't read: {when}. {cloud_placeholders_text([rel_path], 'the import', hashed=hashed)}"
 
 
 @lru_cache(maxsize=4)

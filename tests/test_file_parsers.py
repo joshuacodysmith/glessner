@@ -52,7 +52,8 @@ def test_mft_groups_timestamps_into_macb_and_flags_indicators(tmp_path):
     assert si.file_path == r"\Users\rick\Downloads\coreupdater.exe"
     assert si.file_key == r"\users\rick\downloads\coreupdater.exe"
     assert si.source_file == "DESKTOP/$MFT" and si.source_record == "41-4:coreupdater.exe"
-    assert "deleted" in si.message and "possible timestomping" in si.message and "zero microseconds" in si.message
+    assert si.message == r"$SI MA.B \Users\rick\Downloads\coreupdater.exe [deleted; SI<FN; SI times have zero microseconds]"
+    assert "timestomping" not in si.message   # MFTECmd marks SI<FN on most records of an ordinary volume
     assert json.loads(si.extra)["ZoneIdContents"] == "[ZoneTransfer] ZoneId=3"   # pre-serialized once per record
 
 
