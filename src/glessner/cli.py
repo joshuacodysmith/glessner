@@ -44,6 +44,18 @@ from .parsers.common import evidence_relative
 from .rekey import upgraded, upgraded_copy
 from .runner import LEFT_OUT, NOT_READ, RunError, RunPlan, check_options, plan_runs, read_runs, rebuild
 from .tools import detect, load_registry, recommend
+from .tools_manifest import (
+    Pin,
+    PinCache,
+    differences,
+    manifest_file,
+    pin_states,
+    pin_tools,
+    pinnable,
+    readable_manifest,
+    summary,
+    unpinned,
+)
 from .version import build_id
 
 UNIDENTIFIED_SHOWN = 25
@@ -57,7 +69,7 @@ class _Version(argparse.Action):
     """--version: the build, worked out only when asked for, since it runs git."""
 
     def __init__(self, option_strings, dest, **kwargs):
-        super().__init__(option_strings, dest, nargs=0, help="show the build, such as 0.2.0+abc1234, and exit")
+        super().__init__(option_strings, dest, nargs=0, help="show the build, such as 0.3.0+abc1234, and exit")
 
     def __call__(self, parser, namespace, values, option_string=None):
         print(f"glessner {build_id()}")
@@ -96,10 +108,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--expect-head", help="a journal head recorded outside the case, such as the one close printed")
     p.add_argument("--file", type=Path, help="a file the case wrote, whose record must come at or before that head")
 
-    for name, help_text in (("tools", "show detected tools and recommendations"),
-                            ("runs", "list tool runs"),
+    for name, help_text in (("runs", "list tool runs"),
                             ("rebuild", "recreate the events database from the successful runs")):
         sub.add_parser(name, help=help_text).add_argument("case_folder", type=Path)
+
+    p = sub.add_parser("tools", help="show detected tools, whether each matches its pin, and recommendations; "
+                                     "--pin pins tools")
+    p.add_argument("case_folder", type=Path)
+    p.add_argument("--pin", nargs="*", metavar="ID",
+                   help="pin the files of the named tools as they are now, in the tools folder's tools_manifest.json, which "
+                        "every case that uses the folder compares with; with no ID, the tools that have no pin. Asks first")
 
     p = sub.add_parser("serve", help="open the timeline in a browser, served from 127.0.0.1; without a case, the start page")
     p.add_argument("case_folder", type=Path, nargs="?")
@@ -156,7 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--tool", help="registry tool ID, such as evtxecmd")
     p.add_argument("--all", action="store_true",
                    help="every installed tool that has evidence here and hasn't run, then every found output ready "
-                        "to load, as the Tools page's Run and load everything ready does")
+                        "to load, as the Tools page's Run and load everything ready does; a tool that can't run here "
+                        "is named as left out, and the exit status is 1")
     p.add_argument("--host", action="append", help="limit to this host; repeat for several")
     p.add_argument("--option", action="append", default=[], metavar="ID=VALUE", help="tool option from the registry")
 
@@ -449,16 +468,76 @@ def _file_record(file: Path, found, against: str | None, named: str) -> tuple[st
 def cmd_tools(case: Case, args) -> int:
     specs = load_registry()
     detected = detect(specs.values(), _tools_folder(case))
+    if args.pin is not None:
+        return _pin(case, specs, detected, args.pin)
     print(f"Tools folder: {case.settings.tools_folder or '(not set; PATH only)'}")
-    width = max([10, *(len(tool.version) for tool in detected.values())])   # a build such as 0.2.0+abc1234.dirty
+    width = max([10, *(len(tool.version) for tool in detected.values())])   # a build such as 0.3.0+abc1234.dirty
+    states, manifest = pin_states(_tools_folder(case), detected, PinCache())
     for spec in specs.values():
         tool = detected.get(spec.id)
         state = f"{tool.version:<{width}} {tool.executable}" if tool else "not found"
-        print(f"  {spec.name:<10} {state}")
+        pin = f"  {states[spec.id]['label']}" if spec.id in states else ""
+        blocked = f"  Can't run here: {tool.missing}" if tool and tool.missing else ""
+        print(f"  {spec.name:<10} {state}{blocked}{pin}")
+    if manifest["path"]:
+        print(f"Tools manifest {manifest['path']}: {manifest['text']}.")
     entries = current_entries(case) if case.manifest_path.exists() else []
     artifacts = {e.artifact for e in entries if e.artifact} | {f"{e.artifact}:{e.detail}" for e in entries if e.artifact}
     for rec in recommend(specs.values(), detected, artifacts):
         print(f"Recommended for {', '.join(rec.artifacts)}: {rec.spec.name} ({rec.spec.license}) from {rec.spec.download_url}")
+    return 0
+
+
+def _names(names: list[str]) -> str:
+    """Names in a sentence: "A", "A and B", or "A, B, and C"."""
+    return " and ".join(names) if len(names) < 3 else f"{', '.join(names[:-1])}, and {names[-1]}"
+
+
+def _pin(case: Case, specs: dict, detected: dict, named: list[str]) -> int:
+    """glessner tools --pin: pin the named tools, or with none named each tool in the tools folder that has no pin, after
+    saying which tools, which manifest, and for a tool whose files differ from its pin what changed, and asking. Only a
+    yes pins: anything else, and input that ends, writes nothing and gives 1. A tool that has a pin and differs from it is
+    pinned again only when named, so a bare --pin never accepts a changed tool. ValueError for what can't be pinned
+    (tools_manifest.pinnable) and for a manifest that can't be read."""
+    folder = _tools_folder(case)
+    ids = pinnable(folder, specs, detected, named) if named else unpinned(folder, detected)
+    manifest = readable_manifest(folder)
+    held = manifest.tools if manifest else {}
+    cache = PinCache()
+    lines, pins = [], {}
+    for tool_id in ids:
+        tool = detected[tool_id]
+        taken = cache.get(tool)
+        if taken.error:
+            raise ValueError(f"{tool.spec.name}'s files can't all be read now: {taken.error}")
+        pins[tool_id] = Pin(tool, taken.listing, taken.links)
+        if tool_id in held and (changes := differences(held[tool_id], taken.listing, list(taken.links))):
+            lines.append(f"{tool.spec.name}, since its pin of {held[tool_id]['pinned_utc'][:10]}: {summary(changes)}.")
+    if not named:   # a tool that has a pin and differs from it is left for a name
+        for tool_id, tool in detected.items():
+            if tool_id in held and not tool.spec.builtin and tool_id not in ids:
+                taken = cache.get(tool)
+                if not taken.error and differences(held[tool_id], taken.listing, list(taken.links)):
+                    print(f"{tool.spec.name} differs from its pin; name it to pin it again.")
+    if not pins:
+        print("Nothing to pin: every tool found in the tools folder has a pin.")
+        return 0
+    names = _names([specs[i].name for i in ids])
+    path = manifest_file(folder)
+    print(f"Pin {names} as {'it is' if len(ids) == 1 else 'they are'} now, in {path}? Every case that uses this tools "
+          "folder compares with its pins.")
+    for line in lines:
+        print(line)
+    print("A pin records what is in the folder; it doesn't check where the files came from.")
+    try:
+        answer = input("Pin? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Nothing pinned.")
+        return 1
+    pin_tools(folder, pins)
+    print(f"Pinned {names} in {path}.")
     return 0
 
 
@@ -515,6 +594,7 @@ def _run_and_load(case: Case, plans: list[RunPlan], groups: list[dict], options:
         nonlocal failed
         for record in records:
             if isinstance(step, RunPlan):
+                _print_tool_check(step.tool.spec.name, record)
                 _print_run(case, record)
             else:
                 _print_load(record, bool(step["preset"]))
@@ -527,6 +607,19 @@ def _run_and_load(case: Case, plans: list[RunPlan], groups: list[dict], options:
         print(stopped, file=sys.stderr)
         return 1
     return 1 if failed else 0
+
+
+def _print_tool_check(name: str, record) -> None:
+    """A line before a run's result when its tool's files differ from the pin, and what may explain a missing one."""
+    check = record.tool_check
+    if not check or check.get("result") != "differs":
+        return
+    files = check.get("files", [])
+    text = (f"{name} on {record.host}: its files differ from the pin of {check['pinned_utc'][:10]}: "
+            f"{summary(files, check.get('more', 0))}.")
+    if any(f["state"] == "missing" for f in files):
+        text += " A missing file may have been removed by antivirus."
+    print(text)
 
 
 def _print_run(case: Case, record) -> None:
@@ -690,16 +783,24 @@ def _fmt_us(us: int) -> str:
 
 def _run_all(case: Case) -> int:
     """The path for an evidence folder dropped in whole (run --all): run the ready tools, then load the ready found
-    output, as the Tools page's Run and load everything ready does."""
-    from .toolbox import everything_ready
+    output, as the Tools page's Run and load everything ready does. Each installed tool that has evidence here and can't
+    run, such as a .NET 10 tool without its runtime, is named as left out, and the exit status is 1 for it, as for a
+    failed run."""
+    from .toolbox import NOTHING_READY, cannot_run, everything_ready, overview
 
     specs = load_registry()
-    tools, groups = everything_ready(case, specs, detect(specs.values(), _tools_folder(case)))
+    detected = detect(specs.values(), _tools_folder(case))
+    view = overview(case, specs, detected)
+    tools, groups = everything_ready(case, specs, detected, view)
+    blocked = cannot_run(view)
+    for sentence in blocked:
+        print(f"Left out: {sentence}")
     if not tools and not groups:
-        print("Nothing is ready: every tool with evidence here has run, and found output is loaded.")
-        return 0
+        if not blocked:
+            print(NOTHING_READY)
+        return 1 if blocked else 0
     plans = [plan for tool in tools for plan in plan_runs(case, tool)]
-    return _run_and_load(upgraded(case), plans, groups)
+    return _run_and_load(upgraded(case), plans, groups) or (1 if blocked else 0)
 
 
 def cmd_load_output(case: Case, args) -> int:
@@ -730,10 +831,11 @@ def cmd_load_output(case: Case, args) -> int:
 
 def cmd_runs(case: Case, args) -> int:
     runs = read_runs(case)
-    width = max([10, *(len(r.tool_version) for r in runs)])   # an import's is the build, such as 0.2.0+abc1234.dirty
+    width = max([10, *(len(r.tool_version) for r in runs)])   # an import's is the build, such as 0.3.0+abc1234.dirty
     for r in runs:
         rows = plural(r.loaded_rows, "row") if r.loaded_rows is not None else "not loaded"
-        print(f"{r.run_id:<45} {r.status:<7} {r.tool_version:<{width}} {r.seconds:>7.1f}s  {rows}  {r.reason}")
+        check = str((r.tool_check or {}).get("result", "-"))   # the tool's files against its pin, as the run recorded it
+        print(f"{r.run_id:<45} {r.status:<7} {r.tool_version:<{width}} {r.seconds:>7.1f}s  {check:<11}  {rows}  {r.reason}")
     return 0
 
 

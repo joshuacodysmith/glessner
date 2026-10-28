@@ -5,10 +5,14 @@ page it brings back an open finding form, new or an edit, and the report summary
 can't draw them, as its read fails or another page comes first, they wait for its next draw, which says what of them it
 couldn't open; New finding from an Event page then opens the kept form's words over its own events. A new tab, the link
 opened again in the same tab, another open of the case, and blocked storage still start on the Case overview, and the
-status line says what a reload drops. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke
-does, and are skipped without it."""
+status line says what a reload drops. The window isn't put back when the case had no events, nor when it lies wholly
+before the case's first event or after its last, as after a load that moves them all elsewhere in time: the reload fits
+the events. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke does, and are skipped
+without it."""
 
+import json
 import re
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 import pytest
@@ -21,6 +25,7 @@ from glessner.server import api_finding, api_mark, api_setting
 pytestmark = pytest.mark.browser
 READY = "() => window.__ready === true && window.__app.S.data !== null"
 BACK = "Back where the page was before the reload."
+WINDOW = "() => [window.__app.S.view.start, window.__app.S.view.end]"
 # What a reload puts back, read from the page: the window, the selection and focus, the trail, and the Details page.
 # Back's history is not kept (its pages reopen through functions), so the band is read without its Back link.
 PLACE = """() => {
@@ -102,6 +107,78 @@ def test_a_reload_comes_back_to_the_event_its_pivot_list_and_trail_the_window_an
         }""")
         reload(p)
         assert p.evaluate("() => [window.__app.S.view.start, window.__app.S.view.end]") == pytest.approx(target, abs=1)
+
+
+@pytest.mark.parametrize(("times", "button"), [
+    (["2020-09-19T03:21:50Z"], "Import 1 record"),
+    (["1969-12-31T23:59:00Z", "2020-09-19T03:21:50Z"], "Import 2 records"),
+], ids=["after_1970", "before_1970"])
+def test_the_reload_after_a_first_load_in_a_case_with_no_events_fits_the_events_loaded(
+        browser, tmp_path, times, button):  # noqa: F811
+    """A case with no events has no span to fit, so its window is 2 s around 1970. The Import page's first load reloads
+    the page, which fits the events loaded rather than putting that window back, also when one is from before 1970, as a
+    file's link time can be, and their span takes in that window. The status line says the page is back, with no word on
+    the window. The case is made and taken in as the start page makes one."""
+    from glessner.case import create_case
+    from glessner.intake import intake
+
+    evidence = tmp_path / "evidence"
+    (evidence / "DC01").mkdir(parents=True)
+    case = create_case(tmp_path / "case", "Empty", evidence, "cody")
+    intake(case)
+    for p in served_page(browser, case):
+        assert p.evaluate(WINDOW) == [-1000, 1000]
+        records = [{"@timestamp": when, "user": "u1", "action": "login"} for when in times]
+        (evidence / "DC01" / "export.json").write_text(json.dumps(records), newline="\n")
+        details = p.locator("#details")
+        case_menu(p, "importButton")
+        p.wait_for_selector("#details[data-page='import']")
+        details.get_by_role("button", name="Add new evidence").click()
+        go = details.get_by_role("button", name=button, exact=True)
+        with p.expect_navigation():
+            go.click()
+        p.wait_for_function(READY)
+        start, end = p.evaluate(WINDOW)
+        assert all(start < datetime.fromisoformat(when).timestamp() * 1000 < end for when in times)
+        p.wait_for_function("(n) => document.getElementById('stInWindow').textContent === `In this window: ${n}`",
+                            arg=len(times))
+        p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
+        assert status(p) == BACK
+
+
+def test_the_reload_after_a_load_that_moves_every_event_elsewhere_in_time_fits_the_events(browser, tmp_path):  # noqa: F811
+    """A log imported with the wrong time field, then again with the right one, has its only event replaced by one five
+    years later. The reload after the second import fits that event rather than putting back the first one's window,
+    which now shows nothing. The status line says the page is back, with no word on the window. A window takes in its
+    start and not its end, so one that ends at the event isn't put back either, and one that starts at it is."""
+    from glessner.case import create_case
+    from glessner.imports import guess_mapping, run_import, sniff
+    from glessner.intake import intake
+    from glessner.server import api_import
+
+    evidence = tmp_path / "evidence"
+    (evidence / "DC01").mkdir(parents=True)
+    record = [{"@timestamp": "2020-09-19T03:21:50Z", "seen": "2015-01-01T00:00:00Z", "user": "u1", "action": "login"}]
+    (evidence / "DC01" / "export.json").write_text(json.dumps(record), newline="\n")
+    case = create_case(tmp_path / "case", "Moved", evidence, "cody")
+    intake(case)
+    right = guess_mapping(sniff(case, "DC01/export.json"))
+    run_import(case, "DC01/export.json", {**right, "time": {**right["time"], "columns": ["seen"]}})
+    first = datetime(2015, 1, 1, tzinfo=UTC).timestamp() * 1000
+    when = datetime(2020, 9, 19, 3, 21, 50, tzinfo=UTC).timestamp() * 1000
+    for p in served_page(browser, case):
+        start, end = p.evaluate(WINDOW)
+        assert start < first < end
+        assert api_import(p.hub.app, {"paths": ["DC01/export.json"], "mapping": right})["runs"][0]["replaced"] == 1
+        reload(p)   # as the Import page does after an import
+        fitted = p.evaluate(WINDOW)
+        assert fitted[0] < when < fitted[1]
+        p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
+        assert status(p) == BACK
+        for window, kept in (([when - 5000, when], False), ([when, when + 5000], True)):
+            p.evaluate("(w) => window.__app.setView(...w)", window)
+            reload(p)
+            assert p.evaluate(WINDOW) == pytest.approx(window if kept else fitted, abs=1)
 
 
 def test_a_reload_comes_back_to_the_path_s_step_a_search_and_a_page_of_the_case_menu(browser, synthetic_case):  # noqa: F811

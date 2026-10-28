@@ -3,7 +3,8 @@
 ShellBags record the folders a user browsed in Explorer, including drives and network shares, in the user's
 UsrClass.dat, and in NTUSER.DAT on older Windows. SBECmd writes one CSV per hive, named for the profile folder and the
 hive type, such as Administrator_UsrClass.csv. The CSV doesn't name the hive, so the parser reads the pairs of
-"Finished processing <hive>" and "Exported to: <csv>" lines in SBECmd's messages file.
+"Finished processing <hive>" and "Exported to: <csv>" lines in SBECmd's record of the run: the messages file, or the
+console log from 2026.10.
 
 Times on the timeline: FirstInteracted and LastInteracted, when Windows recorded the user opening the folder, and the
 bag key's LastWriteTime where it differs from both. CreatedOn, ModifiedOn, and AccessedOn are the folder's own times as
@@ -21,7 +22,8 @@ from pathlib import Path, PureWindowsPath
 from ..events import Event, to_us
 from .common import ParseContext, evidence_relative, file_key, output_paths, read_csv_rows
 
-MESSAGES = "!SBECmd_Messages.txt"
+MESSAGES = "!SBECmd_Messages.txt"   # the record of a run in builds before 2026.10
+CONSOLE_LOG = "*_SBECmd_*_ConsoleLog.txt"   # a run's record from 2026.10: <UTC yyyyMMddHHmmss>_SBECmd_<version>_ConsoleLog.txt
 TIMES = (("FirstInteracted", "ShellBag first interacted"), ("LastInteracted", "ShellBag last interacted"))
 KEY_WRITE = "ShellBag key last write"
 FINISHED = re.compile(r"Finished processing (.+?)\s*$")
@@ -41,8 +43,8 @@ def parse_sbecmd(ctx: ParseContext) -> Iterator[Event]:
 
 
 def _from_evidence(ctx: ParseContext) -> Iterator[Event]:
-    """SBECmd's CSVs found in the evidence, such as KAPE's module output. The messages file beside them names each
-    CSV's hive when it's there; otherwise the CSV's own name does, as SBECmd writes it: Administrator_UsrClass.csv."""
+    """SBECmd's CSVs found in the evidence, such as KAPE's module output. The messages file or console log beside them
+    names each CSV's hive when it's there; otherwise the CSV's own name does, as SBECmd writes it: Administrator_UsrClass.csv."""
     hives: dict[Path, dict[str, str]] = {}
     for path in output_paths(ctx, "sbecmd", "*.csv"):
         named = hives.setdefault(path.parent, _hives(path.parent)).get(path.name)
@@ -78,16 +80,18 @@ def _events(row: dict[str, str], source: str, profile: str, hive_type: str) -> I
 
 
 def _hives(output_dir: Path) -> dict[str, str]:
-    """CSV file name to the hive it came from, from the messages file."""
-    out, hive = {}, ""
-    messages = output_dir / MESSAGES
-    if not messages.exists():
-        return out
-    for line in messages.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        if m := FINISHED.search(line):
-            hive = m.group(1)
-        elif (m := EXPORTED.search(line)) and hive:
-            out[PureWindowsPath(m.group(1)).name] = hive
+    """CSV file name to the hive it came from, from the messages file and the console logs in the folder. A console
+    log's name starts with the UTC time of its run, so the log that sorts last names a CSV that several runs wrote."""
+    out = {}
+    for record in (output_dir / MESSAGES, *sorted(output_dir.glob(CONSOLE_LOG))):
+        hive = ""
+        if not record.is_file():
+            continue
+        for line in record.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            if m := FINISHED.search(line):
+                hive = m.group(1)
+            elif (m := EXPORTED.search(line)) and hive:
+                out[PureWindowsPath(m.group(1)).name] = hive
     return out
 
 

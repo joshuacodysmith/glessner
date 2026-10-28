@@ -573,7 +573,7 @@ def test_findings_summary_says_a_suggestion_is_pending_and_lists_clock_changes(c
         con.close()
     text = path.read_text(encoding="utf-8")
     assert "| 10.42.85.10 | none; -3,599.5 s suggested, not applied |" in text
-    assert "| 10.42.85.115 | none |" in text
+    assert "| 10.42.85.115 | none; not measured |" in text
     first, last = min(e.ts_us for e in events), max(e.ts_us for e in events)
     assert ("- **DC01.** Its events pair with the capture's (network) and suggest a clock offset of -3,599.5 s (1 h less "
             "0.5 s), from 12 RDP connections; 12 of 12 pairs within 2 s. Consistent with a clock set to the wrong hour "
@@ -582,6 +582,22 @@ def test_findings_summary_says_a_suggestion_is_pending_and_lists_clock_changes(c
             "one offset fits only its events after the clock change at 2020-09-18 22:43:05.") in text
     assert ("- **DESKTOP.** Its clock was changed by -3,599.6 s at 2020-09-18 04:58:02 host time. Its events on either "
             "side of a change are on different clocks.") in text
+
+
+def test_the_clock_check_s_state_is_worded_without_the_offset():
+    """One set of words for the Overview's Clock cell and the report's Clock offset column. A host that agrees reads
+    aligned when an offset is applied and matching when none is; a suggestion, the Overview's words; a sensor lane is the
+    reference, and any other host the check could not measure, or has not measured, is not measured."""
+    words = clock.state_words
+    agrees, suggest = {"state": "agrees", "reference": "network"}, {"state": "suggest", "skew_seconds": -3599.5,
+                                                                      "skew_text": "59 m 59.5 s"}
+    assert (words(agrees, "DC01", False), words(agrees, "DC01", True)) == ("matches the capture", "aligned to the capture")
+    assert words(suggest, "DC01", False) == "59 m 59.5 s behind the capture, not aligned"
+    assert words({**suggest, "skew_seconds": 3599.5}, "DC01", True) == "59 m 59.5 s ahead of the capture, not aligned"
+    assert words({"state": "disagree"}, "DC01", True) == "pairs with the capture disagree"
+    assert words({"state": "none", "reference": "network"}, "network", True) == "the reference clock"
+    assert words({"state": "none", "reference": "network"}, "DC01", True) == clock.NOT_MEASURED == "not measured"
+    assert words({}, "DC01", False) == words({"state": ""}, "DC01", False) == "not measured"
 
 
 # The page's view of the check: each event's pair, the switch between recorded and aligned times, and the findings

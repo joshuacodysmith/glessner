@@ -128,7 +128,8 @@ def test_offset_in_exports_and_findings(app):
     text = fpath.read_text(encoding="utf-8")
     assert "**2020-09-19 03:21:45.500000 UTC, DC01, Malicious.**" in text
     assert "offset of -2.5 s is applied; the artifact recorded 2020-09-19 03:21:48.000000 UTC" in text
-    assert "| DC01 | Domain controllers (guessed) | Not recorded | CITADEL-DC01 | 10.42.85.10 | -2.5 s |" in text
+    assert ("| DC01 | Domain controllers (guessed) | Not recorded | CITADEL-DC01 | 10.42.85.10 | -2.5 s; not measured |"
+            in text)
 
 
 def test_offset_limits(app):

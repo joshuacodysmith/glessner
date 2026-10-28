@@ -16,6 +16,7 @@ import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import yaml
 
@@ -49,7 +50,11 @@ class ToolSpec:
     input: str
     args: tuple[str, ...]
     timeout_minutes: int
-    outputs: tuple[str, ...]
+    # The files a run must write, as name patterns in its output folder. An entry that is a tuple of patterns is a group,
+    # of which the run must write at least one: SBECmd's builds name the record of a run differently. The run's other
+    # files, such as the console log that 2026.10 builds write for every tool, are hashed with it but not required;
+    # SBECmd's own console log can meet its group.
+    outputs: tuple[str | tuple[str, ...], ...]
     parser: str | None
     options: tuple[ToolOption, ...] = ()
     notes: str = ""
@@ -57,7 +62,7 @@ class ToolSpec:
     # runs on copies in its run folder. copy_also names more of the host's files it needs, as handles does.
     work_on_copies: bool = False
     copy_also: tuple[str, ...] = ()
-    # The .NET major version a framework-dependent build needs, such as 9; 0 for none. A runtime unpacked in the tools
+    # The .NET major version a framework-dependent build needs, such as 10; 0 for none. A runtime unpacked in the tools
     # folder is used through DOTNET_ROOT, so nothing need be installed machine-wide.
     dotnet: int = 0
     # Why a run that loads nothing has failed, for a tool that can finish quietly without reading its inputs.
@@ -75,8 +80,8 @@ class ToolSpec:
     # {related}: MFTECmd reading $J takes its volume's $MFT, the one in the nearest folder above the $J, with -m to give
     # each change its folder. Without one the arguments are left out, and the run notes it.
     related: tuple[dict, ...] = ()
-    # Start the tool in its run folder rather than its own: SQLECmd and WxTCmd unpack SQLite.Interop.dll into their
-    # working folder and can't delete it afterwards.
+    # Start the tool in its run folder rather than its own, so that nothing it writes to its working folder, such as a
+    # native library it unpacks and can't delete afterwards, lands in the tool's folder, which a pin covers.
     run_in_run_folder: bool = False
     # With empty_result: output simply absent means nothing to report, not a failure. The run is ok, with no events and
     # the empty_result as a note, as for WxTCmd on an empty Timeline. Without it, such a run fails with the reason.
@@ -139,11 +144,21 @@ def detect(specs: Iterable[ToolSpec], tools_folder: Path | None) -> dict[str, De
             continue
         root = find_dotnet(tools_folder, spec.dotnet) if spec.dotnet else None
         tool = DetectedTool(spec, exe, "", str(root) if root else "")
-        found[spec.id] = DetectedTool(spec, exe, read_version(spec, exe, tool_env(tool)), tool.dotnet_root, rules=rules)
+        check = check_version(spec, exe, tool_env(tool))
+        # A framework-dependent build that finds no runtime of its major version is stopped by the .NET host, with an
+        # exit code and a message of the host's own. A check that ended otherwise, such as by timing out or being blocked,
+        # shows the tool lacks nothing, and a build that prints its version has started, on a runtime of the machine.
+        absent = dotnet_missing(spec.dotnet) if spec.dotnet and not root and check.host_stopped else ""
+        found[spec.id] = DetectedTool(spec, exe, check.version, tool.dotnet_root, missing=absent, rules=rules)
     return found
 
 
 NPCAP_MISSING = "Needs Npcap, from npcap.com; installing it needs administrator rights"
+
+
+def dotnet_missing(major: int) -> str:
+    """Why a tool that needs a .NET runtime of this major version can't run here, as DetectedTool.missing words it."""
+    return f"Needs a .NET {major} runtime: unpack Microsoft's .NET {major} runtime zip into a folder in the tools folder"
 
 
 def npcap_folder() -> Path | None:
@@ -244,7 +259,7 @@ def _packed_commit(git: Path, ref: str) -> str:
 def _folder_hash(folder: Path, tool_folder: Path, hashes: dict[str, str] | None) -> str:
     """A folder's SHA-256 as a run's tool_files hold it, when they do, or as hashed now; "" for no folder, or one that
     can't be read."""
-    key = _in_folder(folder, tool_folder)
+    key = in_folder(folder, tool_folder)
     if hashes is not None and f"{key}/" in hashes:
         return hashes[f"{key}/"]
     try:
@@ -261,33 +276,71 @@ def _version_line(path: Path) -> str:
     return match.group(1) if match else ""
 
 
+class ToolListing(NamedTuple):
+    """The files of a tool that a run records or a pin keeps: `hashes` is tool_files' value, and `folders` has the
+    listing (folder_listing) of each folder in it, by the folder's key there, such as "Maps/"."""
+    hashes: dict[str, str]
+    folders: dict[str, dict[str, str]]
+
+
 def tool_files(tool: DetectedTool, argv: list[str], links: list[str] | None = None) -> dict[str, str]:
+    """The SHA-256 of the files in the tool's own folder that a run of it names (tool_listing's `hashes`)."""
+    return tool_listing(tool, argv, links).hashes
+
+
+def tool_listing(tool: DetectedTool, argv: list[str], links: list[str] | None = None) -> ToolListing:
     """The SHA-256 of the files in the tool's own folder that a run of it names, by their paths there with forward
-    slashes, in path order: the executable; the .dll of the same name beside it, which a .NET build runs; each argument
-    that names a path in the folder, or whose part after = does; the rules block's version file; and the registry's
-    tool_files. Other files the tool loads from its folder, such as further libraries or a .NET runtimeconfig.json, are
-    left out. A folder is recorded under its path and a /, with folder_sha256's value, which skips the links in it; each
-    is added to `links` as "path -> target", its path in the tool's folder. A path that doesn't exist is left out. A
-    builtin tool, which the app's own Python runs, records none. OSError when a file can't be read or a folder can't be
-    listed."""
+    slashes, in path order, and the files of each folder among them. The files are the executable; each .dll beside it,
+    whatever the case of the extension, which a .NET build loads, with its runtimeconfig.json and deps.json; each
+    argument that names a path in the folder, or whose part after = does; the rules block's version file; and the
+    registry's tool_files. A folder is recorded under its path and a /, with the hash of its listing (listing_sha256),
+    which skips the links in it; each is added to `links` as "path -> target", its path in the tool's folder. A path
+    that doesn't exist is left out. A builtin tool, which the app's own Python runs, has none. OSError when a file can't
+    be read or a folder can't be listed."""
     if tool.spec.builtin:
-        return {}
+        return ToolListing({}, {})
     exe, spec = tool.executable, tool.spec
-    named = [exe, exe.with_suffix(".dll"), *_argument_paths(argv), *(exe.parent / rel for rel in spec.tool_files)]
+    named = [exe, *_libraries(exe), *_argument_paths(argv), *(exe.parent / rel for rel in spec.tool_files)]
     if spec.rules and spec.rules.get("version_file"):
         named.append(exe.parent / spec.rules["version_file"])
-    hashes = {}
+    hashes, folders = {}, {}
     for path in named:
-        if not (rel := _in_folder(path, exe.parent)):
+        if not (rel := in_folder(path, exe.parent)):
             continue
         if path.is_dir():
             skipped: list[str] = []
-            hashes[f"{rel}/"] = folder_sha256(path, skipped)
+            folders[f"{rel}/"] = folder_listing(path, skipped)
+            hashes[f"{rel}/"] = listing_sha256(folders[f"{rel}/"])
             if links is not None:
                 links += (f"{rel}/{link}" for link in skipped)
         elif path.is_file():
             hashes[rel] = file_sha256(path)
-    return dict(sorted(hashes.items()))
+    return ToolListing(dict(sorted(hashes.items())), dict(sorted(folders.items())))
+
+
+def pin_files(tool: DetectedTool, links: list[str] | None = None) -> ToolListing:
+    """What a run of the tool would record (tool_listing), for a command line made of the registry's arguments with the
+    tool's folder and its rules file filled in and no evidence or output folder, which a pin doesn't have. An argument
+    that holds another placeholder, such as {host_dir} or an option's {value}, names no file in the tool's folder."""
+    spec, exe = tool.spec, tool.executable
+    values = {"{tool_dir}": str(exe.parent)}
+    args = list(spec.args)
+    if (rules := rules_file(spec, exe)) is not None:
+        values["{rules_file}"] = str(rules)
+        args += spec.rules.get("args", [])
+    for key, value in values.items():
+        args = [arg.replace(key, value) for arg in args]
+    return tool_listing(tool, [str(exe), *args], links)
+
+
+def _libraries(exe: Path) -> list[Path]:
+    """What a .NET tool loads from its own folder: each .dll beside the executable, whatever the case of its extension,
+    and the executable's runtimeconfig.json and deps.json. Nothing for a folder that isn't there."""
+    try:
+        beside = sorted(p for p in exe.parent.iterdir() if p.suffix.lower() == ".dll")
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    return [*beside, exe.with_name(f"{exe.stem}.runtimeconfig.json"), exe.with_name(f"{exe.stem}.deps.json")]
 
 
 def _argument_paths(argv: list[str]) -> list[Path]:
@@ -297,19 +350,18 @@ def _argument_paths(argv: list[str]) -> list[Path]:
     return [Path(text) for text in texts if text and Path(text).is_absolute()]
 
 
-def _in_folder(path: Path, folder: Path) -> str:
+def in_folder(path: Path, folder: Path) -> str:
     """`path`'s path in `folder`, with forward slashes, or "" when it isn't in it. Both are read with any .. resolved,
     and no link followed."""
     path, folder = Path(os.path.abspath(path)), Path(os.path.abspath(folder))
     return path.relative_to(folder).as_posix() if path != folder and path.is_relative_to(folder) else ""
 
 
-def folder_sha256(folder: Path, links: list[str] | None = None) -> str:
-    """A folder's SHA-256: that of the UTF-8 text of a "<sha256>  <path>" line for each file in it and below, its path
-    in the folder with forward slashes, sorted by path in code point order. sha256sum prints the same lines for the same
-    paths in that order, so the value can be checked without the app. A .git folder is left out, and links are skipped,
-    as intake.walk skips them; each link outside .git is added to `links` as "path -> target", its path in the folder.
-    OSError when a folder can't be listed or a file can't be read."""
+def folder_listing(folder: Path, links: list[str] | None = None) -> dict[str, str]:
+    """The SHA-256 of each file in a folder and below, by its path in the folder with forward slashes, in code point
+    order. A .git folder is left out, and links are skipped, as intake.walk skips them; each link outside .git is added
+    to `links` as "path -> target", its path in the folder. OSError when a folder can't be listed or a file can't be
+    read."""
     unreadable: list[tuple[str, str]] = []
     found: list[str] = []
     paths = sorted(rel for rel in walk_evidence(folder, found, unreadable) if GIT not in rel.split("/"))
@@ -319,8 +371,21 @@ def folder_sha256(folder: Path, links: list[str] | None = None) -> str:
     if links is not None:
         links += (link for link in found if GIT not in link.partition(" -> ")[0].split("/"))
     root = long_path(folder)
-    lines = "".join(f"{file_sha256(long_path(root, rel))}  {rel}\n" for rel in paths)
+    return {rel: file_sha256(long_path(root, rel)) for rel in paths}
+
+
+def listing_sha256(listing: dict[str, str]) -> str:
+    """The SHA-256 of the UTF-8 text of a "<sha256>  <path>" line for each file of a folder's listing, sorted by path in
+    code point order. sha256sum prints the same lines for the same paths in that order, so the value can be checked
+    without the app."""
+    lines = "".join(f"{digest}  {rel}\n" for rel, digest in sorted(listing.items()))
     return hashlib.sha256(lines.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+
+def folder_sha256(folder: Path, links: list[str] | None = None) -> str:
+    """A folder's SHA-256: that of its listing's lines (listing_sha256). OSError when a folder can't be listed or a file
+    can't be read."""
+    return listing_sha256(folder_listing(folder, links))
 
 
 def file_sha256(path: Path) -> str:
@@ -333,7 +398,7 @@ def file_sha256(path: Path) -> str:
 
 
 def find_dotnet(tools_folder: Path | None, major: int) -> Path | None:
-    """A .NET runtime of this major version unpacked in the tools folder or one level down, such as a dotnet-9 folder."""
+    """A .NET runtime of this major version unpacked in the tools folder or one level down, such as a dotnet-10 folder."""
     if not tools_folder or not tools_folder.is_dir():
         return None
     below = sorted(Path(e.path) for e in os.scandir(tools_folder) if entry_kind(e) == "folder")   # links skipped
@@ -365,15 +430,32 @@ def recommend(specs: Iterable[ToolSpec], detected: dict[str, DetectedTool], arti
     return out
 
 
-def read_version(spec: ToolSpec, exe: Path, env: dict[str, str] | None = None) -> str:
+class VersionCheck(NamedTuple):
+    """What running a tool for its version showed: `version`, "unknown" when it printed none, and `host_stopped`, whether
+    the .NET host stopped the tool before it started, as it does for a framework-dependent build with no runtime of the
+    major version it needs."""
+    version: str
+    host_stopped: bool
+
+
+HOST_EXIT_CODES = range(0x80008000, 0x80008100)   # the .NET host's own exit codes, such as 0x80008096 for a framework not found
+HOST_MESSAGE = re.compile(r"You must install (?:or update )?\.NET")
+
+
+def check_version(spec: ToolSpec, exe: Path, env: dict[str, str] | None = None) -> VersionCheck:
+    """Run the tool with its version arguments, with a time limit, and read its version from the output by the registry's
+    regex. A tool that can't be started, or doesn't finish in time, has no version and wasn't stopped by the host."""
     try:
         result = subprocess.run([str(exe), *spec.version_args], cwd=exe.parent, capture_output=True,
                                 text=True, errors="replace", timeout=VERSION_TIMEOUT_S, env=env)
     except (OSError, subprocess.TimeoutExpired):
-        return "unknown"
+        return VersionCheck("unknown", False)
     text = _strip_ansi(result.stdout + "\n" + result.stderr)
     match = re.search(spec.version_regex, text, re.MULTILINE)
-    return match.group(1) if match else "unknown"
+    if match:
+        return VersionCheck(match.group(1), False)
+    code = result.returncode & 0xFFFFFFFF   # Windows reports the code unsigned; a signed reading of it is the same code
+    return VersionCheck("unknown", code in HOST_EXIT_CODES or bool(HOST_MESSAGE.search(text)))
 
 
 def _parse_spec(data: dict, source: str) -> ToolSpec:
@@ -395,7 +477,7 @@ def _parse_spec(data: dict, source: str) -> ToolSpec:
             input=data["input"],
             args=tuple(data["run"]["args"]),
             timeout_minutes=int(data["run"].get("timeout_minutes", 30)),
-            outputs=tuple(data["outputs"]),
+            outputs=_outputs(data["outputs"], source),
             parser=data.get("parser"),
             options=tuple(ToolOption(o["id"], o["label"], tuple(o["args"])) for o in data.get("options") or []),
             notes=data.get("notes") or "",
@@ -424,6 +506,20 @@ def _parse_spec(data: dict, source: str) -> ToolSpec:
         raise ValueError(f"Registry file {source}: rules_label needs a kind, one of {list(LABEL_KINDS)}, a path, and "
                          "a text holding {value}")
     return spec
+
+
+def _outputs(entries: object, source: str) -> tuple[str | tuple[str, ...], ...]:
+    """A registry file's outputs: a list whose entries are each a name pattern, or a list of them that is a group (see
+    ToolSpec.outputs). ValueError, naming the file, for anything else."""
+    def is_pattern(item: object) -> bool:
+        return isinstance(item, str) and bool(item)
+
+    def is_group(item: object) -> bool:
+        return isinstance(item, list) and bool(item) and all(is_pattern(pattern) for pattern in item)
+
+    if not isinstance(entries, list) or not all(is_pattern(entry) or is_group(entry) for entry in entries):
+        raise ValueError(f"Registry file {source}: outputs must be a list of name patterns, each one text or a list of texts")
+    return tuple(entry if isinstance(entry, str) else tuple(entry) for entry in entries)
 
 
 def _executables_under(folder: Path) -> list[Path]:

@@ -14,7 +14,7 @@ from glessner.case import create_case
 from glessner.intake import add_new, intake
 from glessner.long_paths import long_path
 from glessner.runner import RunError, plan_runs, read_runs, run
-from glessner.tools import DetectedTool, ToolOption, ToolSpec, folder_sha256
+from glessner.tools import DetectedTool, ToolOption, ToolSpec, detect, folder_sha256
 
 FAKE_TOOL = """
 import json, os, pathlib, sys, time
@@ -30,6 +30,13 @@ elif mode == 'env':
     (out_dir / 'out.txt').write_text(os.environ.get('DOTNET_ROOT', '') + '|' + os.environ.get('DOTNET_ROOT_X64', ''))
 elif mode == 'argv':
     (out_dir / 'out.txt').write_text(json.dumps(sys.argv))
+elif mode == 'messages':   # a build that writes only a messages file
+    (out_dir / 'messages.txt').write_text('messages')
+elif mode == 'console-log':   # a build that writes only a console log
+    (out_dir / '20261025181337_Fake_2026.10.1_ConsoleLog.txt').write_text('messages')
+elif mode == 'ok-console-log':
+    (out_dir / 'out.txt').write_text('\\n'.join(names))
+    (out_dir / '20261025181337_Fake_2026.10.1_ConsoleLog.txt').write_text('console messages')
 elif mode not in ('no-output', 'fail-no-output'):
     (out_dir / 'out.txt').write_text('\\n'.join(names))
 print('read', len(names), 'files')
@@ -114,6 +121,48 @@ def test_empty_result_explains_absent_output_only(case, tmp_path):
     assert run_mode(case, tool, "ok").status == "ok"
 
 
+CONSOLE_LOG = "20261025181337_Fake_2026.10.1_ConsoleLog.txt"
+
+
+def test_a_console_log_is_hashed_with_the_output_and_is_none_of_the_tool_s_files(case, tmp_path):
+    """Builds from 2026.10 write <stamp>_<tool>_<version>_ConsoleLog.txt in the output folder. No registry entry requires
+    it, so a run of an older build, which writes none, passes too. A run records the file with the rest of its output,
+    and it is none of the files the run records for the tool."""
+    tool = fake_spec(tmp_path)
+    older, newer = run_mode(case, tool, "ok"), run_mode(case, tool, "ok-console-log")
+    assert [(r.status, r.reason, r.missing_outputs) for r in (older, newer)] == [("ok", "", [])] * 2
+    assert [o["path"] for o in older.outputs] == ["out.txt"]
+    assert [o["path"] for o in newer.outputs] == [CONSOLE_LOG, "out.txt"]
+    log = case.runs_folder / newer.run_id / "output" / CONSOLE_LOG
+    assert newer.outputs[0]["sha256"] == hashlib.sha256(log.read_bytes()).hexdigest()
+    assert not any("ConsoleLog" in name for name in saved_record(case, newer)["tool_files"])
+
+
+def with_logs(tool):
+    """The fake tool needing one of two logs, as SBECmd's entry does, in place of its single output."""
+    return with_spec(tool, outputs=(("messages.txt", "*_ConsoleLog.txt"),))
+
+
+@pytest.mark.parametrize("mode", ["messages", "console-log"])
+def test_a_run_that_writes_one_of_a_group_of_outputs_passes(case, tmp_path, mode):
+    record = run_mode(case, with_logs(fake_spec(tmp_path)), mode)
+    assert (record.status, record.reason, record.missing_outputs) == ("ok", "", [])
+
+
+def test_a_run_that_writes_none_of_a_group_of_outputs_fails_naming_the_group(case, tmp_path):
+    record = run_mode(case, with_logs(fake_spec(tmp_path)), "no-output")
+    assert record.status == "failed" and record.missing_outputs == ["messages.txt or *_ConsoleLog.txt"]
+    assert "expected output missing or unreadable: messages.txt or *_ConsoleLog.txt." in record.reason
+    assert "Antivirus may have quarantined it" in record.reason
+
+
+def test_a_run_that_writes_a_group_s_file_it_cannot_read_fails_instead_of_passing_on_the_group(case, tmp_path):
+    """A file of the group that the run hashes and can't read is a missing output of its own, as for any output."""
+    tool = with_spec(fake_spec(tmp_path), outputs=(("out.txt", "other.txt"),))
+    record = run_mode(case, tool, "unreadable-output")
+    assert record.status == "failed" and record.missing_outputs[0].startswith("out.txt (unreadable")
+
+
 def test_private_dotnet_runtime_reaches_the_tool_and_the_record(case, tmp_path):
     runtime = str(tmp_path / "tools" / "dotnet-9")
     tool = fake_spec(tmp_path)
@@ -121,6 +170,28 @@ def test_private_dotnet_runtime_reaches_the_tool_and_the_record(case, tmp_path):
     assert record.status == "ok" and record.dotnet_root == runtime
     assert (case.runs_folder / record.run_id / "output" / "out.txt").read_text() == f"{runtime}|{runtime}"
     assert json.loads((case.runs_folder / record.run_id / "run.json").read_text())["dotnet_root"] == runtime
+
+
+def test_a_run_of_a_tool_that_lacks_its_dotnet_runtime_is_refused_naming_the_runtime(case, tmp_path, monkeypatch):
+    """With only a .NET 9 runtime in the tools folder, a tool that needs .NET 10 is stopped by the .NET host, which says
+    so when its version is checked, and a run is refused with the runtime named rather than started to fail with the host's
+    exit code."""
+    from test_tools import HOST_STOP_CODE, HOST_STOP_TEXT, fake_runtime, version_checks_end
+
+    version_checks_end(monkeypatch, code=HOST_STOP_CODE, stderr=HOST_STOP_TEXT)
+    spec = replace(fake_spec(tmp_path).spec, executables=("Fake.exe",), version_args=("--version",),
+                   version_regex=r"^(\d+\.\d+\.\d+)", dotnet=10)
+    tools_folder = tmp_path / "tools"
+    (tools_folder / "Fake").mkdir(parents=True)
+    (tools_folder / "Fake" / "Fake.exe").write_bytes(b"not a real program")
+    fake_runtime(tools_folder / "dotnet-9", "9.0.21")
+    found = detect([spec], tools_folder)["fake"]
+    (plan,) = plan_runs(case, found, ["DC01"])
+    with pytest.raises(RunError, match=r"Fake can't run here: Needs a \.NET 10 runtime: unpack Microsoft's \.NET 10 runtime zip"):
+        run(case, plan)
+    assert read_runs(case) == []
+    fake_runtime(tools_folder / "dotnet-10", "10.0.13")
+    assert detect([spec], tools_folder)["fake"].missing == ""
 
 
 def test_nonzero_exit_fails(case, tmp_path):
@@ -835,12 +906,15 @@ def git_rules(folder: Path, commit: str) -> dict:
 
 
 def test_a_run_records_the_sha_256_of_its_tool_s_files(case, tmp_path):
-    """The fake tool is the Python executable, given a script outside its folder, so it records the executable alone."""
+    """The fake tool is the Python executable, given a script outside its folder, so it records the executable and the
+    libraries beside it, if it has any. A case with no tools folder checks it against no manifest."""
     exe = Path(sys.executable)
     record = run_mode(case, fake_spec(tmp_path), "ok")
     saved = saved_record(case, record)
-    assert record.status == "ok" and saved["tool_files"] == {exe.name: hashlib.sha256(exe.read_bytes()).hexdigest()}
-    assert saved["rules"] == "" and not {"rows_skipped", "tool_check"} & set(saved)   # no set, no parser, no check
+    assert record.status == "ok" and saved["tool_files"][exe.name] == hashlib.sha256(exe.read_bytes()).hexdigest()
+    assert all(name.lower().endswith(".dll") for name in saved["tool_files"] if name != exe.name)
+    assert saved["rules"] == "" and "rows_skipped" not in saved   # no set, no parser
+    assert saved["tool_check"] == {"result": "no manifest", "reason": "no tools folder is set"}
 
 
 def test_a_builtin_tool_s_run_records_an_empty_set_of_tool_files(case, tmp_path):
@@ -853,17 +927,18 @@ def test_a_builtin_tool_s_run_records_an_empty_set_of_tool_files(case, tmp_path)
 def test_a_run_notes_each_link_its_tool_files_leave_out(case, tmp_path, monkeypatch):
     """A folder's hash skips the links in it, as intake skips them, but the tool may read through one."""
     from glessner import runner
+    from glessner.tools import ToolListing
 
     def hashed(tool, argv, links):
         links += ["rules/shared -> D:\\Rules", "Maps/more -> D:\\Maps"]
-        return {}
+        return ToolListing({}, {})
 
-    monkeypatch.setattr(runner, "tool_files", hashed)
+    monkeypatch.setattr(runner, "tool_listing", hashed)
     record = run_mode(case, fake_spec(tmp_path), "ok")
     note = ("The SHA-256s recorded for Fake's files don't cover what 2 links in its folder point to, which Fake may "
             "read: rules/shared -> D:\\Rules; Maps/more -> D:\\Maps.")
     assert record.status == "ok" and note in saved_record(case, record)["notes"]
-    monkeypatch.setattr(runner, "tool_files", lambda tool, argv, links: {})
+    monkeypatch.setattr(runner, "tool_listing", lambda tool, argv, links: ToolListing({}, {}))
     assert not any("SHA-256s" in n for n in run_mode(case, fake_spec(tmp_path), "ok").notes)
 
 
@@ -909,3 +984,163 @@ def test_a_run_in_a_case_below_format_4_records_none_of_format_4_s_keys(case, tm
     record = run_mode(below, detected, "ok")
     assert (record.status, record.rules, record.tool_files) == ("ok", "", None)
     assert not FORMAT_4_KEYS & set(saved_record(below, record))
+
+
+def at_tools_folder(case, folder):
+    """`case` with its tools folder set to `folder`."""
+    return replace(case, settings=replace(case.settings, tools_folder=str(folder)))
+
+
+def stand_in(tmp_path) -> DetectedTool:
+    """The registry ID "fake" unpacked in a tools folder under tmp_path, with a Maps folder. The fake tool that runs is the
+    Python executable, whose folder can't be written to, so the runs below stub the listing of its files with this one's."""
+    folder = tmp_path / "tools" / "Fake"
+    for rel, data in {"Fake.exe": b"MZ", "Fake.dll": b"MZ dll", "Maps/a.map": b"a\n", "Maps/b.map": b"b\n"}.items():
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_bytes(data)
+    return DetectedTool(replace(fake_spec(tmp_path).spec, tool_files=("Maps",)), folder / "Fake.exe", "1.0")
+
+
+def pinned_stand_in(tmp_path, monkeypatch) -> tuple[DetectedTool, Path]:
+    """The stand-in pinned in the manifest of tmp_path's tools folder, and runs listing its files, as a run's own listing."""
+    from glessner import runner, tools
+    from glessner.tools_manifest import pin_tools, take_pin
+
+    found = stand_in(tmp_path)
+    path = pin_tools(tmp_path / "tools", {"fake": take_pin(found)})
+    listed = runner.tool_listing
+
+    def listing(tool, argv, links):
+        return tools.pin_files(found, links) if tool.spec.id == "fake" and not tool.spec.builtin else listed(tool, argv, links)
+
+    monkeypatch.setattr(runner, "tool_listing", listing)
+    return found, path
+
+
+def test_a_run_records_that_its_tool_s_files_match_the_pin(case, tmp_path, monkeypatch):
+    """The check is made before the run's first write, from the manifest read once, so a run that is stopped keeps it and
+    the record names the manifest by the hash of its bytes."""
+    from glessner import runner
+
+    _, path = pinned_stand_in(tmp_path, monkeypatch)
+    at = at_tools_folder(case, tmp_path / "tools")
+    record = run_mode(at, fake_spec(tmp_path), "ok")
+    entry = json.loads(path.read_text(encoding="utf-8"))["tools"]["fake"]
+    expected = {"result": "matches", "manifest_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "pinned_utc": entry["pinned_utc"], "pinned_version": "1.0", "pinned_by": entry["pinned_by"]}
+    assert record.status == "ok" and record.tool_check == expected == saved_record(at, record)["tool_check"]
+    assert read_runs(at)[0].tool_check == expected
+
+    class Stop(BaseException):
+        pass
+
+    def stop(*args, **kwargs):
+        raise Stop
+
+    monkeypatch.setattr(runner.subprocess, "run", stop)
+    with pytest.raises(Stop):
+        run_mode(at, fake_spec(tmp_path), "ok")
+    (interrupted,) = [r for r in read_runs(at) if r.status == "running"]
+    assert interrupted.tool_check == expected
+
+
+def test_a_run_whose_tool_files_differ_from_the_pin_goes_ahead_and_records_which(case, tmp_path, monkeypatch):
+    found, _ = pinned_stand_in(tmp_path, monkeypatch)
+    (found.executable.parent / "Maps" / "a.map").write_bytes(b"a, edited\n")
+    at = at_tools_folder(case, tmp_path / "tools")
+    record = run_mode(at, fake_spec(tmp_path), "ok")
+    assert (record.status, record.evidence_check) == ("ok", "ok")
+    assert (case.runs_folder / record.run_id / "output" / "out.txt").read_text() == "Security.evtx"
+    check = saved_record(at, record)["tool_check"]
+    assert check["result"] == "differs" and "more" not in check
+    assert check["files"] == [{"path": "Maps/a.map", "state": "changed", "pinned": hashlib.sha256(b"a\n").hexdigest(),
+                               "now": hashlib.sha256(b"a, edited\n").hexdigest()}]
+    assert saved_record(at, record)["tool_files"]["Maps/"] != json.loads(
+        (tmp_path / "tools" / "tools_manifest.json").read_text(encoding="utf-8"))["tools"]["fake"]["files"]["Maps/"]
+
+
+def test_a_run_whose_manifest_cannot_be_read_goes_ahead_and_records_unreadable(case, tmp_path, monkeypatch):
+    _, path = pinned_stand_in(tmp_path, monkeypatch)
+    path.write_text("not json {", encoding="utf-8")
+    at = at_tools_folder(case, tmp_path / "tools")
+    record = run_mode(at, fake_spec(tmp_path), "ok")
+    assert record.status == "ok" and record.tool_check["result"] == "unreadable"
+    assert record.tool_check["manifest_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert "isn't JSON" in record.tool_check["reason"]
+
+
+def test_a_run_in_a_case_with_no_tools_folder_or_no_manifest_records_no_manifest(case, tmp_path):
+    record = run_mode(case, fake_spec(tmp_path), "ok")
+    assert record.tool_check == {"result": "no manifest", "reason": "no tools folder is set"}
+    (tmp_path / "tools").mkdir()
+    record = run_mode(at_tools_folder(case, tmp_path / "tools"), fake_spec(tmp_path), "ok")
+    assert record.tool_check == {"result": "no manifest", "reason": "the tools folder has no tools_manifest.json"}
+    assert saved_record(case, record)["tool_check"] == record.tool_check
+
+
+def test_a_run_records_no_tool_check_below_format_4_for_a_builtin_tool_or_for_a_load_of_found_output(case, tmp_path,
+                                                                                                     monkeypatch):
+    """The key joins run.json only for a tool a case at format 4 ran from files that can be hashed: a case kept at format
+    3 with a manifest in its tools folder, a builtin tool, an import's or found output's load, all leave it out."""
+    from conftest import FAST_ALERTS
+
+    from glessner.imports import preview, run_import
+    from glessner.runner import load_found_output
+
+    _, path = pinned_stand_in(tmp_path, monkeypatch)
+    at = at_tools_folder(case, tmp_path / "tools")
+    builtin = run_mode(at, with_spec(fake_spec(tmp_path), builtin=True), "ok")
+    assert builtin.tool_files == {} and builtin.tool_check is None and "tool_check" not in saved_record(at, builtin)
+    (case.evidence / "SENSOR").mkdir()
+    (case.evidence / "SENSOR" / "eve.json").write_text(eve_lines([1000]), encoding="utf-8")
+    (case.evidence / "IDS").mkdir()
+    (case.evidence / "IDS" / "fast.log").write_text(FAST_ALERTS, newline="\n")
+    add_new(at)
+    found = load_found_output(at, "suricata", "suricata_eve", "SENSOR", ["SENSOR/eve.json"])
+    assert found.status == "ok" and found.tool_check is None and "tool_check" not in saved_record(at, found)
+    mapping = preview(at, "IDS/fast.log")["mapping"]
+    imported = run_import(at, "IDS/fast.log", {**mapping, "time": {**mapping["time"], "zone": "UTC"}}, zones={})
+    assert imported.status == "ok" and imported.tool_check is None and "tool_check" not in saved_record(at, imported)
+    below = at_tools_folder(format3_case(case), tmp_path / "tools")
+    record = run_mode(below, fake_spec(tmp_path), "ok")
+    assert path.is_file() and record.tool_check is None and "tool_check" not in saved_record(below, record)
+
+
+def test_a_rebuild_a_reload_and_the_mark_of_an_interrupted_run_keep_the_tool_check_as_it_was(case):
+    """A rebuild and a reload write each run's record again and a mark of an interrupted run rewrites it. The tool_check a
+    run recorded stays equal, and a record without one has none afterward, since the tools folder at that time isn't
+    what the run used."""
+    from glessner.journal import host_layout
+    from glessner.runner import _write_record, rebuild, reload_run
+    from glessner.toolbox import close_interrupted
+
+    check = {"result": "differs", "manifest_sha256": "ab" * 32, "files": [{"path": "Maps/a.map", "state": "missing",
+                                                                           "pinned": "cd" * 32}]}
+    with_check, folder = pecmd_run(case, "DC01")
+    without, _ = pecmd_run(case, "DESKTOP")
+    with_check.tool_check = check
+    _write_record(folder.parent, with_check)
+    saved = lambda record: json.loads((case.runs_folder / record.run_id / "run.json").read_text(encoding="utf-8"))
+    rebuild(case)
+    assert saved(with_check)["tool_check"] == check and "tool_check" not in saved(without)
+    record = next(r for r in read_runs(case) if r.run_id == with_check.run_id)
+    reload_run(case, record, host_layout(case))
+    assert saved(with_check)["tool_check"] == check and "tool_check" not in saved(without)
+    running = saved(with_check) | {"status": "running"}
+    (case.runs_folder / with_check.run_id / "run.json").write_text(json.dumps(running), encoding="utf-8")
+    assert [r.run_id for r in close_interrupted(case)] == [with_check.run_id]
+    assert saved(with_check)["tool_check"] == check and saved(with_check)["status"] == "failed"
+
+
+def test_a_run_record_whose_tool_check_has_a_result_word_this_build_does_not_know_is_read(case, tmp_path):
+    from glessner.toolbox import overview
+    from glessner.tools import load_registry
+
+    _, folder = pecmd_run(case, "DC01")
+    path = folder.parent / "run.json"
+    check = {"result": "sparkles", "a_later_key": [1, 2]}
+    path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "tool_check": check}), encoding="utf-8")
+    (read,) = read_runs(case)
+    assert read.tool_check == check
+    (pecmd,) = [t for t in overview(case, load_registry(), {})["tools"] if t["id"] == "pecmd"]
+    assert pecmd["last_run"]["latest"]["check"] == check   # shown as written

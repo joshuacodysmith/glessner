@@ -4,7 +4,7 @@
 // Findings page, whose right column holds the export controls.
 
 import { showAudit } from './audit.js';
-import { $, api, HINTS, plural, S } from './core.js';
+import { $, api, HINTS, plural, S, showControls } from './core.js';
 import { loadDetails, setPage } from './event_page.js';
 import { showFindings } from './findings.js';
 import { renderHosts } from './hosts.js';
@@ -169,18 +169,20 @@ export function mismatchFound(check) {
 // that found only that is never called matched. The reasons a copy's manifest record names, that its source couldn't
 // vouch for it, come from the journal, so they show before the copy's own first full re-hash: they warn when the source
 // had a break or no head recorded, and are in the hover whatever they are. A missing manifest.jsonl that the journal
-// records is a warning too, not a case still waiting for intake.
+// records is a warning too, not a case still waiting for intake. Every text in the line and its hover can come from the
+// evidence or the journal (a file's name, an analyst's name, a reason), so each goes through showControls.
 export function renderCaseState(st) {
   if (!st) return;
   const day = (iso) => String(iso || '').slice(0, 10);
+  const say = (text) => document.createTextNode(showControls(text));
   const warn = (text) => {
     const span = document.createElement('span');
     span.className = 'warn';
-    span.textContent = text;
+    span.textContent = showControls(text);
     return span;
   };
   const ev = st.checks || {};
-  const parts = [document.createTextNode(st.closed ? `Closed on ${day(st.closed.at)}` : 'Open')];
+  const parts = [say(st.closed ? `Closed on ${day(st.closed.at)}` : 'Open')];
   let title = st.intake
     ? `${plural(st.evidence_files, 'evidence file')} hashed at intake (SHA-256)` +
       (st.added_files ? `, and ${st.added_files.toLocaleString()} added later` : '') +
@@ -189,7 +191,7 @@ export function renderCaseState(st) {
     : st.manifest_missing || 'No intake manifest: the evidence was not hashed.';
   const evidence = document.createElement('span');
   if (!st.intake) {
-    evidence.append(st.manifest_missing ? warn('manifest.jsonl is missing') : 'no intake manifest yet');
+    evidence.append(st.manifest_missing ? warn('manifest.jsonl is missing') : say('no intake manifest yet'));
   } else if (ev.files) {
     const found = [ev.changed_files ? `evidence changed since intake: ${plural(ev.changed_files, 'file')}` : '',
                    ev.not_reread ? `${plural(ev.not_reread, 'evidence file')} could not be re-read` : '',
@@ -204,7 +206,7 @@ export function renderCaseState(st) {
   } else if (ev.last_full?.result === 'ok') {
     // A file intake couldn't read has no hash, so no re-hash checked it, nor the files of a folder it couldn't list,
     // which are counted as a folder since how many there are is unknown. The line says so, as its hover does.
-    evidence.append(`full re-hash matched on ${day(ev.last_full.at)}`);
+    evidence.append(say(`full re-hash matched on ${day(ev.last_full.at)}`));
     if (st.unreadable) evidence.append('; ', warn(`${plural(st.unreadable, 'file')} unverified`));
     if (st.unlisted) evidence.append('; ', warn(`${plural(st.unlisted, 'folder')} unverified`));
   } else if (ev.last_full) {
@@ -213,7 +215,7 @@ export function renderCaseState(st) {
     evidence.append(warn(found));
     title += ` The full re-hash of ${day(ev.last_full.at)} found ${found}.`;
   } else {
-    evidence.append(ev.newest ? "runs' evidence checks matched; no full re-hash yet" : 'evidence not re-checked since intake');
+    evidence.append(say(ev.newest ? "runs' evidence checks matched; no full re-hash yet" : 'evidence not re-checked since intake'));
   }
   if (st.intake && ev.unreadable_lines) {
     const n = ev.unreadable_lines;
@@ -229,7 +231,7 @@ export function renderCaseState(st) {
     title += ` The newest check, ${n.at} (${n.reason || 'no reason given'}), listed ${plural(n.files_checked, 'file')}: ` +
              `${n.result === 'ok' ? 'every readable one matched' : mismatchFound(n)}.`;
   }
-  if (S.meta.analyst) parts.push(document.createTextNode(`analyst ${S.meta.analyst}`));
+  if (S.meta.analyst) parts.push(say(`analyst ${S.meta.analyst}`));
   // "Journal changed" in red, only while the chain is broken; otherwise the line is unchanged
   S.journal = st.journal || null;
   if (st.journal?.broken) {
@@ -241,8 +243,8 @@ export function renderCaseState(st) {
   }
   const line = $('caseState');
   line.replaceChildren(...parts.flatMap((p, i) => (i ? [document.createTextNode(' · '), p] : [p])));
-  line.title = `${line.textContent}
-${title}`;   // the line ellipsizes in a narrow header, so its hover holds all of it
+  line.title = showControls(`${line.textContent}
+${title}`);   // the line ellipsizes in a narrow header, so its hover holds all of it
 }
 
 // Read the case state again, after something that may have checked the evidence or closed the case

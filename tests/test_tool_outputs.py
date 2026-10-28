@@ -143,6 +143,30 @@ def test_loading_from_the_page_job_and_sbecmd_without_its_messages_file(tmp_path
     assert [(r["host"], r["status"], r["rows"]) for r in job.results] == [("DC01", "ok", 2)]
 
 
+def test_a_console_log_in_the_evidence_is_no_tool_output(tmp_path):
+    """A 2026.10 build's console log is read beside SBECmd's CSVs, but intake identifies it as nothing, and found
+    output lists the CSV alone."""
+    from sbecmd_log_fixtures import CONSOLE_LOG_NAME, console_log_text
+
+    from glessner.intake import current_entries
+
+    folder = "WS01/Modules/FileFolderAccess"
+    csv_path = f"{folder}/alice_UsrClass.csv"
+    text = console_log_text(r"D:\Evidence\WS01\Users\alice\AppData\Local\Microsoft\Windows\UsrClass.dat",
+                            r"C:\out\alice_UsrClass.csv")
+    first_line = text.split("\r\n", 1)[0]
+    assert kind_of(CONSOLE_LOG_NAME, first_line) is None
+    assert identify_bytes(CONSOLE_LOG_NAME, text.encode()).artifact is None
+    ev = tmp_path / "evidence"
+    write_rows(ev / csv_path, SBE_COLUMNS, [{"BagPath": "BagMRU\\0", "Slot": "1", "AbsolutePath": "Desktop\\This PC\\C:\\Tools"}])
+    (ev / folder / CONSOLE_LOG_NAME).write_text(text, encoding="utf-8", newline="")
+    case = create_case(tmp_path / "case", "Console log", ev, "cody")
+    intake(case)
+    assert {e.path: e.artifact for e in current_entries(case)}[f"{folder}/{CONSOLE_LOG_NAME}"] is None
+    groups = found_outputs(case, load_registry(), {})
+    assert [(g["key"], g["host"], g["paths"]) for g in groups] == [("sbecmd_csv", "WS01", [csv_path])]
+
+
 def test_command_line_lists_and_loads_found_output(tmp_path, capsys):
     from glessner.cli import main
 

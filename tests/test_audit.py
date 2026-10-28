@@ -154,6 +154,34 @@ def test_audit_markdown_escapes_event_text(synthetic_case):
     assert "# Audit trail: Case \\<b\\>" in text and "<img" not in text.replace("\\<img", "")
 
 
+def test_the_exported_trail_shows_bidi_controls_as_code_points(synthetic_case):
+    """An event named by its message, a note, and the case's name can hold a right-to-left override, which would draw
+    report[U+202E]fdp.scr as reportrcs.pdf. The trail's Markdown writes it as [U+202E], where the report does, and its
+    code spans keep the code point literal."""
+    rlo = "\u202e"
+    con, journal, _ = open_case(synthetic_case)
+    a, b, _ = evtx_uids(con)
+    journal.append("mark", targets=[a], value="malicious", note=f"see report{rlo}fdp.scr")
+    journal.append("mark", targets=[a, b], value="suspicious", note="")
+    entries = read_entries(journal.path)
+    text = markdown(entries, f"Case{rlo}", {a: f"WS01 4688: report{rlo}fdp.scr"},
+                    listed={3: (2, [{"ts": None, "host": f"WS{rlo}1", "code": "4688", "uid": f"x{rlo}y"}])})
+    assert rlo not in text
+    assert r"# Audit trail: Case\[U+202E\]" in text
+    assert r'Marked WS01 4688: report\[U+202E\]fdp.scr Malicious. Note: "see report\[U+202E\]fdp.scr"' in text
+    assert r"No time recorded, WS\[U+202E\]1, 4688, ID `x[U+202E]y`" in text
+
+
+def test_the_exported_trail_prints_a_character_reference_in_evidence_text_as_written(synthetic_case):
+    """A Markdown reader turns &rlm; into a right-to-left mark and &lt; into <, so the trail escapes the ampersand that
+    begins a named reference, as the report does. An ampersand with no reference after it stays."""
+    con, journal, _ = open_case(synthetic_case)
+    a, _, _ = evtx_uids(con)
+    journal.append("mark", targets=[a], value="malicious", note="report&rlm;fdp.scr")
+    text = markdown(read_entries(journal.path), "Case", {a: "cmd /c a && b &lt;x&gt;"})
+    assert r'Marked cmd /c a && b \&lt;x\&gt; Malicious. Note: "report\&rlm;fdp.scr"' in text
+
+
 def test_audit_api_undo_and_export(running):
     app, port, _ = running
     session = login(port, app)

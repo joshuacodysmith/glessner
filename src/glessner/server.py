@@ -188,6 +188,7 @@ from .tool_outputs import KINDS
 from .toolbox import close_interrupted, everything_ready, overview, run_gaps, start_all_job, start_load_job
 from .toolbox import start_job as start_tool_job
 from .tools import detect, load_registry
+from .tools_manifest import PinCache, pin_group, pin_tools, pinnable, take_pin
 from .version import build_id
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -311,6 +312,7 @@ class App:
         self.refresh_identity(events_changed=True)
         self.filters = FilterStore()   # view filters by ID; in memory only, never journaled
         self.tool_cache: tuple[dict, dict] | None = None   # the registry and detected tools, until a rescan
+        self.pin_cache = PinCache()   # each found tool's files as last hashed for the Tools page's pin states
         self.job = None   # the tool running from the Tools page, if any
         self.anchors: dict = {}   # the events the Event page read last, for the counts of its pivots (see anchor)
         self.checks_cache: tuple[tuple[int, int] | None, dict] | None = None   # evidence_checks, by the log's size and time
@@ -323,7 +325,15 @@ class App:
         that a fault stopped refreshes too: the fault can come after a load committed and before its step's result was
         recorded, as when a group's later member raises what its import doesn't catch. The rebuild runs on the job's
         thread and counts as a request, so a stop waits for it up to its bound and then cuts it off; an App the hub has
-        retired is not rebuilt."""
+        retired is not rebuilt. The next Tools page hashes again the files of each tool a step ran, and of each tool that
+        runs the same executable, since the run may have changed them, and the files of every tool after a job that ends
+        with an error."""
+        if job.error:
+            self.pin_cache.clear()
+        else:
+            detected = self.tool_cache[1] if self.tool_cache else {}
+            ran = [r["tool_id"] for r in job.results if r.get("tool_id") in detected]
+            self.pin_cache.drop(pin_group(detected, ran))
         if (job.error or any(r.get("loaded") for r in job.results)) and self.enter():
             try:
                 self.refresh_identity(events_changed=True)
@@ -1133,12 +1143,24 @@ def _technique(key: str) -> dict:
     return {"name": attack.name(tid), **({"flag": f} if (f := attack.flag(tid)) else {})}
 
 
+def _event_uids(body: dict, *, empty: bool = False) -> list[str]:
+    """The events a mark, tag, follow-up, or tag decision names in `uids`, each once and in the order first named, so
+    the entry's targets and the count answered never repeat an event. QueryError unless `uids` is a list of at most
+    MAX_MARK_TARGETS event IDs (at least one unless `empty`), each a non-empty string. The string check comes before
+    the repeats are dropped, which needs hashable values."""
+    uids = body.get("uids") or []
+    if not isinstance(uids, list) or not (uids or empty) or len(uids) > MAX_MARK_TARGETS:
+        raise QueryError(f"uids must be a list of at most {MAX_MARK_TARGETS} event IDs" if empty
+                         else f"uids must be a list of 1 to {MAX_MARK_TARGETS} event IDs")
+    if not all(isinstance(uid, str) and uid for uid in uids):
+        raise QueryError("uids must be event IDs, each a non-empty string")
+    return list(dict.fromkeys(uids))
+
+
 def api_tag(app: App, body: dict) -> dict:
     """Add or remove tags on events. Tags are typed or picked as text and stored as keys. An added technique
     must be in the ATT&CK list; a removed one need not be, so an older tag off the list can be taken off."""
-    uids = body.get("uids") or []
-    if not isinstance(uids, list) or not uids or len(uids) > MAX_MARK_TARGETS:
-        raise QueryError(f"uids must be a list of 1 to {MAX_MARK_TARGETS} event IDs")
+    uids = _event_uids(body)
     try:
         add = [normalize_tag(t) for t in body.get("add") or []]
         remove = [normalize_tag(t, listed=False) for t in body.get("remove") or []]
@@ -1414,9 +1436,7 @@ def _head_after(entry: dict, head: str) -> dict:
 
 def api_tag_suggestion(app: App, body: dict) -> dict:
     """Dismiss Hayabusa's suggested tags on events, or restore them."""
-    uids = body.get("uids") or []
-    if not isinstance(uids, list) or not uids or len(uids) > MAX_MARK_TARGETS:
-        raise QueryError(f"uids must be a list of 1 to {MAX_MARK_TARGETS} event IDs")
+    uids = _event_uids(body)
     with app.lock:   # an undo plans from the journal under it
         entry = app.journal.append("tag_suggestion", targets=uids, tags=body.get("tags") or [],
                                    decision=body.get("decision"))
@@ -1685,9 +1705,7 @@ def _set_pivot_windows(app: App, edits) -> dict[str, int]:
 
 
 def api_mark(app: App, body: dict) -> dict:
-    uids = body.get("uids") or []
-    if not isinstance(uids, list) or len(uids) > MAX_MARK_TARGETS:
-        raise QueryError(f"uids must be a list of at most {MAX_MARK_TARGETS} event IDs")
+    uids = _event_uids(body, empty=True)   # an empty list reaches the journal, which refuses it
     # Under the lock, which an undo plans and an accept reads the pending suggestions under; a rewrite also reads
     # the journal's state, which an append outside it would change as it reads
     with app.lock:
@@ -2345,9 +2363,7 @@ def api_exports_page(app: App, query: dict) -> dict:
 
 def api_followup(app: App, body: dict) -> dict:
     """Tick or clear Followed up on events. A later mark leaves the tick."""
-    uids = body.get("uids") or []
-    if not isinstance(uids, list) or not uids or len(uids) > MAX_MARK_TARGETS:
-        raise QueryError(f"uids must be a list of 1 to {MAX_MARK_TARGETS} event IDs")
+    uids = _event_uids(body)
     with app.lock:   # an undo plans from the journal under it
         entry = app.journal.append("followup", targets=uids, done=body.get("done"),
                                    **({"confirmed": body["confirmed"]} if "confirmed" in body else {}))
@@ -2588,13 +2604,14 @@ def _tools(app: App, rescan: bool = False) -> tuple[dict, dict]:
         specs = load_registry()
         folder = Path(app.case.settings.tools_folder) if app.case.settings.tools_folder else None
         app.tool_cache = (specs, detect(specs.values(), folder))
+        app.pin_cache.clear()
     return app.tool_cache
 
 
 def api_tools(app: App, query: dict) -> dict:
     """The Tools page: what's installed, what each tool reads here, and what ran."""
     specs, detected = _tools(app, _one(query, "rescan", "") == "1")
-    view = overview(app.case, specs, detected)
+    view = overview(app.case, specs, detected, app.pin_cache)
     tools, groups = everything_ready(app.case, specs, detected, view)
     return {**view, "job": app.job.state() if app.job else None,
             "ready": {"tools": [t.spec.name for t in tools], "outputs": len(groups)}}
@@ -2638,6 +2655,56 @@ def api_run_all(app: App, body: dict) -> dict:
     return _begin_job(app, lambda: start_all_job(app.case, specs, detected, app.after_job))
 
 
+def _check_no_job(app: App) -> None:
+    """ValueError while a Tools page job is running, as _begin_job refuses a second one. The caller holds app.lock."""
+    if app.job and not app.job.finished:
+        raise ValueError(f"{app.job.tool} is still running.")
+
+
+def api_pin_tools(app: App, body: dict) -> dict:
+    """Pin tools in the tools folder's manifest, each as the page showed it: `tools` maps a registry ID to the executable,
+    the hashes (`files`), and the `links` the page sent for it, and the tools that run the same executable are named
+    together. Refused, writing nothing, while a job runs, for a tool that can't be pinned (tools_manifest.pinnable), for a
+    request that leaves out a tool that runs the executable of one it names, for a manifest that can't be read, and when
+    a tool's files now differ from what the page sent, which the analyst's confirm didn't describe. The files are hashed
+    again outside app.lock, which a folder of thousands of files takes seconds to do, and the job is checked again under
+    it, with the write."""
+    asked = body.get("tools")
+    if not isinstance(asked, dict) or not asked:
+        raise ValueError("Name the tools to pin.")
+    with app.lock:
+        _check_no_job(app)
+    specs, detected = _tools(app)
+    folder = Path(app.case.settings.tools_folder) if app.case.settings.tools_folder else None
+    ids = pinnable(folder, specs, detected, list(asked))
+    if left_out := [tool_id for tool_id in ids if tool_id not in asked]:
+        raise ValueError("Tools that run one executable are pinned together. Name each of them: the request leaves out "
+                         f"{', '.join(specs[tool_id].name for tool_id in left_out)}.")
+    pins = {}
+    for tool_id in ids:
+        tool = detected[tool_id]
+        try:
+            pin = take_pin(tool)
+        except OSError as exc:
+            raise ValueError(f"{tool.spec.name}'s files can't all be read now: {exc}") from exc
+        if not _as_shown(asked.get(tool_id), pin):
+            raise ValueError(f"{tool.spec.name}'s files changed since the page showed them. Scan again, then pin.")
+        pins[tool_id] = pin
+    with app.lock:
+        _check_no_job(app)
+        path = pin_tools(folder, pins)
+    for tool_id, pin in pins.items():
+        app.pin_cache.put(detected[tool_id], pin)
+    return {"pinned": ids, "path": str(path)}
+
+
+def _as_shown(sent: object, pin) -> bool:
+    """Whether what the page sent for a tool, its executable, hashes, and links, is what the pin holds."""
+    return (isinstance(sent, dict) and sent.get("executable") == str(pin.tool.executable)
+            and sent.get("files") == pin.listing.hashes and isinstance(sent.get("links"), list)
+            and all(isinstance(link, str) for link in sent["links"]) and sorted(sent["links"]) == sorted(pin.links))
+
+
 def api_run_status(app: App, query: dict) -> dict:
     return {"job": app.job.state() if app.job else None}
 
@@ -2671,7 +2738,7 @@ POST_ROUTES = {"/api/mark": api_mark, "/api/note": api_note, "/api/host": api_ho
                "/api/import": api_import, "/api/evidence_add": api_evidence_add, "/api/run_tool": api_run_tool,
                "/api/load_output": api_load_output, "/api/run_all": api_run_all, "/api/followup": api_followup,
                "/api/finding": api_finding, "/api/journal_check": api_journal_check,
-               "/api/chain_break": api_chain_break}
+               "/api/chain_break": api_chain_break, "/api/pin_tools": api_pin_tools}
 
 
 def serve(case: Case, port: int = 0) -> tuple[ThreadingHTTPServer, App, str]:

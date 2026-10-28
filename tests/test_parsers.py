@@ -2,7 +2,11 @@ import csv
 import html
 import json
 from pathlib import Path
+from xml.etree import ElementTree
 
+import pytest
+
+from glessner.event_xml import row_for
 from glessner.events import connect, load
 from glessner.parsers import PARSERS, ParseContext
 from glessner.parsers.common import evidence_relative, ip_and_port, normalize_ip, payload_fields, payload_text, port_number
@@ -293,16 +297,29 @@ def test_sysmon_13_data_comes_before_a_long_user_key(tmp_path):
     assert value_set.message.index(f"TargetObject: {key}") > start
 
 
-def test_xml_entities_are_unescaped_once(tmp_path):
-    """EvtxECmd writes values as the event's XML holds them. One unescape gives the
-    event's own text: the redirection in a command line, and task XML that keeps its own entities."""
-    written = "cmd.exe /Q /c dir 1&gt; \\\\127.0.0.1\\ADMIN$\\out 2&gt;&amp;1"
+DECODED_LAYOUT = pytest.mark.parametrize("decoded", [False, True], ids=["as the event's XML holds them", "decoded"])
+
+
+def evtx_layout(decoded):
+    """The columns of EvtxECmd's CSV, and how it writes a value that the event's XML holds as `value`. Before 2026.10 it
+    writes the XML's text as it is. From 2026.10 it writes the event's own text, with each entity decoded once, and ends
+    the row with a RenderingInfo column."""
+    return ([*EVTX_COLUMNS, "RenderingInfo"], html.unescape) if decoded else (EVTX_COLUMNS, str)
+
+
+@DECODED_LAYOUT
+def test_xml_entities_are_unescaped_once(tmp_path, decoded):
+    """In the older layout one unescape gives the event's own text: the redirection in a command line, and task XML that
+    keeps its own entities. In the newer layout the value is that text already, so a row with the RenderingInfo column
+    is not unescaped again, and the events come out the same."""
+    columns, text = evtx_layout(decoded)
+    written = text("cmd.exe /Q /c dir 1&gt; \\\\127.0.0.1\\ADMIN$\\out 2&gt;&amp;1")
     command = "cmd.exe /Q /c dir 1> \\\\127.0.0.1\\ADMIN$\\out 2>&1"
-    task_written = ("&lt;Exec&gt;&lt;Command&gt;cmd.exe&lt;/Command&gt;&lt;Arguments&gt;/c dir &amp;gt; x.txt"
-                    "&lt;/Arguments&gt;&lt;/Exec&gt;")
+    task_written = text("&lt;Exec&gt;&lt;Command&gt;cmd.exe&lt;/Command&gt;&lt;Arguments&gt;/c dir &amp;gt; x.txt"
+                        "&lt;/Arguments&gt;&lt;/Exec&gt;")
     task = "<Exec><Command>cmd.exe</Command><Arguments>/c dir &gt; x.txt</Arguments></Exec>"
-    audit = "Raw Audit Event: statement:EXEC sp_configure &apos;xp_cmdshell&apos;, 1 &lt;ok&gt;"
-    write_csv(tmp_path / "evtxecmd.csv", EVTX_COLUMNS, [
+    audit = text("Raw Audit Event: statement:EXEC sp_configure &apos;xp_cmdshell&apos;, 1 &lt;ok&gt;")
+    write_csv(tmp_path / "evtxecmd.csv", columns, [
         sysmon_row(1, 1, "Process creation", {"Image": "C:\\Windows\\System32\\cmd.exe", "CommandLine": written},
                    ExecutableInfo=written),
         security_row(2, 4698, "Scheduled task created", {"TaskName": "\\Updater", "TaskContent": task_written},
@@ -311,8 +328,8 @@ def test_xml_entities_are_unescaped_once(tmp_path):
         {"EventRecordId": "3", "TimeCreated": "2020-09-19 03:21:40.0000000", "EventId": "33205",
          "Provider": "MSSQLSERVER", "Channel": "Application", "SourceFile": "D:\\Evidence\\case\\LAB\\Application.evtx",
          "MapDescription": "SQL audit event", "PayloadData1": audit,
-         "Payload": json.dumps({"EventData": {"Data": "audit &lt;ok&gt;"}})},
-        sysmon_row(4, 3, "Network connection", {"Image": "&lt;unknown process&gt;", "SourceIp": "10.0.0.5"}),
+         "Payload": json.dumps({"EventData": {"Data": text("audit &lt;ok&gt;")}})},
+        sysmon_row(4, 3, "Network connection", {"Image": text("&lt;unknown process&gt;"), "SourceIp": "10.0.0.5"}),
     ])
     proc, created, sql, net = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
     assert proc.process_command_line == command and proc.extra["CommandLine"] == command and command in proc.message
@@ -467,15 +484,18 @@ TASK_XML = ('<?xml version="1.0" encoding="UTF-16"?>'
             "<Arguments>/C tasklist &gt; %windir%\\Temp\\CYAlyNSS.tmp 2&gt;&amp;1</Arguments></Exec></Actions></Task>")
 
 
-def test_scheduled_task_xml_gives_the_command(tmp_path):
-    """What a remote task runs is only in its escaped XML. EvtxECmd writes the XML escaped once more, as
-    the event holds it; after one unescape it parses, and the action becomes the process and command line. XML that
-    declares a DTD is left alone."""
+@DECODED_LAYOUT
+def test_scheduled_task_xml_gives_the_command(tmp_path, decoded):
+    """What a remote task runs is only in its escaped XML. The older EvtxECmd layout writes the XML escaped once more, as
+    the event holds it, and after one unescape it parses. The newer layout writes it unescaped once already, and a second
+    unescape would break it: the task's own &amp; would become a bare &. Either way the action becomes the process and
+    command line. XML that declares a DTD is left alone."""
+    columns, text = evtx_layout(decoded)
     # As EvtxECmd delivers it: escaped, with the XML's lines joined by ", ".
-    escaped = html.escape(TASK_XML.replace("><", ">, <"), quote=False)
-    bomb = html.escape('<?xml version="1.0"?><!DOCTYPE t [<!ENTITY a "aa">]><Task><Actions><Exec><Command>&a;'
-                       "</Command></Exec></Actions></Task>", quote=False)
-    write_csv(tmp_path / "evtxecmd.csv", EVTX_COLUMNS, [
+    escaped = text(html.escape(TASK_XML.replace("><", ">, <"), quote=False))
+    bomb = text(html.escape('<?xml version="1.0"?><!DOCTYPE t [<!ENTITY a "aa">]><Task><Actions><Exec><Command>&a;'
+                            "</Command></Exec></Actions></Task>", quote=False))
+    write_csv(tmp_path / "evtxecmd.csv", columns, [
         security_row(1, 4698, "Scheduled Task created", {"TaskName": "\\CYAlyNSS", "TaskContent": escaped},
                      PayloadData1="TaskName: \\CYAlyNSS", PayloadData2=escaped),
         security_row(2, 4702, "A scheduled task was updated", {"TaskName": "\\LMST", "TaskContentNew": escaped},
@@ -606,6 +626,18 @@ def test_payload_text_finds_utf16_strings_and_nothing_in_binary():
     assert payload_text("not hex") == "" and payload_text("") == ""
 
 
+def test_the_xml_reader_s_message_parts_are_never_unescaped_and_an_older_row_s_are():
+    """The message decides from its own arguments whether a part is unescaped: the built-in XML reader's rows hold text
+    its parser decoded, as do rows with the RenderingInfo column, and an older EvtxECmd row holds the XML's entities."""
+    from glessner.parsers.evtxecmd import _message
+
+    row = {"MapDescription": "Process created", "PayloadData1": "cmd /c dir 1&gt; x &amp; ver"}
+    assert _message("4688", row, {}, "", xml_reader=True) == "4688 Process created | cmd /c dir 1&gt; x &amp; ver"
+    assert _message("4688", {**row, "RenderingInfo": ""}, {}, "", xml_reader=False) == (
+        "4688 Process created | cmd /c dir 1&gt; x &amp; ver")
+    assert _message("4688", row, {}, "", xml_reader=False) == "4688 Process created | cmd /c dir 1> x & ver"
+
+
 def test_decoded_payload_text_is_not_unescaped_again(tmp_path):
     """The text decoded from hex is literal, so the unescape for EvtxECmd's values doesn't apply."""
     write_csv(tmp_path / "evtxecmd.csv", EVTX_COLUMNS, [
@@ -636,3 +668,218 @@ def test_sysmon_network_messages_name_the_direction_and_ports(tmp_path):
     assert inbound.message == "3 Network connection | inbound | Source: 10.0.2.15:445 | Destination: 10.0.2.17:52000 | System"
     assert (inbound.source_ip, inbound.dest_ip, inbound.dest_port) == ("10.0.2.15", "10.0.2.17", "52000")
     assert outbound.message == "3 Network connection | outbound | Source: [fe80::1]:49712 | Destination: [fe80::2]:443"
+
+
+def test_a_logon_names_its_authentication_package_once(tmp_path):
+    """EvtxECmd's 4624 map from 2026.10 writes the authentication package as a part of its own, so the parser adds its
+    part only to a row whose map part is absent or holds no value."""
+    payload = {"TargetUserName": "alice", "TargetDomainName": "CORP", "LogonType": "3",
+               "AuthenticationPackageName": "NTLM"}
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        security_row(1, 4624, "Successful logon", payload, PayloadData1="Target: CORP\\alice",
+                     PayloadData2="LogonType 3", PayloadData4="AuthenticationPackageName: NTLM",
+                     PayloadData5="LogonProcessName: NtLmSsp"),
+        security_row(2, 4624, "Successful logon", payload, PayloadData1="Target: CORP\\alice",
+                     PayloadData2="LogonType 3", PayloadData4="AuthenticationPackageName: -"),
+        security_row(3, 4625, "Failed logon", payload, PayloadData1="Target: CORP\\alice"),
+    ])
+    mapped, bare_label, failed = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert mapped.message == ("4624 Successful logon | Target: CORP\\alice | LogonType 3 | "
+                              "AuthenticationPackageName: NTLM | LogonProcessName: NtLmSsp")
+    assert bare_label.message == ("4624 Successful logon | Target: CORP\\alice | LogonType 3 | "
+                                  "AuthenticationPackage: NTLM")
+    assert failed.message == "4625 Failed logon | Target: CORP\\alice | AuthenticationPackage: NTLM"
+
+
+LRM, RLM = "\u200e", "\u200f"
+
+
+def test_bidi_marks_leave_a_windows_date_and_stay_elsewhere(tmp_path):
+    """Windows writes a date for the reader's locale with a left-to-right mark before each part, as Task Scheduler's 800
+    and CAPI2's 4111 hold it, so a search for the date as shown would miss it. The marks leave a value that is a date
+    without them, in a field whose name holds Date or Time or in the unnamed data of CAPI2 or EventLog, and a message
+    part that repeats such a value. Anywhere else they stay, and the pages show them, since they can disguise a name."""
+    run_date = f"{LRM}9/{LRM}17/{LRM}2020 9:43 AM"
+    long_date = f"{LRM}Wednesday, {LRM}September {LRM}2, {LRM}2020 6:21:26 PM"
+    disguised = f"C:\\Users\\Public\\{RLM}invoice{LRM}.pdf.exe"
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        {**system_row(1, 800, "Task Scheduler service", {"LastRunDateTime": run_date}),
+         "Provider": "Microsoft-Windows-TaskScheduler", "PayloadData1": f"LastRunDateTime: {run_date}"},
+        {**system_row(2, 4111, "", {}), "Provider": "Microsoft-Windows-CAPI2",
+         "Payload": json.dumps({"EventData": {"Data": long_date}})},
+        sysmon_row(3, 1, "Process creation", {"Image": disguised, "CommandLine": f"{disguised} {run_date}"},
+                   ExecutableInfo=disguised),
+        # EvtxECmd writes the marks as characters, not as JSON escapes.
+        {**system_row(4, 800, "Task Scheduler service", {}), "Provider": "Microsoft-Windows-TaskScheduler",
+         "Payload": json.dumps({"EventData": {"Data": [{"@Name": "LastRunDateTime", "#text": run_date}]}},
+                               ensure_ascii=False)},
+    ])
+    task, capi, proc, written = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert written.extra["LastRunDateTime"] == "9/17/2020 9:43 AM"
+    assert task.extra["LastRunDateTime"] == "9/17/2020 9:43 AM"
+    assert task.message == "800 Task Scheduler service | LastRunDateTime: 9/17/2020 9:43 AM"
+    assert capi.extra == {"Data": "Wednesday, September 2, 2020 6:21:26 PM"} and LRM not in capi.message
+    assert proc.extra["Image"] == disguised and disguised in proc.message
+    assert proc.process_command_line == f"{disguised} {run_date}"
+
+
+@pytest.mark.parametrize("text", [
+    f"{LRM}1.2.3", f"1.{LRM}2.3", f"{LRM}6.1.7601", f"{LRM}123-45-6789", f"Windows {LRM}10 2004", f"1 of {LRM}2048",
+    f"admin{RLM} 12 2024", f"evil{RLM}gpj 12 2020", f"{LRM}1.2.3 4:56 evil", f"{LRM}9/{LRM}17/{LRM}2020 9:43 evil",
+    f"cmd /c echo {RLM}x: {LRM}9/{LRM}17/{LRM}2020 9:43 AM", f"Target: CORP\\admin{RLM} 12 2024",
+])
+def test_bidi_marks_stay_in_text_that_is_not_a_windows_date(text):
+    from glessner.parsers.evtxecmd import _unmarked_date
+
+    assert _unmarked_date(text) == text
+
+
+@pytest.mark.parametrize(("text", "shown"), [
+    (f"{LRM}17.{LRM}09.{LRM}2020 09:43", "17.09.2020 09:43"),
+    (f"{LRM}2020-{LRM}09-{LRM}17", "2020-09-17"),
+    (f"{LRM}2 {LRM}September {LRM}2020", "2 September 2020"),
+    (f"{LRM}Mittwoch, {LRM}2. {LRM}September {LRM}2020 18:21:26", "Mittwoch, 2. September 2020 18:21:26"),
+    (f"{RLM}9/{RLM}17/{RLM}2020 9:43 p.m.", "9/17/2020 9:43 p.m."),
+])
+def test_bidi_marks_leave_each_form_of_a_windows_date(text, shown):
+    from glessner.parsers.evtxecmd import _unmarked_date
+
+    assert _unmarked_date(text) == shown
+
+
+CRAFTED = f"{LRM}Mallory {LRM}12 {LRM}2024"   # a name built in the shape of a marked date
+DATED_FOLDER = f"{LRM}2020-{LRM}09-{LRM}17"
+
+
+RUN_DATE = f"{RLM}9/{RLM}17/{RLM}2020 9:43 p.m."
+
+
+@pytest.mark.parametrize(("part", "shown"), [
+    (f"LastRunDateTime: {RUN_DATE}", "LastRunDateTime: 9/17/2020 9:43 p.m."),
+    (RUN_DATE, "9/17/2020 9:43 p.m."),
+    (f"Time: {CRAFTED}", f"Time: {CRAFTED}"),
+    (f"Object: {DATED_FOLDER}", f"Object: {DATED_FOLDER}"),
+    (f"LastRunDateTime: {RUN_DATE} evil", f"LastRunDateTime: {RUN_DATE} evil"),
+    (f"cmd /c echo {RUN_DATE}", f"cmd /c echo {RUN_DATE}"),
+])
+def test_a_map_part_loses_only_the_marks_a_payload_value_lost(part, shown):
+    """A map part loses marks only where the whole part, or its value after the label, is a payload value that lost
+    them, so text that reads like a label, as a command line can, keeps its marks."""
+    from glessner.parsers.evtxecmd import _unmarked_part
+
+    assert _unmarked_part(part, {RUN_DATE: "9/17/2020 9:43 p.m."}) == shown
+
+
+def test_a_message_part_keeps_marks_that_a_field_with_its_value_keeps(tmp_path):
+    """When a field that keeps its marks holds the same text as a date field that lost them, the message keeps the
+    marks in that text, so it never shows a value without marks that a field still has."""
+    run_date = f"{LRM}9/{LRM}17/{LRM}2020 9:43 AM"
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        {**system_row(1, 800, "Task Scheduler service", {"LastRunDateTime": run_date, "TaskName": run_date}),
+         "Provider": "Microsoft-Windows-TaskScheduler", "PayloadData1": f"TaskName: {run_date}"},
+    ])
+    (task,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert task.extra == {"LastRunDateTime": "9/17/2020 9:43 AM", "TaskName": run_date}
+    assert task.message == f"800 Task Scheduler service | TaskName: {run_date}"
+
+
+def xml_reader_row(record, code, provider, *unnamed, **named):
+    """A row as the built-in XML reader writes one, for an event with its unnamed values first, then its named ones."""
+    data = "".join(f"<Data>{v}</Data>" for v in unnamed) + "".join(f'<Data Name="{k}">{v}</Data>'
+                                                                  for k, v in named.items())
+    xml = (f'<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="{provider}"/>'
+           f"<EventID>{code}</EventID><EventRecordID>{record}</EventRecordID><Channel>System</Channel>"
+           f"<Computer>LAB</Computer></System><EventData>{data}</EventData></Event>")
+    return row_for(ElementTree.fromstring(xml), "D:\\Evidence\\case\\LAB\\System.evtx")
+
+
+def test_bidi_marks_leave_a_date_written_with_right_to_left_marks_as_characters(tmp_path):
+    """EvtxECmd writes the marks as characters. CAPI2's unnamed data is a date in its 4111 to 4113."""
+    run_date = f"{RLM}9/{RLM}17/{RLM}2020 9:43 PM"
+    long_date = f"{RLM}Wednesday, {RLM}September {RLM}2, {RLM}2020 6:21:26 PM"
+    task_payload = {"EventData": {"Data": [{"@Name": "LastRunDateTime", "#text": run_date}]}}
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        {**system_row(1, 800, "Task Scheduler service", {}), "Provider": "Microsoft-Windows-TaskScheduler",
+         "Payload": json.dumps(task_payload, ensure_ascii=False)},
+        {**system_row(2, 4112, "", {}), "Provider": "Microsoft-Windows-CAPI2",
+         "Payload": json.dumps({"EventData": {"Data": long_date}}, ensure_ascii=False)},
+    ])
+    task, capi = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert RLM in (tmp_path / "evtxecmd.csv").read_text(encoding="utf-8-sig")
+    assert task.extra["LastRunDateTime"] == "9/17/2020 9:43 PM"
+    assert capi.extra == {"Data": "Wednesday, September 2, 2020 6:21:26 PM"} and RLM not in capi.message
+
+
+def test_bidi_marks_leave_a_field_whose_name_holds_date_or_time_in_that_case(tmp_path):
+    """A name holding Date or Time, with those capitals, marks a field that can hold a date: DriverDate and StartTime
+    lose their marks, and updateTitle and Runtime keep them."""
+    run_date = f"{LRM}9/{LRM}17/{LRM}2020 9:43 AM"
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        system_row(1, 7000, "Service start failed",
+                   {"DriverDate": run_date, "StartTime": run_date, "updateTitle": run_date, "Runtime": run_date}),
+    ])
+    (event,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert event.extra == {"DriverDate": "9/17/2020 9:43 AM", "StartTime": "9/17/2020 9:43 AM",
+                           "updateTitle": run_date, "Runtime": run_date}
+
+
+def test_bidi_marks_leave_unnamed_dates_in_the_xml_readers_rows(tmp_path):
+    """The built-in XML reader numbers unnamed values Data1 to DataN, so CAPI2's date and the date of EventLog's 6008,
+    an unexpected shutdown, lose their marks there too. A command line keeps them, label-like text and all."""
+    long_date = f"{RLM}Wednesday, {RLM}September {RLM}2, {RLM}2020 6:21:26 PM"
+    rows = [
+        xml_reader_row(1, 4111, "Microsoft-Windows-CAPI2", long_date),
+        xml_reader_row(2, 6008, "EventLog", "PM 3:32:54", DATED_FOLDER, "", "", "520643"),
+        xml_reader_row(3, 4688, "Microsoft-Windows-Security-Auditing", NewProcessName="C:\\Windows\\System32\\cmd.exe",
+                       CommandLine=f"cmd Time: {CRAFTED}"),
+    ]
+    write_csv(tmp_path / "event_xml.csv", list(rows[0]), rows)
+    capi, shutdown, created = PARSERS["event_xml_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert capi.extra == {"Data1": "Wednesday, September 2, 2020 6:21:26 PM"} and RLM not in capi.message
+    assert shutdown.extra["Data2"] == "2020-09-17" and LRM not in shutdown.message
+    assert created.process_command_line == f"cmd Time: {CRAFTED}" and f"cmd Time: {CRAFTED}" in created.message
+
+
+def test_bidi_marks_stay_in_a_date_shaped_value_whose_field_names_no_date(tmp_path):
+    """An account, a service, a folder, registry data, a rule name, or a command line can take the shape of a marked
+    date, or read like a labeled one, to disguise itself. A field keeps its marks unless its name holds Date or Time,
+    or it is the unnamed data of CAPI2 or EventLog, and then only a marked date loses them; a message part keeps them
+    unless its value is one that lost them."""
+    run_date = f"{LRM}9/{LRM}17/{LRM}2020 9:43 AM"
+    capi2 = "Microsoft-Windows-CAPI2"
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        security_row(1, 4624, "Successful logon",
+                     {"TargetUserName": CRAFTED, "TargetDomainName": "CORP", "LogonType": "3"},
+                     PayloadData1=f"Target: {CRAFTED}"),
+        system_row(2, 7045, "A service was installed in the system", {"ServiceName": CRAFTED, "ImagePath": "cmd.exe"}),
+        security_row(3, 5145, "Network share object access",
+                     {**SHARE_FIELDS, "ShareName": "\\\\*\\C$", "ShareLocalPath": "\\??\\C:\\",
+                      "RelativeTargetName": DATED_FOLDER},
+                     PayloadData2=f"Object: {DATED_FOLDER}"),
+        sysmon_row(4, 13, "Registry value set",
+                   {"RuleName": CRAFTED, "TargetObject": "HKLM\\Software\\Example\\When", "Details": DATED_FOLDER}),
+        {**system_row(5, 4111, "", {}), "Payload": json.dumps({"EventData": {"Data": run_date}}, ensure_ascii=False)},
+        sysmon_row(6, 1, "Process creation", {"UtcTime": run_date, "CommandLine": f"Time: {CRAFTED}"},
+                   ExecutableInfo=f"Time: {CRAFTED}"),
+        {**system_row(7, 400, "Engine state changed", {"HostApplication": f"powershell Time: {CRAFTED}"}),
+         "Provider": "PowerShell", "Channel": "Windows PowerShell", "PayloadData1": f"powershell Time: {CRAFTED}"},
+        {**system_row(8, 800, "Task Scheduler service", {"LastRunDateTime": f"{CRAFTED} evil"}),
+         "Provider": "Microsoft-Windows-TaskScheduler"},
+        {**system_row(9, 4111, "", {}), "Provider": capi2,
+         "Payload": json.dumps({"EventData": {"Data": f"{LRM}1.2.3"}}, ensure_ascii=False)},
+        {**system_row(10, 4111, "", {"Subject": CRAFTED}), "Provider": capi2},
+    ])
+    (logon, service, share, registry, unnamed, process, engine, task, capi_version,
+     capi_named) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert logon.user_name == CRAFTED and logon.extra["TargetUserName"] == CRAFTED
+    assert f"Target: {CRAFTED}" in logon.message
+    assert service.extra["ServiceName"] == CRAFTED
+    assert share.file_path == f"C:\\{DATED_FOLDER}" and DATED_FOLDER in share.file_key
+    assert share.extra["RelativeTargetName"] == DATED_FOLDER and f"Object: {DATED_FOLDER}" in share.message
+    assert registry.registry_data == DATED_FOLDER and registry.extra["RuleName"] == CRAFTED
+    assert unnamed.extra == {"Data": run_date}   # unnamed data from a provider other than CAPI2 or EventLog
+    assert process.extra["UtcTime"] == "9/17/2020 9:43 AM" and f"Time: {CRAFTED}" in process.message
+    assert process.process_command_line == f"Time: {CRAFTED}"
+    assert f"powershell Time: {CRAFTED}" in engine.message
+    assert task.extra["LastRunDateTime"] == f"{CRAFTED} evil"
+    assert capi_version.extra == {"Data": f"{LRM}1.2.3"} and capi_named.extra == {"Subject": CRAFTED}

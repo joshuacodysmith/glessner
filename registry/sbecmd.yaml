@@ -20,7 +20,9 @@ run:
   args: ["-d", "{host_dir}", "--csv", "{output_dir}"]
   timeout_minutes: 30
 options: []
-# The messages file is written on every run; a host whose hives hold no ShellBags still gets header-only CSVs.
-outputs: ["!SBECmd_Messages.txt"]
+# SBECmd records its run, and which CSV came from which hive, in !SBECmd_Messages.txt in builds before 2026.10 and in
+# <UTC yyyyMMddHHmmss>_SBECmd_<version>_ConsoleLog.txt in later ones. A run writes one of the two every time; a host
+# whose hives hold no ShellBags still gets header-only CSVs. Never --co false: older builds refuse the option.
+outputs: [["!SBECmd_Messages.txt", "*_SBECmd_*_ConsoleLog.txt"]]
 parser: sbecmd_csv
 notes: "ShellBags: the folders, drives, and network shares each user browsed in Explorer"

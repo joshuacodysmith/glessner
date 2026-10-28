@@ -774,7 +774,7 @@ def test_host_edits_sent_while_the_lock_is_held_land_before_or_after_the_summary
         row = next(line for line in Path(res["path"]).read_text(encoding="utf-8").splitlines()
                    if line.startswith("| DC01 |"))
         assert (host.role, host.offset_seconds, "DC-ONE" in host.add_names) == ("Servers", 5.0, True)
-        assert "| Servers |" in row and "DC-ONE" in row and row.endswith("| +5 s |")
+        assert "| Servers |" in row and "DC-ONE" in row and row.endswith("| +5 s; not measured |")
     finally:
         app.con.close()
 

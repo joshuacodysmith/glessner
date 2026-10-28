@@ -11,7 +11,7 @@ Glessner is pre-alpha. Read [Limits](#limits) before you rely on it for a case.
 You point Glessner at a folder holding a collection, with one top-level folder per host, as KAPE and most collection scripts produce. Glessner then does the following:
 
 - Hashes every file into a manifest and identifies each artifact by its header. It never writes to the evidence folder, and it re-hashes the files each tool run read. From case format 4, the journal records the SHA-256, size, and line count of `manifest.jsonl` itself at intake and at each `intake --add`, and `verify`, `close`, and the report compare the file with that record.
-- Runs the installed tools that read the evidence: EvtxECmd, RECmd, MFTECmd, PECmd, LECmd, JLECmd, SBECmd, AmcacheParser, SrumECmd, RBCmd, SQLECmd, WxTCmd, Hayabusa, and Suricata on packet captures. It logs each exact command line and records each tool's version. From case format 4, each run also records its rule or map set and the SHA-256 of its executable and of the rule, map, plugin, and configuration files the run names.
+- Runs the installed tools that read the evidence: EvtxECmd, RECmd, MFTECmd, PECmd, LECmd, JLECmd, SBECmd, AmcacheParser, SrumECmd, RBCmd, SQLECmd, WxTCmd, Hayabusa, and Suricata on packet captures. It logs each exact command line and records each tool's version. From case format 4, each run also records its rule or map set and the SHA-256 of its executable, of each `.dll` beside it, of the executable's `runtimeconfig.json` and `deps.json`, and of the rule, map, plugin, and configuration files the run names, and of SQLECmd's `runtimes` folder, which holds its native SQLite library. It also records a tool check: whether those files match the pin you made of the tool (`glessner tools CASE --pin`, or the Tools page). The check reads `matches`, `differs`, `not pinned`, `no manifest`, or `unreadable`. A run whose files differ still runs, and the Tools page, the job's step line, and `glessner run` say so. The report's Method table shows the tool check of each run whose events the case holds, and the report and the Case overview add a line when any run's tool files differed from the pin.
 - Loads other tools' output found in the evidence, such as a KAPE run's CSVs, Zeek's logs, Suricata's EVE JSON, and Sysinternals Autoruns CSVs. It imports text logs no tool reads: Windows Firewall, IIS, FortiGate, SonicWall, Apache, NGINX, syslog, Cisco ASA, Snort and Suricata fast alerts, and CSV or JSON-lines exports such as a SIEM's.
 - Shows every event on one timeline in a local browser page, in lanes you group by mark, role, host, user, artifact, or tactic. Logon links are drawn between hosts. A host's clock can be checked against a capture and corrected with an offset, and the recorded time never changes.
 - Ranks the next pivots for each kind of event, each with its reason and its count across the case before you click, and flags broad ones.
@@ -28,7 +28,7 @@ The screenshots show a small synthetic case built from the test suite's records.
 
 ## Set up
 
-[setup.md](setup.md) sets up Glessner on a fresh Windows machine: uv and Python, a tools folder, Eric Zimmerman's tools with the .NET 9 runtime that RBCmd, SQLECmd, and WxTCmd need, Hayabusa, and Npcap, Suricata, and the ET Open rule set for packet captures.
+[setup.md](setup.md) sets up Glessner on a fresh Windows machine: uv and Python, a tools folder, Eric Zimmerman's tools with the .NET 10 runtime that AmcacheParser, RBCmd, SQLECmd, and WxTCmd need, Hayabusa, and Npcap, Suricata, and the ET Open rule set for packet captures.
 
 Glessner runs on Windows. Install its Python dependencies with [uv](https://docs.astral.sh/uv/), from the folder you cloned it to:
 
@@ -91,11 +91,11 @@ Each command takes the case folder first. `new-case` makes that folder, `copy-ca
 | `new-case CASE` | Make a case folder for an evidence folder | `--evidence` and `--name` (required), `--tools`, `--analyst` (default: your Windows user name), `--host` for a single-host collection |
 | `copy-case SOURCE CASE` | A clean copy: same evidence, intake, and runs, and a new journal whose first entry names the source; reloads the events | `--name` (required), `--analyst` |
 | `intake` | Hash and identify every evidence file, and record `manifest.jsonl`'s hash in the journal | `--add` for files new since intake, which refuses a `manifest.jsonl` that differs from its record |
-| `tools` | Installed tools with versions and paths, and recommended missing ones | |
+| `tools` | Installed tools with versions, paths, and pin states, and recommended missing ones | `--pin [ID ...]` pins the named tools, or with no ID each tool that has no pin, after asking |
 | `run` | Run a tool on each host's evidence and load its output | `--tool ID` or `--all`, `--host` (repeatable), `--option ID=VALUE` |
 | `load-output [KIND]` | List found output, or load one kind of it | `--host` (repeatable), `--anyway` |
 | `import [FILES]` | Import text logs from the evidence folder | `--list`, `--preview`, `--mapping`, `--zone`, `--year`, `--host`, `--host-field`, `--time-field` (twice for a date and a time field), `--time-format`, `--format`, `--layout`, `--delimiter`, `--artifact`, `--save-as` |
-| `runs` | List the runs with their status and rows | |
+| `runs` | List the runs with their status, tool check, and rows | |
 | `rebuild` | Recreate the events database from the latest successful run of each tool and host | |
 | `serve [CASE]` | Open the case, or the start page without one | `--port`, `--no-browser` |
 | `rule OP [TARGET]` | `list`, `add` or `change` a rule from a YAML file, or `remove` one by ID | |
@@ -107,7 +107,7 @@ Each command takes the case folder first. `new-case` makes that folder, `copy-ca
 ## Limits
 
 - Pre-alpha. Expect changes to the page and the case format. A newer build upgrades a case when it opens it, and an older build then refuses that case, so work on copies.
-- No blind round yet. The app has been checked against three public practice sets whose answers are published, and [checks/](checks/) holds a write-up of each. No analyst has yet worked a case with it without knowing the answer.
+- No finished blind round yet. The app has been checked against five public practice sets whose answers are published, and [checks/](checks/) holds a write-up of each. No analyst has yet finished a case with it without knowing the answer.
 - About 10 hosts per case. The performance figures come from synthetic cases built from copies of two hosts: 5.2 million events on 10 hosts, and 10.5 million. A real collection of that size hasn't been tried.
 - No network calls is a tested claim for the app itself: a test checks it across a case load, a search, and every export. The tools it runs are separate programs, outside that test.
 - Windows only, for the analyst's machine and for the hosts' own artifacts. Text logs from other systems, such as syslog, can be imported.
@@ -175,8 +175,10 @@ Datasets:
 - [The Stolen Szechuan Sauce](https://dfirmadness.com/the-stolen-szechuan-sauce/), a case from [DFIR Madness](https://dfirmadness.com/) by its founder, James Smith. Many of the test suite's synthetic records take its host names, domain, and addresses, and the lab tests run on local copies of its collections.
 - [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES), by sbousseaden, under the GPL-3.0 license.
 - The [Malware-Traffic-Analysis.net](https://www.malware-traffic-analysis.net/) [exercise of 2016-01-07](https://www.malware-traffic-analysis.net/2016/01/07/index.html).
+- [OTRF Security Datasets](https://github.com/OTRF/Security-Datasets), by Roberto Rodriguez and Jose Luis Rodriguez of the Open Threat Research Forge, under the MIT license. Its [APT29 sets](https://github.com/OTRF/Security-Datasets/tree/master/datasets/compound/apt29), by Roberto Rodriguez, record a replay of the APT29 emulation from round 2 of MITRE's ATT&CK Evaluations. The check used Day 1.
+- The [Data Leakage Case](https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html) from NIST's Computer Forensic Reference Data Sets (CFReDS).
 
-The app was checked against all three, and [checks/](checks/) holds a write-up of each check. This repository holds none of their files.
+The app was checked against all five, and [checks/](checks/) holds a write-up of each check. This repository holds none of their files.
 
 Glessner is named for Frances Glessner Lee, whose models trained investigators to observe before they conclude. [about_the_name.md](about_the_name.md) says what the app takes from her work.
 
@@ -193,7 +195,7 @@ Joshua Cody Smith designed Glessner and directed its build. AI coding agents wro
 | [known_limitations.md](known_limitations.md) | What the app doesn't do yet, or doesn't do well |
 | [scope.md](scope.md) | What the app does, what is planned, and what it leaves out |
 | [glossary.md](glossary.md) | The names for every part of the page and the data, including the search syntax |
-| [checks/](checks/) | Write-ups of the open-answer checks on three public practice sets, with each check's score under one rubric, each item's state, and the gaps found |
+| [checks/](checks/) | Write-ups of the open-answer checks on five public practice sets, with each check's score under one rubric, each item's state, and the gaps found |
 | [coverage_reference.md](coverage_reference.md) | What the app reads, what reaches the timeline, the rule sets that flag events, and the Windows sources it doesn't cover yet |
 | [about_the_name.md](about_the_name.md) | The namesake, Frances Glessner Lee, and what the app takes from her work |
 | [SECURITY.md](SECURITY.md) | How to report a security problem |

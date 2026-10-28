@@ -18,7 +18,9 @@ Each kind names the registry tool whose parser reads it, or the import preset th
 loads it yet. Raw evidence comes first: for a host that has the raw files a tool reads, the app runs the tool, and the
 output found in the evidence is listed but not loaded unless the analyst asks.
 
-The headers are those of EZ tools 2026.5.0 and Hayabusa 4.1.0 output, MFTECmd's `$J` output included.
+The headers are those of EZ tools 2026.5.0 and Hayabusa 4.1.0 output, MFTECmd's `$J` output included. A 2026.10 build's
+CSV is the same kind as its 2026.5.0 one. The console log each EZ tool writes beside its CSVs
+(`<UTC yyyyMMddHHmmss>_<Tool>_<version>_ConsoleLog.txt`) is no output kind.
 """
 
 from __future__ import annotations

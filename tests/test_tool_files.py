@@ -13,7 +13,7 @@ from conftest import junction
 from test_evidence_paths import shut
 
 from glessner import tools
-from glessner.tools import DetectedTool, detect, folder_sha256, load_registry, rules_label, tool_files
+from glessner.tools import DetectedTool, detect, folder_sha256, load_registry, pin_files, rules_label, tool_files
 
 COMMIT = "fffbdd179c8c8c7554368c443f9ba2917877f108"
 OTHER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -92,6 +92,42 @@ def test_a_tool_s_files_are_its_executable_its_dll_what_its_arguments_name_and_i
 def test_a_builtin_tool_records_no_file():
     found = detect([load_registry()["event_xml"]], None)["event_xml"]
     assert tool_files(found, [sys.executable, "-m", "glessner"]) == {}
+
+
+def test_a_console_log_in_a_tool_s_folder_is_none_of_its_files_and_is_not_in_its_pin(tmp_path):
+    """A 2026.10 build writes its console log to the output folder. One in the tool's own folder, as a run made by hand
+    there leaves, is a file no argument names, so a run's files and a pin hold the executable, the library, and the Maps
+    folder, and not the log."""
+    folder = tmp_path / "tools" / "EvtxECmd"
+    maps = {"a.map": b"a\n"}
+    write(folder, {"EvtxECmd.exe": b"MZ exe", "EvtxECmd.dll": b"MZ dll", "Maps/a.map": b"a\n",
+                   "20261025181337_EvtxECmd_2026.10.2_ConsoleLog.txt": b"[01:13:37.234 INF] EvtxECmd version 2026.10.2\n"})
+    tool = DetectedTool(spec("evtxecmd"), folder / "EvtxECmd.exe", "2026.10.2")
+    argv = [str(folder / "EvtxECmd.exe"), "-d", str(tmp_path / "host"), "--csv", str(tmp_path / "out")]
+    expected = {"EvtxECmd.dll": sha(b"MZ dll"), "EvtxECmd.exe": sha(b"MZ exe"), "Maps/": listing(maps, ["a.map"])}
+    assert tool_files(tool, argv) == expected
+    assert pin_files(tool).hashes == expected
+
+
+def test_sqlecmd_s_files_and_pin_hold_the_native_sqlite_library_its_build_loads_from_runtimes(tmp_path):
+    """The 2026.10 SQLECmd loads SQLite.Interop.dll from runtimes\\<platform>\\native in its own folder, not from a .dll
+    beside the executable, so a run and a pin record that folder with the Maps folder. A build with no runtimes folder
+    records the Maps folder alone."""
+    folder = tmp_path / "tools" / "SQLECmd" / "SQLECmd"
+    native = {"win-x64/native/SQLite.Interop.dll": b"MZ native x64", "win-x86/native/SQLite.Interop.dll": b"MZ native x86"}
+    maps = {"a.smap": b"a\n"}
+    write(folder, {"SQLECmd.exe": b"MZ exe", "SQLECmd.dll": b"MZ dll", "Maps/a.smap": b"a\n",
+                   **{f"runtimes/{name}": data for name, data in native.items()}})
+    tool = DetectedTool(spec("sqlecmd"), folder / "SQLECmd.exe", "2026.10.3")
+    argv = [str(folder / "SQLECmd.exe"), "-d", str(tmp_path / "host"), "--csv", str(tmp_path / "out"), "--hunt", "false"]
+    expected = {"Maps/": listing(maps, ["a.smap"]), "SQLECmd.dll": sha(b"MZ dll"), "SQLECmd.exe": sha(b"MZ exe"),
+                "runtimes/": listing(native, ["win-x64/native/SQLite.Interop.dll", "win-x86/native/SQLite.Interop.dll"])}
+    assert tool_files(tool, argv) == expected
+    assert pin_files(tool).hashes == expected
+    (folder / "runtimes" / "win-x64" / "native" / "SQLite.Interop.dll").write_bytes(b"MZ native changed")
+    assert tool_files(tool, argv)["runtimes/"] != expected["runtimes/"]
+    shutil.rmtree(folder / "runtimes")
+    assert set(tool_files(tool, argv)) == {"Maps/", "SQLECmd.dll", "SQLECmd.exe"}
 
 
 def test_a_tool_file_that_cannot_be_read_raises(tmp_path, monkeypatch):
@@ -306,3 +342,122 @@ def test_detection_names_each_tool_s_set(tmp_path):
                                                       "refs/heads/main": COMMIT.encode() + b"\n"})
     files = folder_sha256(tool.executable.parent / "rules")[:8]
     assert detect([tool.spec], tmp_path / "tools")["hayabusa"].rules == f"Hayabusa rules fffbdd1, files {files}"
+
+
+def test_a_tool_s_files_include_every_dll_beside_its_executable_and_its_runtimeconfig_and_deps_files(tmp_path):
+    """A .NET build loads the libraries in its own folder, and its runtimeconfig.json and deps.json name the runtime and
+    the libraries. Each .dll beside the executable is recorded, whatever the case of its extension; a .dll in a folder
+    below, a runtimeconfig or deps file named for another executable, and other files are left out. A file the folder
+    lacks is left out."""
+    folder = tmp_path / "tools" / "RBCmd"
+    write(folder, {"RBCmd.exe": b"MZ exe", "RBCmd.dll": b"MZ dll", "Other.dll": b"MZ other", "Third.DLL": b"MZ third",
+                   "RBCmd.runtimeconfig.json": b'{"runtime": 9}', "RBCmd.deps.json": b'{"deps": 1}',
+                   "Other.runtimeconfig.json": b"another tool's", "Below/Deeper.dll": b"MZ below", "notes.txt": b"x"})
+    tool = DetectedTool(spec("rbcmd"), folder / "RBCmd.exe", "1")
+    argv = [str(folder / "RBCmd.exe")]
+    assert tool_files(tool, argv) == {
+        "Other.dll": sha(b"MZ other"), "RBCmd.deps.json": sha(b'{"deps": 1}'), "RBCmd.dll": sha(b"MZ dll"),
+        "RBCmd.exe": sha(b"MZ exe"), "RBCmd.runtimeconfig.json": sha(b'{"runtime": 9}'), "Third.DLL": sha(b"MZ third")}
+    (folder / "RBCmd.deps.json").unlink()
+    (folder / "Other.dll").unlink()
+    assert list(tool_files(tool, argv)) == ["RBCmd.dll", "RBCmd.exe", "RBCmd.runtimeconfig.json", "Third.DLL"]
+
+
+def test_a_tool_whose_folder_is_gone_has_no_files(tmp_path):
+    tool = DetectedTool(spec("rbcmd"), tmp_path / "gone" / "RBCmd.exe", "1")
+    assert tool_files(tool, [str(tool.executable)]) == {}
+
+
+def test_a_folder_s_listing_names_each_file_with_its_sha256_and_leaves_out_git_and_links(tmp_path):
+    """The listing is a dict in code point order of each file's path in the folder and its SHA-256. The folder's own hash
+    is that of the sha256sum lines of this listing, and the links it skips go to `links`."""
+    files = {"b.txt": b"bee\n", "C.txt": b"sea\n", "a/x.map": b"ex\n"}
+    write(tmp_path / "Maps", {**files, ".git/HEAD": b"ref: refs/heads/main\n"})
+    write(tmp_path / "outside", {"c.map": b"not in the folder\n"})
+    junction(tmp_path / "Maps" / "linked", tmp_path / "outside")
+    links = []
+    found = tools.folder_listing(tmp_path / "Maps", links)
+    assert found == {"C.txt": sha(b"sea\n"), "a/x.map": sha(b"ex\n"), "b.txt": sha(b"bee\n")}
+    assert list(found) == ["C.txt", "a/x.map", "b.txt"]
+    assert links == [f"linked -> {tmp_path / 'outside'}"]
+    assert folder_sha256(tmp_path / "Maps") == listing(files, list(found))
+    assert tools.listing_sha256(found) == listing(files, list(found))
+
+
+def test_a_tool_s_listing_gives_the_hashes_tool_files_gives_and_the_files_of_each_folder(tmp_path):
+    folder = tmp_path / "tools" / "EvtxECmd"
+    maps = {"a.map": b"a\n", "sub/b.map": b"b\n"}
+    write(folder, {"EvtxECmd.exe": b"MZ", **{f"Maps/{name}": data for name, data in maps.items()}})
+    write(tmp_path / "outside", {"c.map": b"elsewhere\n"})
+    junction(folder / "Maps" / "linked", tmp_path / "outside")
+    tool = DetectedTool(spec("evtxecmd"), folder / "EvtxECmd.exe", "1")
+    argv = [str(folder / "EvtxECmd.exe")]
+    links, plain = [], []
+    found = tools.tool_listing(tool, argv, links)
+    assert found.hashes == tool_files(tool, argv, plain)
+    assert found.folders == {"Maps/": {"a.map": sha(b"a\n"), "sub/b.map": sha(b"b\n")}}
+    assert found.hashes["Maps/"] == tools.listing_sha256(found.folders["Maps/"])
+    assert links == plain == [f"Maps/linked -> {tmp_path / 'outside'}"]
+
+
+def install(root: Path, tool_spec: tools.ToolSpec, rules: bool = True) -> DetectedTool:
+    """The tool unpacked under `root` with every file its registry entry names: its executable and the .dll of the same
+    name, a file for each argument that names a path in its folder, one in each folder its tool_files lists, and, with
+    `rules`, the rules block's file and version file."""
+    folder = root / tool_spec.id
+    exe = next((name for name in tool_spec.executables if not set("*?[") & set(name)), tool_spec.executables[0])
+    files = {exe: b"MZ", f"{Path(exe).stem}.dll": b"MZ dll"}
+    for arg in [*tool_spec.args, *(tool_spec.rules["args"] if tool_spec.rules and rules else [])]:
+        for text in (arg, arg.partition("=")[2]):
+            path = Path(text.replace("{tool_dir}", str(folder)))
+            if path.is_absolute() and path.is_relative_to(folder):
+                files[path.relative_to(folder).as_posix()] = b"read\n"
+    files |= {f"{rel}/one.txt": b"in a folder\n" for rel in tool_spec.tool_files}
+    if tool_spec.rules and rules:
+        files[tool_spec.rules["file"].replace("\\", "/")] = b"rules\n"
+        files[tool_spec.rules["version_file"].replace("\\", "/")] = b"Rules 1\n"
+    write(folder, files)
+    return DetectedTool(tool_spec, folder / exe, "1")
+
+
+def run_argv(root: Path, tool: DetectedTool, options: dict[str, str]) -> list[str]:
+    """The command line a run of the tool on one file of a host builds, in a case made under `root`."""
+    from glessner.case import create_case
+    from glessner.intake import intake
+    from glessner.runner import RunPlan, build_argv
+
+    (evidence := root / "evidence" / "HOST").mkdir(parents=True, exist_ok=True)
+    (evidence / "input.bin").write_bytes(b"input")
+    case = create_case(root / "case", "T", root / "evidence", "cody")
+    intake(case)
+    each = tool.spec.input == "each_file"
+    plan = RunPlan(tool, "HOST", ("HOST/input.bin",), input_file="HOST/input.bin" if each else "")
+    return build_argv(case, plan, root / "out", options)
+
+
+EXTRA_FILES = {   # what a tool's pin holds besides its executable and its .dll, by registry ID
+    "hayabusa": {"rules/", "config/"}, "evtxecmd": {"Maps/"}, "sqlecmd": {"Maps/", "runtimes/"},
+    "recmd": {"Plugins/", "BatchExamples/DFIRBatch.reb"},
+    "suricata": {"suricata.yaml", "reference.config", "rules/suricata.rules", "rules/classification.config",
+                 "rules/et-open-version.txt"}}
+
+
+@pytest.mark.parametrize("tool_id", [i for i, s in load_registry().items() if not s.builtin])
+def test_a_pin_names_the_files_a_run_of_the_tool_records(tmp_path, tool_id):
+    """pin_files fills the registry's arguments with the tool's folder and its rules file alone, since no evidence or
+    output folder exists yet, and so names the files a run records (tool_files) for the command line build_argv makes.
+    An argument that holds another placeholder names no file in the tool's folder. A run with Hayabusa's minimum level
+    set records no more, and Suricata without its rules file records neither them nor the classification list."""
+    registry = load_registry()[tool_id]
+    for rules in (True, False) if registry.rules else (True,):
+        root = tmp_path / f"rules_{rules}"
+        tool = install(root, registry, rules)
+        recorded = tool_files(tool, run_argv(root, tool, {"min_level": "high"} if tool_id == "hayabusa" else {}))
+        pinned = tools.pin_files(tool)
+        assert pinned.hashes == recorded
+        assert {tool.executable.name, f"{tool.executable.stem}.dll"} <= set(recorded)
+        wanted = EXTRA_FILES.get(tool_id, set())
+        if tool_id == "suricata" and not rules:
+            wanted = {"suricata.yaml", "reference.config"}
+            assert not {"rules/suricata.rules", "rules/classification.config", "rules/et-open-version.txt"} & set(recorded)
+        assert wanted <= set(recorded), (tool_id, rules, sorted(recorded))

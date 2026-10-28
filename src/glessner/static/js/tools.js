@@ -4,6 +4,7 @@
 // the background; the page follows it and the timeline reloads after.
 
 import { $, api, el, plural, post, sentence, setStatus } from './core.js';
+import { askConfirm } from './confirm.js';
 import { button, claimDetails, pageAction, pageAnswered, pageRead, setPage } from './event_page.js';
 import { refreshCaseState } from './frame.js';
 import { showImport } from './import.js';
@@ -70,7 +71,8 @@ function render(res, focus = null) {
     const hosts = t.hosts.length;
     let status, action = '';
     if (t.status === 'ran') {
-      status = [el('span', { class: 'ok' }, `Ran ${t.last_run.at.slice(0, 16).replace('T', ' ')} UTC: ${loadedText(t.last_run, t.hits)}`),
+      const differed = t.last_run.latest?.check?.result === 'differs' ? '; its tools differed from the pin' : '';
+      status = [el('span', { class: 'ok' }, `Ran ${t.last_run.at.slice(0, 16).replace('T', ' ')} UTC: ${loadedText(t.last_run, t.hits)}${differed}`),
         ...(rulesText(t.last_run) ? [el('div', { class: 'muted' }, rulesText(t.last_run))] : [])];
       action = button('Run again', () => runTool(t), { 'aria-label': `Run ${t.name} again` });
     } else if (t.status === 'blocked') {
@@ -87,12 +89,15 @@ function render(res, focus = null) {
       action = el('a', { href: t.download_url, target: '_blank', rel: 'noopener noreferrer' }, 'Download page');
     }
     if (running && action && action.tagName === 'BUTTON') action.disabled = true;
-    return el('tr', {},
+    const again = t.pin?.state === 'differs' ? pinButton('Pin again', () => pinTools(res, t.pin.group), running, { 'aria-label': `Pin ${t.name} again` }) : null;
+    const fold = t.pin?.rows.length ? pinFold(t, res) : null;
+    return [el('tr', { 'data-tool': t.id },
       el('td', { title: t.notes }, t.name),
       el('td', {}, ...(t.builtin ? ['built in', el('div', { class: 'muted', title: `glessner ${t.version}` }, '(no download)')]
-        : [t.found ? t.version : el('span', { class: 'muted' }, 'not found'), ...runtimeNotes(t)])),
+        : [t.found ? t.version : el('span', { class: 'muted' }, 'not found'), ...runtimeNotes(t), ...(t.pin ? [pinLine(t, fold)] : [])])),
       el('td', {}, t.reads ? `${t.reads}${hosts ? `, on ${plural(hosts, 'host')}` : ''}` : el('span', { class: 'muted' }, 'none')),
-      el('td', {}, ...[status].flat()), el('td', {}, action));
+      el('td', {}, ...[status].flat()), el('td', {}, ...(again ? [again, ' '] : []), action)),
+    ...(fold ? [fold] : [])];
   });
   const unread = [...res.unread.map((u) => el('li', {}, `${u.what}: no installed tool reads them`))];
   // The files the Import page offers to import, counted as it lists them
@@ -111,10 +116,11 @@ function render(res, focus = null) {
     el('div', { class: 'actions' }, all, el('span', { class: 'muted' }, ready ? readyText(res.ready) : 'Nothing is ready to run or load.')),
     el('div', { class: 'actions' }, el('span', { class: 'muted' }, `Tools folder ${res.tools_folder || '(not set; PATH only)'}`),
       el('span', { class: 'muted' }, `${res.found} of ${res.total} found`), button('Scan again', () => showTools(true))),
+    ...manifestLine(res, running),
     ...(res.job ? [jobBox(res.job)] : []),
     el('table', { class: 'tools-table' },
       el('thead', {}, el('tr', {}, ...['Tool', 'Version', 'Reads, in this case', 'Status', ''].map((h) => el('th', {}, h)))),
-      el('tbody', {}, ...rows)),
+      el('tbody', {}, ...rows.flat())),
     ...(res.outputs.length ? [el('h3', {}, 'Tool output already in the evidence'), outputTable(res.outputs, running)] : []),
     // The latest runs that failed or loaded nothing, which the Case overview's Gaps link to
     ...(res.gaps.length ? [el('h3', {}, 'Runs that failed or loaded nothing'),
@@ -158,9 +164,151 @@ function dotnetNote(t) {
   return el('div', { class: 'warn' }, `Needs ${net}. Unpack Microsoft's ${net} runtime zip into a folder in the tools folder.`);
 }
 
+// ---------- Pins: a tool's files against the tools folder's manifest ----------
+
+const openFolds = new Set();   // tools whose fold of pinned files is open, kept across redraws
+const utcText = (stamp) => `${stamp.slice(0, 16).replace('T', ' ')} UTC`;
+const shortSha = (sha) => `${sha.slice(0, 12)}...`;
+const nameList = (names) => (names.length < 3 ? names.join(' and ') : `${names.slice(0, -1).join(', ')}, and ${names.at(-1)}`);
+
+let pinOut = false;   // a confirmed pin is waiting for the server, so a page drawn meanwhile draws its pin buttons held
+
+// A button that pins, disabled while a job runs and, through holdPinButtons, while a pin is out.
+function pinButton(label, onclick, running, attrs = {}) {
+  const b = button(label, onclick, { class: 'pin-action', ...attrs });
+  if (running) b.disabled = true;
+  else if (pinOut) holdButton(b);
+  return b;
+}
+
+// Disable a pin button for the time a pin is out, marking it so releasePinButtons enables it again. A button disabled for
+// a running job isn't marked, and stays disabled.
+function holdButton(b) {
+  b.disabled = true;
+  b.dataset.held = '';
+}
+
+// Disable the enabled pin buttons on the page, and those the page draws until releasePinButtons, so a second click can't
+// open a second confirm or send a second pin while one is out.
+function holdPinButtons() {
+  pinOut = true;
+  for (const b of $('detailsBody').querySelectorAll('button.pin-action:not(:disabled)')) holdButton(b);
+}
+
+// Enable the pin buttons that holdPinButtons or a page drawn while the pin was out disabled, once the server has answered.
+function releasePinButtons() {
+  pinOut = false;
+  for (const b of $('detailsBody').querySelectorAll('button.pin-action[data-held]')) {
+    b.disabled = false;
+    delete b.dataset.held;
+  }
+}
+
+// The line under a tool's version: the badge, with its hover, and the toggle that opens the fold of pinned files.
+function pinLine(t, fold) {
+  const children = [el('span', { class: `pin-badge ${t.pin.tone}`, title: t.pin.hint }, t.pin.label)];
+  if (fold) {
+    const toggle = button('Pinned files', () => {
+      fold.hidden = !fold.hidden;
+      toggle.setAttribute('aria-expanded', String(!fold.hidden));
+      if (fold.hidden) openFolds.delete(t.id); else openFolds.add(t.id);
+    }, { class: 'linklike', 'aria-expanded': String(openFolds.has(t.id)) });
+    children.push(' ', toggle);
+  }
+  return el('span', { class: 'pin-line' }, ...children);
+}
+
+// A path's pinned hash, or "none" for a path the pin doesn't hold. The whole hash is its hover.
+const hashCell = (sha) => el('td', { class: `pin-sha${sha ? '' : ' muted'}`, title: sha }, sha ? shortSha(sha) : 'none');
+
+function nowWords(r) {
+  if (r.state === 'same') return 'Matches';
+  if (r.state === 'missing') return 'Missing, possibly removed by antivirus';
+  if (r.state === 'changed' && r.detail) return `Differs: ${r.detail}`;
+  return `${r.state === 'added' ? 'Added' : 'Changed'}, now ${shortSha(r.now)}`;
+}
+
+function pinRow(r) {
+  if (r.state === 'more') return el('tr', { class: 'pin-more muted' }, el('td', { colspan: '3' }, `and ${r.more.toLocaleString()} more`));
+  return el('tr', { class: `pin-row${r.depth ? ' nested' : ''}` }, el('td', { class: 'pin-path' }, r.path), hashCell(r.pinned),
+    el('td', { class: `pin-now ${r.state === 'same' ? 'ok' : 'warn'}` }, nowWords(r)));
+}
+
+// The links a tool's folder holds that the pin and the folder now agree on or not.
+function linkLine(rows) {
+  if (!rows.length) return el('div', { class: 'muted' }, 'Links: none pinned, none now.');
+  const words = {
+    same: (l) => `${l.path} -> ${l.pinned}: matches`,
+    changed: (l) => `${l.path}: pointed to ${l.pinned} when pinned, now ${l.now}`,
+    missing: (l) => `${l.path} -> ${l.pinned}: missing now`,
+    added: (l) => `${l.path} -> ${l.now}: not in the pin`,
+  };
+  return el('div', {}, 'Links:', el('ul', { class: 'pin-links' }, ...rows.map((l) => el('li', {}, words[l.state](l)))));
+}
+
+// The full-width row under a tool's row: when and by what the pin was made, each pinned file or folder with its pinned hash
+// and what it is now, the links, the manifest, and the tool's latest run in this case.
+function pinFold(t, res) {
+  const { pinned, rows, link_rows: links } = t.pin;
+  const latest = t.last_run?.latest;
+  const manifest = res.manifest;
+  const intro = `Pinned ${utcText(pinned.utc)} by build ${pinned.by}, at version ${pinned.version}`
+    + `${pinned.rules ? ` with ${pinned.rules}` : ''}.`;
+  return el('tr', { class: 'pin-fold', 'data-tool': t.id, ...(openFolds.has(t.id) ? {} : { hidden: '' }) },
+    el('td', { colspan: '5' },
+      el('div', {}, intro),
+      el('table', { class: 'pin-table' },
+        el('thead', {}, el('tr', {}, ...['Pinned file or folder', 'Pinned SHA-256', 'Now'].map((h) => el('th', {}, h)))),
+        el('tbody', {}, ...rows.map(pinRow))),
+      linkLine(links),
+      el('div', { class: 'muted' }, `Tools manifest ${manifest.path}, SHA-256 `,
+        el('span', { title: manifest.sha256 }, shortSha(manifest.sha256)), '.'),
+      el('div', { class: 'muted' }, latest ? `Latest run, ${utcText(latest.at)} on ${latest.host}: ${latest.text}.`
+        : 'No run of this tool in this case.')));
+}
+
+// The manifest's line, with the button that pins every tool that has no pin, and the place the confirm opens.
+function manifestLine(res, running) {
+  const m = res.manifest;
+  if (!m?.path) return [];
+  const more = m.unpinned.length ? [pinButton('Pin unpinned tools', () => pinTools(res, m.unpinned), running)] : [];
+  return [el('div', { class: 'actions tools-manifest' },
+    el('span', { class: m.state === 'unreadable' ? 'warn' : 'muted' }, `Tools manifest ${m.path}: ${sentence(m.text)} Checked at ${m.checked.slice(11, 16)} UTC.`), ...more),
+  el('div', { class: 'confirm-slot' })];
+}
+
+// Ask first, then pin the named tools with the files the page showed. The server refuses when a file changed since, and
+// says to scan again.
+async function pinTools(res, ids) {
+  const tools = ids.map((id) => res.tools.find((t) => t.id === id));
+  const names = nameList(tools.map((t) => t.name));
+  const changed = tools.filter((t) => t.pin.changes);
+  const ok = await askConfirm({
+    title: `Pin ${names} as ${tools.length === 1 ? 'it is' : 'they are'} now, in ${res.manifest.path}? `
+      + 'Every case that uses this tools folder compares with its pins.',
+    lines: [...changed.map((t) => `${changed.length > 1 ? `${t.name}, since` : 'Since'} its pin of ${t.pin.pinned.utc.slice(0, 10)}: ${t.pin.changes}.`),
+      "A pin records what is in the folder; it doesn't check where the files came from."],
+    confirm: `Pin ${names}`,
+  });
+  if (!ok) return;
+  const done = pageAction('tools');
+  const pins = Object.fromEntries(tools.map((t) => [t.id, { executable: t.pin.executable, files: t.pin.files, links: t.pin.links }]));
+  holdPinButtons();
+  try { await post('/api/pin_tools', { tools: pins }); }
+  catch (err) {
+    releasePinButtons();
+    setStatus(`Didn't pin: ${err.message}`);
+    return;
+  }
+  pinOut = false;   // the buttons held stay disabled until the page the pin changed draws again
+  setStatus(`Pinned ${names}.`);
+  done();
+}
+
 function jobBox(job) {
   const lines = job.results.map((r) => el('li', {}, `${r.host}: ${r.status}` +
     (r.rows != null ? `, ${rowsText(r.rows, r.hits)}` : '') + `, evidence ${r.evidence}` +
+    (r.tool_check === 'differs' ? ', tools differ from the pin' : '') +
     (r.working_copy_changes ? '; it changed its working copies, as expected' : '') + (r.reason ? `. ${r.reason}` : '')));
   const head = job.finished ? `${job.tool} finished ${stepsText(job)}.` : jobProgress(job);
   return el('div', { class: `tools-job${job.error ? ' failed' : ''}` }, el('div', {}, head),

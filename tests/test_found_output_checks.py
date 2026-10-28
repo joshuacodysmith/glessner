@@ -5,6 +5,7 @@ import json
 
 from chain_fixtures import format3_case
 from conftest import junction
+from sbecmd_log_fixtures import CONSOLE_LOG_NAME, console_log_text
 from test_runner import eve_lines
 from test_tool_outputs import SBE_COLUMNS, write_rows
 
@@ -191,6 +192,129 @@ def test_a_rebuild_leaves_out_found_sbecmd_output_whose_messages_file_changed_si
     (saved,) = read_runs(case)
     assert saved.loaded_rows == 0
     assert LEFT_OUT in saved.notes[-1] and f"{MESSAGES}: SHA-256 changed" in saved.notes[-1]
+
+
+LOG = f"HOST/Modules/FileFolderAccess/{CONSOLE_LOG_NAME}"
+OLDER_LOG = "HOST/Modules/FileFolderAccess/20261024090000_SBECmd_2026.10.2_ConsoleLog.txt"
+
+
+def write_console_log(evidence, hive=HIVE, path=LOG):
+    """The console log of a 2026.10 build, which takes the messages file's place beside the CSV it names."""
+    text = console_log_text(hive, r"C:\out\alice_UsrClass.csv", name=path.rpartition("/")[2])
+    (evidence / path).write_text(text, encoding="utf-8", newline="")
+
+
+def case_with_console_log(tmp_path):
+    """A case whose evidence holds an SBECmd CSV and the console log that names its hive, hashed at intake."""
+    evidence = tmp_path / "evidence"
+    write_rows(evidence / CSV, SBE_COLUMNS, [BAG])
+    write_console_log(evidence)
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    return case
+
+
+def test_found_sbecmd_output_loads_when_the_console_log_is_unchanged(tmp_path):
+    """The log is read beside the CSV and checked with it, but the run's input is the CSV alone."""
+    case = case_with_console_log(tmp_path)
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (record.status, record.loaded_rows, record.evidence_check, record.inputs) == ("ok", 1, "ok", [CSV])
+    assert source_files(case) == [HIVE.replace("\\", "/")]   # the hive the console log names
+
+
+def test_found_sbecmd_output_fails_when_the_console_log_changed_after_intake(tmp_path):
+    case = case_with_console_log(tmp_path)
+    write_console_log(case.evidence, hive=HIVE.replace("alice", "bob"))
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert record.status == "failed" and record.loaded_rows is None and record.inputs == [CSV]
+    assert record.evidence_check == "mismatch" and f"{LOG}: SHA-256 changed" in record.reason
+
+
+def test_found_sbecmd_output_fails_when_the_console_log_is_gone(tmp_path):
+    case = case_with_console_log(tmp_path)
+    (case.evidence / LOG).unlink()
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert record.status == "failed" and f"{LOG}: missing" in record.reason
+
+
+def test_found_sbecmd_output_fails_for_a_console_log_the_manifest_does_not_list_until_it_is_added(tmp_path):
+    case = found_case(tmp_path)
+    write_console_log(case.evidence)   # put there after intake
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert record.status == "failed" and f"{LOG}: not in the manifest" in record.reason
+    assert (record.loaded_rows, record.evidence_check, record.evidence_problems) == (None, "not checked", [])
+    add_new(case)
+    again = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (again.status, again.loaded_rows) == ("ok", 1)
+
+
+def test_found_sbecmd_output_fails_when_a_console_log_appears_while_it_loads(tmp_path, monkeypatch):
+    case = found_case(tmp_path)
+    changing_during_the_load(monkeypatch, lambda case: write_console_log(case.evidence))
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (record.status, record.evidence_check) == ("failed", "mismatch")
+    assert record.evidence_problems == [f"{LOG}: not in the manifest"]
+
+
+def test_every_console_log_beside_found_sbecmd_output_is_checked(tmp_path):
+    """A folder that holds the logs of two runs: the one that isn't named for a CSV is read all the same, so a change to
+    it is caught. A log in another folder is none of the load's concern."""
+    evidence = tmp_path / "evidence"
+    write_rows(evidence / CSV, SBE_COLUMNS, [BAG])
+    write_console_log(evidence)
+    write_console_log(evidence, hive=HIVE.replace("alice", "bob"), path=OLDER_LOG)
+    (evidence / "HOST" / "Modules" / "Other").mkdir()
+    write_console_log(evidence, path="HOST/Modules/Other/" + CONSOLE_LOG_NAME)
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    write_console_log(evidence, hive=HIVE.replace("alice", "carol"), path="HOST/Modules/Other/" + CONSOLE_LOG_NAME)
+    ok = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (ok.status, ok.evidence_check) == ("ok", "ok")
+    assert source_files(case) == [HIVE.replace("\\", "/")]   # the later run's log names the CSV
+    write_console_log(evidence, hive=HIVE.replace("alice", "dave"), path=OLDER_LOG)
+    changed = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert changed.status == "failed" and f"{OLDER_LOG}: SHA-256 changed" in changed.reason
+
+
+OTHER_TOOL_LOG = "HOST/Modules/FileFolderAccess/20261025181337_EvtxECmd_2026.10.2_ConsoleLog.txt"
+
+
+def test_another_tool_s_console_log_beside_found_sbecmd_output_is_neither_read_nor_checked(tmp_path):
+    """A KAPE module folder can hold the console log of a tool other than SBECmd. Its lines name no hive for the CSV, a
+    change to it after intake doesn't fail the load, and a second one put there after intake isn't reported as a file
+    the load needs."""
+    evidence = tmp_path / "evidence"
+    write_rows(evidence / CSV, SBE_COLUMNS, [BAG])
+    write_console_log(evidence, path=OTHER_TOOL_LOG)   # lines that would name the hive, were it SBECmd's log
+    case = create_case(tmp_path / "case", "Found", evidence, "cody")
+    intake(case)
+    write_console_log(evidence, hive=HIVE.replace("alice", "bob"), path=OTHER_TOOL_LOG)
+    write_console_log(evidence, path=OTHER_TOOL_LOG.replace("20261025", "20261026"))
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (record.status, record.evidence_check, record.evidence_problems) == ("ok", "ok", [])
+    assert source_files(case) == [CSV]   # no SBECmd log names its hive, so the events cite the CSV
+    assert run_problems(case, record, "test") == ([], [])
+
+
+def test_a_folder_named_like_a_console_log_is_none_of_the_files_a_load_of_found_sbecmd_output_needs(tmp_path):
+    case = found_case(tmp_path)
+    (case.evidence / LOG).mkdir()   # put there after intake
+    record = load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV])
+    assert (record.status, record.evidence_check, record.evidence_problems) == ("ok", "ok", [])
+    assert run_problems(case, record, "test") == ([], [])
+
+
+def test_a_rebuild_loads_found_output_unchecked_when_its_console_log_is_not_in_the_manifest(tmp_path):
+    case = found_case(tmp_path)
+    assert load_found_output(case, "sbecmd", "sbecmd_csv", "HOST", [CSV]).status == "ok"
+    write_console_log(case.evidence)   # after intake
+    (record,) = read_runs(case)
+    assert run_problems(case, record, "test") == ([], [LOG])
+    rebuild(case)
+    (saved,) = read_runs(case)
+    assert saved.loaded_rows == 1
+    assert LEFT_OUT not in saved.notes[-1] and LOG in saved.notes[-1] and UNLISTED_NOTE in saved.notes[-1]
+    assert source_files(case) == [HIVE.replace("\\", "/")]
 
 
 def test_a_load_of_found_output_records_what_its_parser_skipped_once_the_case_is_at_format_4(tmp_path):

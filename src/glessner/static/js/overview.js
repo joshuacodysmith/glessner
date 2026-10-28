@@ -40,6 +40,15 @@ export async function showOverview() {
 }
 
 const when = (us) => (us == null ? '' : fmtUs(us).slice(0, 19));
+const day = (us) => fmtUs(us).slice(0, 10);
+
+// The note under a host's first and last time on its events outside them (overview._host_span): one is dated, several
+// give the dates of the earliest and latest. The hover says where the span's bounds lie.
+const OUTSIDE_WHY = 'The first and last time leave out events dated before 1990 or more than a day after the newest tool ' +
+  'run, which a wrong clock or a placeholder time gives. They are still counted, and on the timeline.';
+const outsideNote = (o) => el('div', { class: 'muted', title: OUTSIDE_WHY }, o.count === 1
+  ? `1 event dated ${day(o.first)}, outside the rest`
+  : `${o.count.toLocaleString()} events outside the rest, dated ${day(o.first)} to ${day(o.last)}`);
 const num = (n, action, title) => button(n.toLocaleString(), action, { class: 'linklike num', title });
 
 // A View of exactly these marks and values, on the timeline: what a number that stands for events opens, with the same
@@ -221,7 +230,7 @@ function holds(res) {
     el('td', { class: 'num' }, h.events ? num(h.events, () => openView([], [{ host: h.host }], `${h.host}: all events`), `Show ${h.host}'s events on the timeline`) : '0',
        ...(h.untimed ? [el('div', { class: 'muted' }, `and ${h.untimed.toLocaleString()} without a time`)] : []),
        ...(h.skipped ? [el('div', { class: 'muted' }, `and ${h.skipped.toLocaleString()} skipped`)] : [])),
-    el('td', {}, h.first == null ? '' : `${when(h.first)} to ${when(h.last)}`),
+    el('td', {}, h.first == null ? '' : `${when(h.first)} to ${when(h.last)}`, ...(h.outside ? [outsideNote(h.outside)] : [])),
     el('td', { title: h.kinds.map((k) => `${k.label}: ${plural(k.events, 'event')}`).join('\n') }, evidence(h)),
     el('td', { class: h.clock.flag ? 'flag' : '', title: h.clock.reason }, h.clock.text),
     el('td', {}, h.review.length ? el('ul', {}, ...h.review.map((r) => el('li', {}, r))) : 'none')));
@@ -327,6 +336,8 @@ function integrity(i) {
     ...(i.manifest ? [field('manifest.jsonl', i.manifest.text,
                             { id: 'ovManifest', ...(i.manifest.warn ? { class: 'warn' } : {}) })] : []),
     i.journal ? journalRow(i.journal) : field('Journal', plural(i.journal_entries, 'entry', 'entries')),
+    // Runs whose tool files differed from the pin (overview._tool_check_row); a tool's name is drawn as text
+    ...(i.tool_check ? [field('Tool check', i.tool_check.text, { id: 'ovToolCheck', class: 'warn' })] : []),
     field('Times shown', i.times), field('Build', i.build));
 }
 

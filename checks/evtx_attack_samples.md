@@ -2,26 +2,26 @@
 
 ## What this check is
 
-This is an open-answer check. Glessner was run on the dataset's Lateral Movement samples with the expected answers at hand, so the check shows whether the evidence each answer rests on is present and readable in Glessner. It doesn't show that an analyst who doesn't know the answer would find it. Blind rounds do that, and none has run yet. For this dataset an answer item is one sample file, scored against the technique the file is named for, so there are 47 items. The check's score is 42, 5, 0 of 47: 42 items were reached, 5 were partly reached, and none was missed. Seven of the 42 reached files could still fall to partly reached, as the totals under Results explain.
+This is an open-answer check. Glessner was run on the dataset's Lateral Movement samples with the expected answers at hand, so the check shows whether the evidence each answer rests on is present and readable in Glessner. It doesn't show that an analyst who doesn't know the answer would find it. Blind rounds do that, and none has been finished yet. For this dataset an answer item is one sample file, scored against the technique the file is named for, so there are 47 items. The check's score is 37, 10, 0 of 47: 37 items were reached, 10 were partly reached, and none was missed. Each file's state rests on its facts, the records and values that show the technique it is named for, by the rules the totals under Results give.
 
 ## The dataset
 
 - **Source:** [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES), a GitHub repository by sbousseaden.
 - **Credit and license:** The dataset is by sbousseaden, under the GPL-3.0 license. This repository holds none of the dataset's files.
 - **What it holds:** Windows event logs that record attack techniques, sorted into folders by ATT&CK tactic. This check used the Lateral Movement folder: 47 `.evtx` files from 11 machines, 1,288 events in all. The logs come from Sysmon, the Security and System logs, the RdpCoreTS and WinRM logs, and SQL Server's events.
-- **Where the answers come from:** The dataset has no separate answer key for this check. Each file is named for the technique or tool it records, such as a PsExec, WMI, or WinRM run, and that technique is the expected answer. The names carry no technique IDs, so the check mapped each name to an ATT&CK technique ID. The table under Results lists it, with a second technique where the file records one, such as a Startup folder drop.
+- **Where the answers come from:** The dataset has no separate answer key for this check. Each file is named for the technique or tool it records, such as a PsExec, WMI, or WinRM run, and that technique is the expected answer. The names carry no technique IDs, so the check mapped each name to an ATT&CK technique ID. The table under Results lists it, with a second technique where the file records one, such as a Startup folder drop. Each file's facts are the records and values that show its technique.
 
 ## How it was run
 
 [glossary.md](../glossary.md) defines terms such as lane, pivot, and mark.
 
-**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number, with Hayabusa 4.1.0. Each gap's state under Gaps found says where the gap stands in v0.2.0, and a fixed gap names the release that fixed it.
+**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number, with Hayabusa 4.1.0. Each gap's state under Gaps found says where the gap stands in v0.3.0, and a fixed gap names the release that fixed it.
 
 **Evidence.** The samples sit loose in one folder, not one folder per host. The case was made with `new-case --host LAB`, then `intake` and `run --all`. EvtxECmd and Hayabusa finished in 12 seconds.
 
 **Loading.** All 47 files loaded, with 1,288 events. Nothing was skipped or left unidentified. Hayabusa wrote 1,222 rows, which joined to 1,098 events. The files came from 11 machines, but they sat in one folder, so they all loaded as one host named LAB. Gap 13 below covers this.
 
-**Scoring.** For each file, read-only queries of the case database looked for the technique's key events and the fields that identify them. The check then looked at whether Glessner suggested a mark for them and which ATT&CK tags Hayabusa gave them. A query on the case confirmed each gap.
+**Scoring.** For each file, read-only queries of the case database looked for the technique's key events and the fields that identify them. The check then looked at whether Glessner suggested a mark for them and which ATT&CK tags Hayabusa gave them. A query on the case confirmed each gap. Each file's state was then set against its facts, read from the first run's records.
 
 Each item has one of four states: reached, partly reached, missed, or out of scope. An out-of-scope item needs something the app doesn't do by design, so it's listed and not counted. No item in this check is out of scope. A value in the raw data counts as shown, so a reached file can still have a field gap. A value that reads only after decoding or a comparison done by hand doesn't count. [How each item is scored](README.md#how-each-item-is-scored) gives the full rubric.
 
@@ -35,7 +35,6 @@ Each row is one answer item, a sample file. The Suggested column says whether an
 | `lateral_movement_startup_3_11.evtx` | T1021.002 with T1547.001 | yes | Reached |
 | `LM_4624_mimikatz_sekurlsa_pth_source_machine.evtx` | T1550.002 | yes | Reached |
 | `LM_add_new_namedpipe_tp_nullsession_registry_turla_like_ttp.evtx` | T1112 (enabling T1021.002) | yes | Reached |
-| `LM_DCOM_MSHTA_LethalHTA_Sysmon_3_1.evtx` | T1021.003 | yes | Reached |
 | `LM_ImageLoad_NFSH_Sysmon_7.evtx` | T1547.008 (LSASS Driver), filed under Lateral Movement | yes | Reached |
 | `LM_impacket_docmexec_mmc_sysmon_01.evtx` | T1021.003 | yes | Reached |
 | `LM_PowershellRemoting_sysmon_1_wsmprovhost.evtx` | T1021.006 | yes | Reached |
@@ -61,45 +60,54 @@ Each row is one answer item, a sample file. The Suggested column says whether an
 | `DFIR_RDP_Client_TimeZone_RdpCoreTs_104_example.evtx` | T1021.001 | no | Reached |
 | `dfir_rdpsharp_target_RdpCoreTs_168_68_131.evtx` | T1021.001 | no | Reached |
 | `LM_NewShare_Added_Sysmon_12_13.evtx` | T1021.002 | no | Reached |
-| `LM_REMCOM_5145_TargetHost.evtx` | T1021.002 (with T1569.002 and T1570) | no | Reached |
 | `LM_Remote_Service01_5145_svcctl.evtx` | T1021.002 (with T1569.002) | no | Reached |
-| `LM_renamed_psexecsvc_5145.evtx` | T1021.002 (with T1569.002) | no | Reached |
 | `LM_ScheduledTask_ATSVC_target_host.evtx` | T1053.005 (with T1021.002) | no | Reached |
 | `LM_sysmon_remote_task_src_powershell.evtx` | T1053.005 | no | Reached |
 | `LM_WMI_4624_4688_TargetHost.evtx` | T1047 | no | Reached |
 | `net_share_drive_5142.evtx` | T1021.002 | no | Reached |
-| `powercat_revShell_sysmon_1_3.evtx` | T1059.001 with T1095 | no | Reached |
 | `RemotePowerShell_MS_Windows-Remote_Management_EventID_169.evtx` | T1021.006 | no | Reached |
 | `sharprdp_sysmon_7_mstscax.dll.evtx` | T1021.001 | no | Reached |
-| `smb_bi_auth_conn_spoolsample.evtx` | T1187 | no | Reached |
 | `spoolsample_5145.evtx` | T1187 | no | Reached |
+| `LM_DCOM_MSHTA_LethalHTA_Sysmon_3_1.evtx` | T1021.003 | yes | Partly reached |
 | `LM_5145_Remote_FileCopy.evtx` | T1570 (over T1021.002) | no | Partly reached |
 | `LM_dcom_shwnd_shbrwnd_mmc20_failed_traces_system_10016.evtx` | T1021.003 | no | Partly reached |
+| `LM_REMCOM_5145_TargetHost.evtx` | T1021.002 (with T1569.002 and T1570) | no | Partly reached |
+| `LM_renamed_psexecsvc_5145.evtx` | T1021.002 (with T1569.002) | no | Partly reached |
 | `LM_sysmon_3_DCOM_ShellBrowserWindow_ShellWindows.evtx` | T1021.003 | no | Partly reached |
 | `LM_winrm_target_wrmlogs_91_wsmanShellStarted_poorLog.evtx` | T1021.006 | no | Partly reached |
 | `MSSQL_15281_xp_cmdshell_exec_failed_attempt.evtx` | T1505.001 (attempt) | no | Partly reached |
+| `powercat_revShell_sysmon_1_3.evtx` | T1059.001 with T1095 | no | Partly reached |
+| `smb_bi_auth_conn_spoolsample.evtx` | T1187 | no | Partly reached |
 
-The five partly reached files, and why:
+The ten partly reached files, and why:
 
+- `LM_DCOM_MSHTA_LethalHTA_Sysmon_3_1.evtx`: the file name names Sysmon event 3, so the connection's direction is a fact. mshta.exe's inbound connection from 10.0.2.17 reads as mshta.exe connecting out, because the address labels put the local host as the source. Only the raw `Initiated` value, read against the labels, gives its direction (gap 8).
 - `LM_5145_Remote_FileCopy.evtx`: the 4 writes show only as the raw access code `%%4417`, so telling them from the 865 reads takes decoding by hand (gap 3).
 - `LM_dcom_shwnd_shbrwnd_mmc20_failed_traces_system_10016.evtx`: the account, source address, and CLSID stay numbered parameters, and naming the DCOM objects the file is named for takes a CLSID lookup by hand (the DCOM 10016 gap under Smaller gaps). Its message named only the provider (gap 11).
+- `LM_REMCOM_5145_TargetHost.evtx`: the 6 writes of RemComSvc.exe to ADMIN$ show only as the raw access code `%%4417`, so reading them as writes takes decoding by hand (gap 3). The svcctl pipe opens show.
+- `LM_renamed_psexecsvc_5145.evtx`: the 2 writes of blabla.exe to ADMIN$ show only as the raw access code `%%4417`, so reading them as writes takes decoding by hand (gap 3). The svcctl open and the renamed service's pipes show.
 - `LM_sysmon_3_DCOM_ShellBrowserWindow_ShellWindows.evtx`: the inbound connection, the file's only sign of the technique, reads as explorer.exe connecting out. Only the raw `Initiated` value, read against the address labels, gives its direction (gap 8).
-- `LM_winrm_target_wrmlogs_91_wsmanShellStarted_poorLog.evtx`: the WinRM 91 event shows only its ID and provider, because Glessner dropped its account and its error data (gaps 7 and 11).
+- `LM_winrm_target_wrmlogs_91_wsmanShellStarted_poorLog.evtx`: the WinRM 91 event shows only its ID and provider, because Glessner dropped its account (gap 7). It also dropped the event's error data (gap 11), which surrounds the technique and isn't scored.
 - `MSSQL_15281_xp_cmdshell_exec_failed_attempt.evtx`: the 15281 event shows only its ID and provider, because Glessner dropped its account and the data string that names xp_cmdshell (gaps 7 and 11).
+- `powercat_revShell_sysmon_1_3.evtx`: the file name names Sysmon event 3, so the connection's direction is a fact. The record holds an inbound session to powershell.exe's listener on port 4444. The name says reverse shell, and where a name and a record disagree, the record decides. The address labels put the local host as the source, so the session reads as powershell.exe connecting out, and only the raw `Initiated` value, read against the labels, gives its direction (gap 8).
+- `smb_bi_auth_conn_spoolsample.evtx`: the file name names a connection, so both connections' directions are facts. The inbound connection from 10.0.2.17 reads as outbound, because its address labels put the local host as the source, and only the raw `Initiated` value, read against them, gives its direction (gap 8). The outbound connection to 10.0.2.17 on port 445 reads right.
 
 ### Totals
 
-- **Score:** 42, 5, 0 of 47. Of the 47 answer items, 42 were reached, 5 were partly reached, and none was missed. No item is out of scope. The score measures the build the check ran on, which predates v0.1.0 and its fixes.
-- **Seven scores that could fall:** The file names give only a technique, so which records and values show it is the check's reading of each sample. For seven reached files, that reading decides the score. A list of each file's records and values will be written before the next full run of the check. Each value the list counts that the app didn't show lowers its file to partly reached, so at worst the score is 35, 12, 0 of 47. Three of the seven turn on a Sysmon 3 connection's inbound direction: `LM_DCOM_MSHTA_LethalHTA_Sysmon_3_1.evtx`, `lm_sysmon_18_remshell_over_namedpipe.evtx`, and `smb_bi_auth_conn_spoolsample.evtx`. In `lm_sysmon_18_remshell_over_namedpipe.evtx` the address labels read the connection backwards, and for the other two the check didn't record whether they do. Where they do, the direction shows only by reading the raw `Initiated` value against them, a comparison by hand, as in `LM_sysmon_3_DCOM_ShellBrowserWindow_ShellWindows.evtx`. One turns on the write of RemComSvc.exe to ADMIN$, whose access shows only as a raw code: `LM_REMCOM_5145_TargetHost.evtx`. Three turn on a link between two records by time alone, and the check didn't record how far apart they are: `lateral_movement_startup_3_11.evtx`, `wmi_remote_registry_sysmon.evtx`, and `DFIR_RDP_Client_TimeZone_RdpCoreTs_104_example.evtx`.
+- **Score:** 37, 10, 0 of 47. Of the 47 answer items, 37 were reached, 10 were partly reached, and none was missed. No item is out of scope. The score measures the build the check ran on, which predates v0.1.0 and its fixes.
+- **Each file's facts:** The file names give only a technique, so each file's facts, read from the samples' records after the first run, decide its state. A file's facts are the records and values that show the technique its name names, and each part the name names, such as an event ID, a pipe, a share, a process, or a key. Records that only surround the technique are context and aren't scored. A 5145 share-access event that places a file on a share is a write, and the write is a fact. For a 5145 that opens a pipe, the kind of access isn't a fact. A value the sample doesn't hold, and the name doesn't name, isn't a fact. A file is scored on its own records, so a join counts only when both records are in the file. A connection's direction is a fact only when the file name names Sysmon event 3 or a connection.
+- **What these rules changed:** Before these rules, this page gave the score as 42, 5, 0 and named seven reached files that the rules could lower. The rules lowered five reached files to partly reached, three of them among the seven. Three of the five turn on an inbound connection whose address labels put the local host as the source, in files whose names name Sysmon event 3 or a connection: `LM_DCOM_MSHTA_LethalHTA_Sysmon_3_1.evtx`, `powercat_revShell_sysmon_1_3.evtx`, and `smb_bi_auth_conn_spoolsample.evtx`. In each, the direction shows only by reading the raw `Initiated` value against the labels, a comparison by hand, as in `LM_sysmon_3_DCOM_ShellBrowserWindow_ShellWindows.evtx`. Two turn on writes to ADMIN$ whose access shows only as the raw code `%%4417`, which takes decoding: `LM_REMCOM_5145_TargetHost.evtx` and `LM_renamed_psexecsvc_5145.evtx`.
+- **Four of the seven stay reached:** The name of `lm_sysmon_18_remshell_over_namedpipe.evtx` names neither Sysmon event 3 nor a connection, so its connection's direction isn't a fact, and the remote client's address shows. In `lateral_movement_startup_3_11.evtx`, the inbound connection joins the Startup folder write on time, 1.11 s apart. In `wmi_remote_registry_sysmon.evtx`, the remote side joins the Run value write, 2.41 s apart. Each join has one candidate, and in both files the address labels read right. `DFIR_RDP_Client_TimeZone_RdpCoreTs_104_example.evtx` holds no connection record to join its time zone records to, so it is reached on those records.
+- **A wider reading:** Counting a connection's direction also where the file's only records of the remote host's address are inbound connections would lower three more files, `LM_impacket_docmexec_mmc_sysmon_01.evtx`, `LM_wmiexec_impacket_sysmon_whoami.evtx`, and `lm_sysmon_18_remshell_over_namedpipe.evtx`, for 34, 13, 0. These rules don't count it, since those files' names don't point to the connection.
 - **Suggestions:** 27 files had suggestions, and 82 events were suggested in all (59 high, 1 critical, and 22 medium). In the two SharpRDP samples, the suggestions fell on RunMRU key creations that Hayabusa's deletion rule misnamed, and in one of them on an unrelated SYSTEM shell. The registry values that record the commands typed over RDP weren't suggested, and their data was only in the raw data (gap 5). Both files are reached, since a value in the raw data counts as shown. The misnamed rule is listed under Gaps outside the app.
 - **ATT&CK tags:** These come from Hayabusa's rules. 13 files carried the expected technique or tactic, 12 carried a related one, 6 carried none that fit, and 16 carried no tag. Lateral Movement (TA0008) appears on only 20 events in 10 files, because Hayabusa's rules tag the execution or persistence side of these techniques.
-- **Gaps by file:** 42 of the 47 files had a gap, and 5 had none. In 26 files, Glessner loaded the event but read EvtxECmd's output wrongly or left a value the answer uses in the raw data. In 12 files, the key events loaded, but nothing pointed an analyst to them. In one of these, `smbmap_upload_exec_sysmon.evtx`, other events were suggested, but not the upload. Those answers were hard to find, which doesn't lower their score. In 4 files, the sample itself doesn't hold a value. In three of them, the file name doesn't name the value either, so it isn't one of the file's facts: the impersonated account, the pipe added, and what WMIC ran. In `LM_WMI_4624_4688_TargetHost.evtx`, the 4688s hold no parent name, and WmiPrvSE.exe starting calc.exe shows through a join on process ID 0xAE8 within the host's records.
+- **Gaps by file:** 42 of the 47 files had a gap, and 5 had none. In 26 files, Glessner loaded the event but read EvtxECmd's output wrongly or left a value the answer uses in the raw data. In 12 files, the key events loaded, but nothing pointed an analyst to them. In one of these, `smbmap_upload_exec_sysmon.evtx`, other events were suggested, but not the upload. Those answers were hard to find, which by itself doesn't lower a score. Four of the 12 are partly reached for another reason, gap 3 or gap 8, as the notes above give. In 4 files, the sample itself doesn't hold a value. In three of them, the file name doesn't name the value either, so it isn't one of the file's facts: the impersonated account, the pipe added, and what WMIC ran. In `LM_WMI_4624_4688_TargetHost.evtx`, the 4688s hold no parent name, and WmiPrvSE.exe starting calc.exe shows through a join on process ID 0xAE8 within the host's records.
 
 ## Gaps found
 
 The check grouped its findings into 13 gaps. This page numbers them 1 to 13, in the order the check recorded them, and the results above refer to them by number. All 13 are fixed in v0.1.0. The per-file notes also record three smaller field gaps, listed after gap 13, and each of those is open. Seven more have their cause outside Glessner, in Hayabusa, the rule sets it runs, its converter, EvtxECmd's output, or the samples, and are listed last. [CHANGELOG.md](../CHANGELOG.md) lists each release's changes, and [known_limitations.md](../known_limitations.md) lists what the app still doesn't do.
 
-A gap's state here is one of three: fixed, with the release that fixed it; open, where the gap is deferred or no fix is chosen yet; or outside the app, where the evidence lacks the value or the cause is in another tool's rules, and the state names where a fix would go.
+A gap's state here is one of three: fixed, with the release that fixed it; open, where the gap is deferred or no fix is chosen yet; or outside the app, where the evidence lacks the value or the cause is in another tool's rules, and the state names where a fix would go. [Gap states](README.md#gap-states) defines each.
 
 Twelve of the 13 gaps are in how Glessner reads EvtxECmd's output or suggests marks, and one is in the workflow. Gaps 1 to 5 were rated high in value when found, and gaps 6 to 13 medium. All 13 fixes were built on 2026-10-15, the day after the run. None of the fixes changes an event's ID, so marks made before them still hold. The counts given for the fixes come from rebuilding or reparsing the samples, not from scoring the case again.
 
@@ -137,7 +145,7 @@ Sysmon 13 records the data written to a registry value. In these samples, that d
 
 EvtxECmd's output escapes some characters as XML entities. Glessner showed them as written, so command lines held `&gt;`, `&lt;`, and `&amp;`. A search for a redirection as the attacker typed it found nothing, and a copied command line was wrong. On the samples, 13 command lines in 5 files held entities.
 
-**State now:** Fixed in v0.1.0. EvtxECmd's values are decoded once when they load. No command line on the samples holds an entity now. Scheduled-task XML keeps its own escapes.
+**State now:** Fixed in v0.1.0. EvtxECmd's values are decoded once when they load. No command line on the samples holds an entity now. Scheduled-task XML keeps its own escapes. EvtxECmd 2026.10, which v0.3.0's setup installs, writes its values already decoded, so Glessner decodes only the output of earlier EvtxECmd builds.
 
 ### Gap 7: Accounts recorded only in the System part were dropped
 
@@ -211,4 +219,5 @@ These came up in the same check. Their cause is in Hayabusa's rules, the rule se
 - The suggestions in the table and the ATT&CK tags in the totals come from Hayabusa 4.1.0 and the rule set it ran with. Another Hayabusa version or rule set can change both.
 - The dataset is 47 small logs, most of them built to show one technique, from 11 machines. It is not a real collection. Several samples are one-sided, and the files were loaded as one host, so the results say nothing about a multi-host case.
 - The expected techniques come from file names. Some files carry a second technique, and the Lateral Movement folder holds files whose technique belongs to another tactic, such as T1547.008 (LSASS Driver).
+- Which records and values show each technique is the check's reading of the file name, made after the first run. The totals under Results give the rules for that reading and the score under a wider reading of connection direction.
 - The What has been checked section of [known_limitations.md](../known_limitations.md#what-has-been-checked) says what else hasn't been shown.

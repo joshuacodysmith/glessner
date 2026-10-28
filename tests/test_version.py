@@ -250,7 +250,7 @@ def test_the_runs_and_tools_listings_line_up_with_a_build_as_the_version(synthet
     from glessner import cli
 
     build = "0.1.0+abc1234.dirty"
-    runs = [SimpleNamespace(run_id=run_id, status="ok", tool_version=v, seconds=1.0, loaded_rows=5, reason="")
+    runs = [SimpleNamespace(run_id=run_id, status="ok", tool_version=v, seconds=1.0, loaded_rows=5, reason="", tool_check=None)
             for run_id, v in (("r1", "1.2.0"), ("r2", build))]
     monkeypatch.setattr(cli, "read_runs", lambda case: runs)
     assert main(["runs", str(synthetic_case.folder)]) == 0

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from sbecmd_log_fixtures import CONSOLE_LOG_NAME, MESSAGES_NAME, console_log_text, messages_text
 
 from glessner.parsers import PARSERS, ParseContext
 from glessner.parsers.common import file_key
@@ -148,6 +149,68 @@ def write_rows(path, columns, rows):
         w.writeheader()
         for row in rows:
             w.writerow(row)
+
+
+def shellbag_csv(folder, name, folder_name):
+    """A ShellBags CSV of one bag, whose path names `folder_name`."""
+    write_rows(folder / name, SBE_COLUMNS, [{"BagPath": "BagMRU\\1", "Slot": "6", "ShellType": "Directory",
+                                             "AbsolutePath": f"Desktop\\This PC\\C:\\{folder_name}",
+                                             "FirstInteracted": "2020-09-19 03:38:45"}])
+
+
+def hive_of(user):
+    return rf"D:\Evidence\case\DESKTOP\Users\{user}\AppData\Local\Microsoft\Windows\UsrClass.dat"
+
+
+def hive_sources(folder):
+    """What each ShellBags event cites as its source, and its profile, for the CSVs in `folder`."""
+    return sorted((e.source_file, e.user_name) for e in PARSERS["sbecmd_csv"](ParseContext(folder, EVIDENCE)))
+
+
+def test_shellbags_name_their_hive_from_the_console_log_of_a_2026_10_build(tmp_path):
+    """From 2026.10 SBECmd writes its record of the run to <stamp>_SBECmd_<version>_ConsoleLog.txt and no messages file."""
+    (tmp_path / CONSOLE_LOG_NAME).write_text(
+        console_log_text(hive_of("ricksanchez"), r"C:\out\ricksanchez_UsrClass.csv"), encoding="utf-8", newline="")
+    shellbag_csv(tmp_path, "ricksanchez_UsrClass.csv", "Secret")
+    assert hive_sources(tmp_path) == [("DESKTOP/Users/ricksanchez/AppData/Local/Microsoft/Windows/UsrClass.dat", "ricksanchez")]
+
+
+def test_shellbags_name_their_hives_from_a_messages_file_and_a_console_log_in_one_folder(tmp_path):
+    (tmp_path / MESSAGES_NAME).write_text(
+        messages_text(hive_of("ricksanchez"), r"C:\out\ricksanchez_UsrClass.csv"), encoding="utf-8", newline="")
+    (tmp_path / CONSOLE_LOG_NAME).write_text(
+        console_log_text(hive_of("mortysmith"), r"C:\out\mortysmith_UsrClass.csv"), encoding="utf-8", newline="")
+    shellbag_csv(tmp_path, "ricksanchez_UsrClass.csv", "One")
+    shellbag_csv(tmp_path, "mortysmith_UsrClass.csv", "Two")
+    assert [user for _, user in hive_sources(tmp_path)] == ["mortysmith", "ricksanchez"]
+
+
+def test_the_latest_console_log_names_a_csv_two_runs_wrote(tmp_path):
+    """Console logs sort by the UTC stamp that starts their names, so the run that wrote the CSV last names its hive."""
+    for stamp, user in (("20261025181337", "mortysmith"), ("20261024090000", "ricksanchez")):
+        name = f"{stamp}_SBECmd_2026.10.2_ConsoleLog.txt"
+        (tmp_path / name).write_text(console_log_text(hive_of(user), r"C:\out\profile_UsrClass.csv", name=name),
+                                     encoding="utf-8", newline="")
+    shellbag_csv(tmp_path, "profile_UsrClass.csv", "Tools")
+    assert [user for _, user in hive_sources(tmp_path)] == ["mortysmith"]
+
+
+def test_an_exported_line_ahead_of_a_log_s_first_finished_line_names_no_hive(tmp_path):
+    """A hive is named by the finished line before an exported line in the same file. A later log that opens with an
+    exported line has no hive of its own yet, and doesn't take the hive its predecessor ended on."""
+    earlier, later = "20261024090000_SBECmd_2026.10.2_ConsoleLog.txt", "20261025181337_SBECmd_2026.10.2_ConsoleLog.txt"
+    (tmp_path / earlier).write_text(console_log_text(hive_of("ricksanchez"), r"C:\out\ricksanchez_UsrClass.csv", name=earlier),
+                                    encoding="utf-8", newline="")
+    (tmp_path / later).write_text(r"[01:13:37.728 INF] Exported to: C:\out\mortysmith_UsrClass.csv" "\r\n",
+                                  encoding="utf-8", newline="")
+    shellbag_csv(tmp_path, "ricksanchez_UsrClass.csv", "Secret")
+    shellbag_csv(tmp_path, "mortysmith_UsrClass.csv", "Tools")
+    assert [user for _, user in hive_sources(tmp_path)] == ["ricksanchez"]
+
+
+def test_shellbags_name_no_hive_when_the_folder_holds_no_record_of_the_run(tmp_path):
+    shellbag_csv(tmp_path, "ricksanchez_UsrClass.csv", "Secret")
+    assert hive_sources(tmp_path) == []
 
 
 AMCACHE_FILE_COLUMNS = ["ApplicationName", "ProgramId", "FileKeyLastWriteTimestamp", "SHA1", "IsOsComponent", "FullPath", "Name",

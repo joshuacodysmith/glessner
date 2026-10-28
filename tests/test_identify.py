@@ -103,3 +103,14 @@ def test_item_41_artifacts_by_signature_and_name():
     assert identify_bytes("report.doc", ole).artifact is None
     assert identify_bytes("$Iwhatever.txt", pad(b"hello")).artifact is None
     assert identify_bytes("other.dat", pad(bytes.fromhex("dad5f576efcdab89"))).artifact is None
+
+
+def test_an_eric_zimmerman_console_log_is_named_among_the_unidentified():
+    """Eric Zimmerman's tools write <stamp>_<Tool>_<version>_ConsoleLog.txt beside their output from release 2026.10. No
+    events are loaded from it, so it stays unidentified, with a note that says what it is."""
+    log = b"[13:08:02.051 INF] EvtxECmd version 2026.10.2\r\n\r\nAuthor: Eric Zimmerman\r\n"
+    ident = identify_bytes("20261026060736_EvtxECmd_2026.10.2_ConsoleLog.txt", log)
+    assert ident == Identification(None, "unidentified",
+                                   "an Eric Zimmerman tool's console log; no events are loaded from it")
+    assert identify_bytes("20261026060736_MFTECmd_2026.10.6_ConsoleLog.TXT", log).detail == ident.detail
+    assert identify_bytes("my_ConsoleLog.txt", log).detail == ""

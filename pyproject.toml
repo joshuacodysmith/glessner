@@ -1,6 +1,6 @@
 [project]
 name = "glessner"
-version = "0.2.0"
+version = "0.3.0"
 description = "Windows triage for SOC analysts: runs Eric Zimmerman's tools, Hayabusa, and Suricata on a collection and puts every record on one timeline to pivot, mark, and export. Local, no AI, no network calls. Pre-alpha."
 readme = "README.md"
 authors = [

@@ -24,7 +24,7 @@ from .accounts import SID_SQL
 from .case import Case
 from .caveats import CAVEAT_COLUMNS, caveat_for, caveats_for
 from .caveats import table as caveat_table
-from .clock import in_segment
+from .clock import in_segment, state_words
 from .events import from_us, id_table, well_formed
 from .hashes import ALGORITHMS
 from .identity import Identity
@@ -35,6 +35,7 @@ from .pivot_names import extra_of, service_names, task_names
 from .queries import BASE_FROM, BASE_WHERE, MARK_EXPR, TS, event_pairs
 from .runner import FOUND_OUTPUT, RunRecord, read_runs, rules_text
 from .tools import load_registry
+from .tools_manifest import RECORD_PATHS, check_words, differing_tools, differs_sentence
 from .version import build_id
 
 SECURITY_SID = "json_extract_string(NULLIF(e.extra, ''), '$.SecurityUserID')"   # set by the EvtxECmd parser
@@ -266,6 +267,10 @@ def head_lines(journal: dict) -> list[str]:
 SECTIONS = ("Summary", "Findings", "Timeline of marked events", "Indicators", "Hosts and clocks",
             "Evidence and integrity", "Method")
 REPORT_CHECK = "full check when writing the report"   # the re-hash's reason in verification.jsonl
+# Where the Tool check line sends the reader. The Method table holds the runs whose events the case still has, so a
+# differing run that a rerun replaced, or that loaded nothing, is counted by the line but is not in the table.
+TOOL_CHECK_WHERE = ("The Method table shows the check of each run whose events the case holds, with the files its tool ran "
+                    f"with. {RECORD_PATHS}")
 NO_SUMMARY = ("No summary has been written. The analyst writes it on the Findings page, in their own words; the app "
               "writes none of it.")
 FINDING_EVENTS = 25   # supporting events a finding's section lists before "and N more"
@@ -345,7 +350,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
         "",
         *([f"**Filtered.** This report applies the analyst's view filter, so marked events outside it are left out of "
            f"the timeline and the indicators. {_md(filter_note)}", ""] if extra else []),
-        heading[0], "", summary or NO_SUMMARY, "",
+        heading[0], "", *(_summary_lines(summary) if summary else [NO_SUMMARY]), "",
         heading[1], "", *_findings_section(con, findings, uids, kinds), "",
         heading[2], "",
     ]
@@ -361,15 +366,18 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     lines += ["", heading[3], "", *_indicators_section(indicators(con, [r[0] for r in rows if r[3] == "Malicious"], identity),
                                                       malicious)]
     lines += ["", heading[4], "", *_hosts_section(identity, splits)]
-    lines += ["", heading[5], "", f"Evidence folder: `{case.settings.evidence_path}`. {check}", "",
-              *(head_lines(journal) if journal else [])]
+    differed = differs_sentence(*differing_tools(records.values(), _md), TOOL_CHECK_WHERE)
+    lines += ["", heading[5], "", f"Evidence folder: `{_tick(case.settings.evidence_path)}`. {check}", "",
+              *(head_lines(journal) if journal else []),
+              *([f"Tool check: {differed}", ""] if differed else [])]
     lines += [heading[6], "", f"Written by glessner {build_id()}. The tool runs loaded in this case, by the host each ran "
               "on; the marks and the findings are the analyst's, and a rule's or a tool's suggestion counts only once the "
               "analyst accepts it.", "",
-              "| Run | Tool | Version | Host | Events | Rules |", "|---|---|---|---|---|---|"]
+              "| Run | Tool | Version | Host | Events | Rules | Tool check |", "|---|---|---|---|---|---|---|"]
     specs = load_registry()
     lines += [f"| `{run_id}` | {tool} | {version} | {_md(host)} | {count:,} | "
-              f"{_md(rules_text(records[run_id], specs)) if run_id in records else ''} |"
+              f"{_md(rules_text(records[run_id], specs)) if run_id in records else ''} | "
+              f"{_md(check_words(records[run_id].tool_check)) if run_id in records else ''} |"
               for run_id, tool, version, host, count in runs]
     lines += _tool_files_lines(list(dict.fromkeys(run[0] for run in runs)), records)
     return "\n".join(lines) + "\n", len(rows)
@@ -424,11 +432,19 @@ def _sources(sources: list[dict]) -> str:
                      for s in sources)
 
 
+def _by_time(event: tuple | None, uid: str) -> tuple:
+    """The sort key of a finding's supporting event, as the Findings page orders them: by shown time, events at one time
+    by ID, an event without a time after those, and an event no longer loaded (`event` None) last."""
+    if event is None:
+        return 2, 0, uid
+    return (0, event[0], uid) if event[0] is not None else (1, 0, uid)
+
+
 def _findings_section(con: duckdb.DuckDBPyConnection, findings: list[tuple[int, dict]], marked: list[str],
                       kinds: dict[str, dict]) -> list[str]:
     """The findings the analyst wrote, in the order of their adds, each with its severity, ATT&CK techniques, who wrote
-    it, its narrative, its supporting events (as entries of the timeline when marked), and the caveats of its events'
-    types. Retired findings are named at the end and left out."""
+    it, its narrative, its supporting events in time order (as entries of the timeline when marked; the first
+    FINDING_EVENTS of them), and the caveats of its events' types. Retired findings are named at the end and left out."""
     if not findings:
         return ["No findings have been written. A finding is the analyst's conclusion, with the events that support "
                 "it, written on the Findings page."]
@@ -455,8 +471,8 @@ def _findings_section(con: duckdb.DuckDBPyConnection, findings: list[tuple[int, 
                   f"{_md(f['severity'])}. ATT&CK: {_md(attack.worded(f['techniques'])) if f['techniques'] else 'none given'}. "
                   f"{n:,} supporting event{'' if n == 1 else 's'}; {when}.", ""]
         if f["narrative"].strip():
-            lines += [*_md(f["narrative"]).split("\n"), ""]   # the analyst's words, one paragraph
-        for uid in f["targets"][:FINDING_EVENTS]:
+            lines += [_line_start(_md(f["narrative"])), ""]   # the analyst's words, one paragraph
+        for uid in sorted(f["targets"], key=lambda u: _by_time(events.get(u), u))[:FINDING_EVENTS]:
             ev = events.get(uid)
             if ev is None:
                 lines.append(f"- An event no longer loaded: ID `{_tick(uid)}`")
@@ -707,6 +723,8 @@ def _hosts_section(identity: Identity, splits: list[tuple]) -> list[str]:
             said += [f"Its events pair with the capture's ({clock['reference']}) and suggest a clock offset of "
                      f"{clock['display']}, {clock['basis_text']}.", clock["zone_note"],
                      f"{applied}, so its times may not line up with the capture's."]
+        else:
+            offset += f"; {state_words(clock, h.host, bool(h.offset_seconds))}"
         if clock.get("steps"):
             said += [clock["steps_text"], clock["span_note"] or "Its events on either side of a change are on different clocks."]
         if said:
@@ -821,15 +839,47 @@ def _time(us: int, zone: str = " UTC") -> str:
     return f"{from_us(us):%Y-%m-%d %H:%M:%S.%f}{zone}"
 
 
-_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>|#~])")
+# The characters Markdown acts on, and an ampersand that begins a named character reference, which a reader turns into the
+# character it names (&lt; into <, &lrm; into a bidi control). A numeric reference has its # escaped, and an ampersand
+# with no reference after it (a URL's query, a command line's &&) stays.
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>|#~]|&(?=[A-Za-z][A-Za-z0-9]*;))")
+# Bidi controls reorder the text around them, so a name can read as another: report[RLO]fdp.scr reads as reportrcs.pdf.
+# The report writes each as its code point, as the pages do (core.js showControls). Zero-width characters, which ordinary
+# text uses, stay.
+_BIDI_CONTROL = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# Where a line starts a list item (a bullet, or up to nine digits and a dot or parenthesis, then a space or the end of the
+# line), underlines the line above it (only = or -), or is a rule (dashes with spaces among them). The digits are kept
+# ahead of the backslash, the rest follows it.
+_LINE_START = re.compile(r"^(\d{1,9}(?=[.)](?:[ \t]|$))|(?=[-+](?:[ \t]|$)|-[- \t]*$|=+[ \t]*$))")
+
+
+def _show_controls(text: str) -> str:
+    """Each bidi control in `text` written as [U+XXXX]."""
+    return _BIDI_CONTROL.sub(lambda m: f"[U+{ord(m.group()):04X}]", text)
 
 
 def _md(text) -> str:
-    """Escape event text for Markdown. It comes from evidence, so it can hold anything."""
-    return _MD_SPECIAL.sub(r"\\\1", str(text or "")).replace("\r", " ").replace("\n", " ")
+    """Escape event text for Markdown. It comes from evidence, so it can hold anything. A bidi control is written as its
+    code point before the escape, so the brackets are escaped with the rest and a (...) after it cannot make a link."""
+    return _MD_SPECIAL.sub(r"\\\1", _show_controls(str(text or ""))).replace("\r", " ").replace("\n", " ")
 
 
 def _tick(text) -> str:
     """Evidence text for a Markdown code span: a backtick would end the span, and a line break could end its
-    paragraph, letting the rest render as Markdown."""
-    return str(text or "").replace("`", "'").replace("\r", " ").replace("\n", " ")
+    paragraph, letting the rest render as Markdown. A bidi control is written as its code point, which stays literal."""
+    return _show_controls(str(text or "")).replace("`", "'").replace("\r", " ").replace("\n", " ")
+
+
+def _line_start(line: str) -> str:
+    """A line of the analyst's words, already through _md, as a line of text. _md leaves the characters that begin a
+    line in Markdown without a special character: a list marker, a numbered one, a heading's underline, and the spaces
+    that start an indented code block. So the leading spaces and tabs are dropped, and a backslash goes before the marker."""
+    return _LINE_START.sub(lambda m: m.group() + "\\", line.lstrip(" \t"))
+
+
+def _summary_lines(summary: str) -> list[str]:
+    """The analyst's Summary as report lines: each line through _md and _line_start, so the words render as typed. A line
+    followed by another line of its paragraph ends in a backslash, which Markdown reads as a line break; without it a
+    renderer joins the lines. A line of spaces is a blank line and ends the paragraph."""
+    lines = [_line_start(_md(line)) for line in summary.split("\n")]
+    return [f"{line}\\" if line and following else line for line, following in zip(lines, [*lines[1:], ""])]

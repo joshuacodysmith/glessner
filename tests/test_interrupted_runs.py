@@ -167,8 +167,8 @@ def test_close_interrupted_returns_what_it_marked_when_a_record_cannot_be_writte
 
 
 def test_close_interrupted_keeps_a_tool_check_and_writes_no_format_4_key_below_format_4(synthetic_case):
-    """The mark rewrites the record: in a format 4 case its tool_check, which this build doesn't fill, stays as it was,
-    and in a case below format 4 the record keeps the shape the builds of its format read."""
+    """The mark rewrites the record: in a format 4 case its tool_check stays as it was, whatever it holds, and in a case
+    below format 4 the record keeps the shape the builds of its format read."""
     check = {"manifest": "tools.json", "files": {"EvtxECmd.exe": "matches"}, "found": [1, None, "x"]}
     _, path = started(synthetic_case, "HOST1")
     path.write_text(json.dumps({**json.loads(path.read_text(encoding="utf-8")), "tool_check": check}), encoding="utf-8")

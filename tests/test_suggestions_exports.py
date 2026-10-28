@@ -11,7 +11,8 @@ from conftest import DOTTED_QUAD, METASPLOIT, SEC, T0, eve_alert
 from test_analysis_relations import WINDOWS_10, add_os
 
 from glessner.events import Event, event_uid, load
-from glessner.export import export_timeline, write_report
+from glessner.export import _hosts_section, export_timeline, write_report
+from glessner.identity import HostIdentity, Identity
 from glessner.parsers import PARSERS, ParseContext
 from glessner.queries import QueryError, investigate, pending_for_source
 from glessner.rules import RuleError, parse
@@ -654,14 +655,43 @@ def test_the_report_and_hosts_payload_carry_the_os(synthetic_case):
         text = path.read_text(encoding="utf-8")
         assert "| Host | Role | OS | Names | IPs | Clock offset |" in text
         assert ("| DESKTOP | Workstations (guessed) | Windows 10 Enterprise Evaluation, version 2004, build 19041.264 | "
-                "DESKTOP-SDN1RPT | 10.42.85.115 | none |") in text
-        assert "| DC01 | Domain controllers (guessed) | Not recorded | CITADEL-DC01 | 10.42.85.10 | none |" in text
+                "DESKTOP-SDN1RPT | 10.42.85.115 | none; not measured |") in text
+        assert "| DC01 | Domain controllers (guessed) | Not recorded | CITADEL-DC01 | 10.42.85.10 | none; not measured |" in text
         # The page's hosts payload sends every HostIdentity field, so the OS reaches it with no server change.
         hosts = {h["host"]: h["os"] for h in api_meta(a, {})["hosts"]}
         assert hosts["DESKTOP"]["display"] == "Windows 10 Enterprise Evaluation, version 2004, build 19041.264"
         assert hosts["DC01"] == {}
     finally:
         a.con.close()
+
+
+SUGGESTED = {"state": "suggest", "reference": "network", "seconds": -3599.5, "display": "-3,599.5 s (1 h less 0.5 s)",
+             "basis_text": "from 12 RDP connections; 12 of 12 pairs within 2 s", "zone_note": "", "skew_seconds": 3599.5,
+             "skew_text": "59 m 59.5 s", "steps": []}
+
+
+def test_the_hosts_table_gives_the_offset_applied_and_the_clock_check_s_state_for_each_host():
+    """The Clock offset column reads the offset applied ("none" or "+N s"), a semicolon, and the state the clock check
+    found, in the Overview's words without the offset: a host not measured reads not measured, and one found aligned reads
+    aligned. A suggestion gives the seconds suggested, not applied."""
+    hosts = {
+        "NEW": ({}, 0.0), "TYPED": ({"state": "none", "reference": "network"}, 90.0),
+        "MATCH": ({"state": "agrees", "reference": "network"}, 0.0),
+        "ALIGNED": ({"state": "agrees", "reference": "network"}, -3599.5),
+        "CLASH": ({"state": "disagree", "reference": "network"}, 0.0),
+        "CLASHED": ({"state": "disagree", "reference": "network"}, 5.0),
+        "SENSOR": ({"state": "none", "reference": "SENSOR"}, 0.0),
+        "SUGGEST": (SUGGESTED, 0.0), "PARTLY": (SUGGESTED, 90.0)}
+    identity = Identity(hosts={name: HostIdentity(host=name, role="Servers", role_source="analyst", offset_seconds=offset,
+                                                  clock=clock) for name, (clock, offset) in hosts.items()},
+                        lookup={}, conflicts=[])
+    cells = {line.split(" | ")[0].removeprefix("| "): line.split(" | ")[-1].removesuffix(" |")
+             for line in _hosts_section(identity, [])[2:] if line.startswith("| ")}
+    assert cells == {
+        "NEW": "none; not measured", "TYPED": "+90 s; not measured", "MATCH": "none; matches the capture",
+        "ALIGNED": "-3599.5 s; aligned to the capture", "CLASH": "none; pairs with the capture disagree",
+        "CLASHED": "+5 s; pairs with the capture disagree", "SENSOR": "none; the reference clock",
+        "SUGGEST": "none; -3,599.5 s suggested, not applied", "PARTLY": "+90 s; -3,599.5 s suggested, not applied"}
 
 
 BEFORE_1970 = -315_619_200 * SEC   # 1960-01-01 00:00 UTC, a PE link time Autoruns loads as an event time

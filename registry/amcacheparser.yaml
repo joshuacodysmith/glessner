@@ -2,10 +2,12 @@ id: amcacheparser
 name: AmcacheParser
 publisher: Eric Zimmerman
 license: MIT
-download_url: https://download.ericzimmermanstools.com/AmcacheParser.zip
+download_url: https://download.ericzimmermanstools.com/net/AmcacheParser.zip
 detect:
   executables: [AmcacheParser.exe]
   version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
+# The .NET 10 build, on a .NET 10 runtime, ideally one unpacked in the tools folder.
+dotnet: 10
 handles: ["registry:AMCACHE"]   # only the Amcache.hve hive, not every registry file
 input: each_file
 run:

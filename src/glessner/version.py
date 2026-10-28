@@ -1,6 +1,6 @@
 """The build identifier: the release version, which pyproject.toml alone holds and the package reads from
-its installed metadata, plus the commit the code came from, as a PEP 440 local label: 0.2.0+abc1234, or
-0.2.0+abc1234.dirty when tracked files under the package differ from that commit. The report, the audit trail
+its installed metadata, plus the commit the code came from, as a PEP 440 local label: 0.3.0+abc1234, or
+0.3.0+abc1234.dirty when tracked files under the package differ from that commit. The report, the audit trail
 and its export, the start page, `--version`, the built-in tools and imports as a tool version, and the journal's
 case_open entries carry it.
 """
@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import __version__
 
-# A release build writes its build string here, such as "0.2.0+abc1234", and build_id() then gives it as it is, without
+# A release build writes its build string here, such as "0.3.0+abc1234", and build_id() then gives it as it is, without
 # asking git. Empty in a source checkout.
 BAKED_BUILD = ""
 PACKAGE_DIR = Path(__file__).resolve().parent

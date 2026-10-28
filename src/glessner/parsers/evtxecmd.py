@@ -3,10 +3,12 @@
 Fields come from the Payload JSON by name. The PayloadData columns hold display strings such as
 "LogonType 3" and are used only to build the one-line message.
 
-EvtxECmd writes values as the event's XML holds them, so &gt;, &lt;, and &amp; stand for the characters, and task XML
-carried in event data has them twice (&amp;gt;). Payload values and the message columns are unescaped once, so command
-lines, messages, and raw fields show the event's own text. The built-in XML reader
-(event_xml.py) writes text its XML parser has already decoded, so its rows aren't unescaped again.
+Before 2026.10, EvtxECmd writes values as the event's XML holds them, so &gt;, &lt;, and &amp; stand for the characters,
+and task XML carried in event data has them twice (&amp;gt;). Payload values and the message columns of those rows are
+unescaped once, so command lines, messages, and raw fields show the event's own text. From 2026.10 it writes the event's
+own text and adds a RenderingInfo column; a row with that column is already decoded, and unescaping it again would turn
+the &amp; that a task's XML holds into a bare &. The built-in XML reader (event_xml.py) also writes text its XML
+parser has already decoded, so its rows aren't unescaped either.
 """
 
 from __future__ import annotations
@@ -34,7 +36,11 @@ from .common import (
 )
 
 OUTPUT_FILE = "evtxecmd.csv"
+DECODED_COLUMN = "RenderingInfo"   # a column whose presence marks a CSV written with the event's own text (2026.10 on)
 SYSMON = "Microsoft-Windows-Sysmon"
+# Providers that write a date for the reader's locale as unnamed data: CAPI2 in its 4111 to 4113, and EventLog in its
+# 6008, an unexpected shutdown.
+UNNAMED_DATES = {"Microsoft-Windows-CAPI2", "EventLog"}
 # The message's parts after the event's description: EvtxECmd's map columns, and parts the parser adds: "parent" (the
 # parent process's file name), "auth" (a logon's authentication package), and "task" (what a scheduled task
 # runs). PayloadData3 to 6 come last, so messages other than Sysmon's start with PayloadData1 and 2. A share or object
@@ -42,6 +48,18 @@ SYSMON = "Microsoft-Windows-Sysmon"
 # none.
 MAP_COLUMNS = ("PayloadData1", "PayloadData2", "auth", "ExecutableInfo", "PayloadData3", "PayloadData4", "PayloadData5",
                "PayloadData6")
+MAP_PACKAGE = "AuthenticationPackageName:"   # the part a 4624 map writes for the package itself, from EvtxECmd 2026.10
+# Left-to-right and right-to-left marks. Windows writes a date for the reader's locale with one before each part of
+# it, as in "\u200e9/\u200e17/\u200e2020 9:43 AM". Elsewhere such marks can disguise a name, and the pages show them.
+DATE_MARKS = re.compile("[\u200e\u200f]")
+MARK = DATE_MARKS.pattern
+WORD = MARK + r"[^\W\d_]+"   # a weekday or a month
+DAY = MARK + r"\d{1,2}"
+NUMBERS = MARK + r"\d{1,4}[/.-]" + MARK + r"\d{1,2}[/.-]" + MARK + r"\d{1,4}"   # 9/17/2020, 17.09.2020, 2020-09-17
+WORDS = f"(?:{WORD},? )?(?:{DAY}\\.? {WORD}|{WORD} {DAY}),? {MARK}" + r"\d{4}"   # Wednesday, September 2, 2020
+TIME = r"(?:,? \d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?: ?[AaPp]\.?[Mm]\.?)?)?"
+MARKED_DATE = re.compile(f"(?:{NUMBERS}|{WORDS}){TIME}")   # a mark before each part of the date, none in the time
+MAP_PART = re.compile(r"([A-Za-z][\w ]{0,40}: )(.*)", re.DOTALL)   # a map's "Label: value"
 # Windows' names for the rights a 5145 or 4663 lists as %% codes. EvtxECmd's map names a single code but writes
 # "Unknown code (%%1537 | %%4423 ...)" for a list, so these names are what tell a share's writes from its reads.
 ACCESS_NAMES = {"%%1537": "DELETE", "%%1538": "READ_CONTROL", "%%1539": "WRITE_DAC", "%%1540": "WRITE_OWNER",
@@ -141,8 +159,19 @@ def parse_event_xml(ctx: ParseContext) -> Iterator[Event]:
 def event_from_row(row: dict[str, str], ctx: ParseContext, xml_reader: bool = False) -> Event:
     raw = row.get("Payload")
     fields = payload_fields(raw)
-    if not xml_reader and raw and "&" in raw:   # JSON leaves & as it is, so a payload without one holds no entity
+    if not _decoded(row, xml_reader) and raw and "&" in raw:   # JSON leaves & as it is, so a payload without one holds no entity
         fields = {k: html.unescape(v) for k, v in fields.items()}
+    unmarked: dict[str, str] = {}   # each value that lost its marks, as written, to the value as loaded
+    # Only a payload with a mark pays for the date check: written as the character, or as a JSON escape (\u200e).
+    if raw and ("\u200e" in raw or "\u200f" in raw or "\\u200" in raw):
+        provider = row.get("Provider", "")
+        for name, value in fields.items():
+            plain = _unmarked_date(value) if _dated(name, provider) else value
+            if plain != value:
+                fields[name] = unmarked[value] = plain
+        # Text that another field keeps, marks and all, keeps them in the message too.
+        kept = set(fields.values())
+        unmarked = {written: plain for written, plain in unmarked.items() if written not in kept}
     if "EventPayload" in fields:   # ProcessingErrorData's hex, read as text
         text = payload_text(fields["EventPayload"])
         if text:
@@ -177,7 +206,7 @@ def event_from_row(row: dict[str, str], ctx: ParseContext, xml_reader: bool = Fa
     task = _task_action(fields.get("TaskContent") or fields.get("TaskContentNew")) if code in TASK_EVENTS else None
     if task:
         fields.update({f"Task{k.capitalize()}": task[k] for k in ("command", "arguments", "principal") if task[k]})
-    message = _message(code, row, fields, parent, xml_reader, access, task)
+    message = _message(code, row, fields, parent, xml_reader, access, task, unmarked)
     record = row.get("EventRecordId", "")
     # The file an event is about: Sysmon 11's file, a 5145's file on the share, Sysmon 7's loaded DLL, or a service's
     # binary. For Sysmon 7, Same file then reaches the DLL; the loading process stays the process.
@@ -232,11 +261,19 @@ def event_from_row(row: dict[str, str], ctx: ParseContext, xml_reader: bool = Fa
     )
 
 
+def _decoded(row: dict[str, str], xml_reader: bool) -> bool:
+    """Whether the row's values hold the event's own text already: the built-in XML reader's rows, and an EvtxECmd row
+    from 2026.10 on, which has the RenderingInfo column. Other rows hold the XML's entities."""
+    return xml_reader or DECODED_COLUMN in row
+
+
 def _message(code: str, row: dict[str, str], fields: dict[str, str], parent: str, xml_reader: bool,
-             access: str = "", task: dict | None = None) -> str:
+             access: str = "", task: dict | None = None, unmarked: dict[str, str] | None = None) -> str:
     """The event ID and description, then the message parts, a Sysmon event's target first. It runs on every
     row, so each step runs only where it can change a part; run on every part, they would make parsing half again as
-    slow."""
+    slow. The parts of a row that is not decoded (_decoded) are unescaped once, and a part loses the marks the row's
+    payload values lost (unmarked, from event_from_row)."""
+    decoded = _decoded(row, xml_reader)
     if xml_reader and sysmon_network(row.get("Provider", ""), row.get("Channel", ""), code):
         # Stored output from an older reader holds the ends in its detail too, and a rebuild or a case copy parses
         # stored output again without running the reader, so the detail is worded again from the fields.
@@ -262,9 +299,9 @@ def _message(code: str, row: dict[str, str], fields: dict[str, str], parent: str
             part = ("parent " + parent.replace("/", "\\").rsplit("\\", 1)[-1]) if parent else ""
         elif column == "auth":
             # 4624 and 4625 name the authentication package (NTLM, Kerberos, or Negotiate), which pass-the-hash checks
-            # read.
+            # read. A map that writes the package itself makes this part a repeat.
             package = clean(fields.get("AuthenticationPackageName")) if code in ("4624", "4625") else ""
-            part = f"AuthenticationPackage: {package}" if package else ""
+            part = f"AuthenticationPackage: {package}" if package and not _map_names_package(row) else ""
         elif column == "access":   # the XML reader's rows only
             part = f"Access: {access}" if access and code == "5145" else ""
         elif column == "direction":
@@ -288,8 +325,10 @@ def _message(code: str, row: dict[str, str], fields: dict[str, str], parent: str
             # The 5140 and 5145 maps write "Share: \\*\IPC$ ()" for a share with no local folder
             if part.endswith(" ()") and part.startswith("Share: "):
                 part = part[:-3]
-            if not xml_reader and "&" in part:
+            if not decoded and "&" in part:
                 part = html.unescape(part)
+            if "\u200e" in part or "\u200f" in part:
+                part = _unmarked_part(part, unmarked or {})
             if not xml_reader and "GUID" in part and column != "ExecutableInfo":
                 part = GUID.sub("", part)
         part = part.strip()   # as clean() does, with the placeholder check below
@@ -302,6 +341,39 @@ def _message(code: str, row: dict[str, str], fields: dict[str, str], parent: str
     if not row.get("MapDescription") and len(bits) == head:   # no map, so only the ID and provider: the fields say more
         bits += _field_parts(fields)
     return f"{code} " + " | ".join(bits)
+
+
+def _map_names_package(row: dict[str, str]) -> bool:
+    """Whether one of the row's map columns names the authentication package with a value."""
+    for column in MAP_COLUMNS:
+        part = (row.get(column) or "").strip()
+        if part.startswith(MAP_PACKAGE):
+            return part[len(MAP_PACKAGE):].strip() not in ("", "-")
+    return False
+
+
+def _dated(name: str, provider: str) -> bool:
+    """Whether a payload field can hold a date for the reader's locale: one whose name holds Date or Time, as
+    LastRunDateTime does, or the unnamed data of a provider in UNNAMED_DATES."""
+    return "Date" in name or "Time" in name or (provider in UNNAMED_DATES and UNNAMED.match(name) is not None)
+
+
+def _unmarked_date(value: str) -> str:
+    """A value that is a date, with or without a time, with a mark before each part of the date, as Windows writes one
+    for the reader's locale, without its marks. Any other value is returned as it is."""
+    return DATE_MARKS.sub("", value) if MARKED_DATE.fullmatch(value) else value
+
+
+def _unmarked_part(part: str, unmarked: dict[str, str]) -> str:
+    """A message part without the marks a payload value lost, where the whole part or its value after a map's "Label: "
+    is that value as written (unmarked maps it to the value as loaded). Any other part keeps its marks, so the message
+    agrees with the fields."""
+    if part in unmarked:
+        return unmarked[part]
+    labeled = MAP_PART.fullmatch(part)
+    if labeled and labeled[2] in unmarked:
+        return labeled[1] + unmarked[labeled[2]]
+    return part
 
 
 def _share_file(fields: dict[str, str]) -> str:

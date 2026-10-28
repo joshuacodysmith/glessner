@@ -51,6 +51,7 @@ from .runner import (
 )
 from .tool_outputs import BY_KIND, CAPTURES
 from .tools import REGISTRY_DIR, DetectedTool, ToolSpec, _executables_under
+from .tools_manifest import PinCache, check_text, pin_states
 
 KNOWN_FILE = REGISTRY_DIR / "known" / "known_tools.yaml"
 NOUNS = {   # what an artifact is called on the page, singular
@@ -157,10 +158,15 @@ def _noun(key: str, n: int) -> str:
     return f"{n:,} {word if word.endswith('s') else word + 's'}"
 
 
-def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool]) -> dict:
+def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],
+             pins: PinCache | None = None) -> dict:
+    """The Tools page's data. With `pins`, each found tool's files against its pin (tools_manifest.pin_states) are each
+    tool's `pin` and, for the page, the tools folder's `manifest`; without it, both are None and no tool is hashed."""
     entries = current_entries(case) if case.manifest_path.exists() else []
     runs = read_runs(case)
     tools = []
+    folder = Path(case.settings.tools_folder) if case.settings.tools_folder else None
+    states, manifest = pin_states(folder, detected, pins) if pins is not None else ({}, None)
     for spec in specs.values():
         matched = [e for e in entries if handles(spec, e.artifact, e.detail)]
         by_kind = Counter(next(h for h in spec.handles if h in (e.artifact, f"{e.artifact}:{e.detail}")) for e in matched)
@@ -169,7 +175,7 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
         last = max((r.finished_utc for r in latest.values()), default="")
         tool = detected.get(spec.id)
         if tool and tool.missing and hosts:
-            status = "blocked"   # installed, but can't run here, such as Suricata without Npcap
+            status = "blocked"   # installed, but can't run here, such as Suricata without Npcap or RBCmd without .NET 10
         elif tool and hosts:
             status = "ran" if latest else "ready"
         elif tool:
@@ -185,6 +191,7 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             "reads": ", ".join(_noun(k, n) for k, n in by_kind.most_common()), "hosts": hosts, "status": status,
             "last_run": _last_run(latest, last, specs) if latest else None,
             "hits": spec.id == "hayabusa",   # its rows are hits, not events
+            "pin": states.get(spec.id),
         })
     # A file a tool copies along with its input, such as a SQLite database's logs, is read too.
     handled = lambda e: any(handles(t.spec, e.artifact, e.detail) or e.artifact in t.spec.copy_also
@@ -202,8 +209,8 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             offered["text_log" if e.artifact in IMPORTABLE else detail] += 1
     # Each with intake's reason, where it gave one, such as a prefetch name without its signature
     unidentified = [{"path": e.path, "reason": e.detail} for e in entries if e.artifact is None and not e.error]
-    folder = Path(case.settings.tools_folder) if case.settings.tools_folder else None
     return {"tools_folder": str(folder or ""), "found": len(detected), "total": len(specs), "tools": tools,
+            "manifest": manifest,
             "outputs": found_outputs(case, specs, detected, entries, runs),
             "unread": [{"what": _noun(k, n)} for k, n in unread.most_common()],
             "to_import": [_noun(k, n) for k, n in offered.most_common()],
@@ -214,14 +221,20 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
 def _last_run(latest: dict[tuple, RunRecord], at: str, specs: dict[str, ToolSpec]) -> dict:
     """What a tool's held runs (runner.held_runs) hold, for its row on the Tools page: the rows they loaded, those
     without a time, and those skipped; the rule sets they used, in run order, and whether any run of a tool that names its
-    rule set made none to name (runner.RULES_NOT_RECORDED)."""
+    rule set made none to name (runner.RULES_NOT_RECORDED). `latest` is the newest of them that ran the tool, as its
+    run ID, host, time, tool check as recorded, and that check in words, or None for a tool whose runs are all loads
+    of output found in the evidence."""
     records = list(latest.values())
     named = rule_sets(records, specs)
+    ran = [r for r in records if not r.from_output]
+    newest = max(ran, key=lambda r: r.finished_utc, default=None)
     return {"at": at, "rows": sum(r.loaded_rows or 0 for r in records), "hosts": sorted({host for host, _ in latest}),
             "without_time": sum(r.rows_without_time or 0 for r in records),
             "skipped": sum(r.rows_skipped or 0 for r in records),
             "rules": [text for text in named if text != RULES_NOT_RECORDED],
-            "rules_unrecorded": RULES_NOT_RECORDED in named}
+            "rules_unrecorded": RULES_NOT_RECORDED in named,
+            "latest": newest and {"run_id": newest.run_id, "host": newest.host, "at": newest.finished_utc,
+                                  "check": newest.tool_check, "text": check_text(newest.tool_check)}}
 
 
 def found_outputs(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],
@@ -315,14 +328,27 @@ def everything_ready(case: Case, specs: dict[str, ToolSpec], detected: dict[str,
     return tools, sorted(groups, key=lambda g: g["parser"] in LOCAL_TIME)
 
 
+NOTHING_READY = "Nothing is ready: every tool with evidence here has run, and found output is loaded."
+
+
+def cannot_run(view: dict) -> list[str]:
+    """A sentence for each installed tool that has evidence here and can't run, such as Suricata without Npcap or a
+    .NET 10 tool without its runtime: "RBCmd can't run here: Needs a .NET 10 runtime: ...". Run and load everything
+    ready leaves these tools out. `view` is the overview."""
+    return [f"{t['name']} can't run here: {t['missing']}." for t in view["tools"] if t["status"] == "blocked"]
+
+
 def start_all_job(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],
                   after: Callable[[ToolJob], None]) -> ToolJob:
     """Run every ready tool on its hosts, then load every ready group of found output, in one background job: the
-    one-folder-in path. Raw evidence comes first, so the tools run before any output loads."""
-    tools, groups = everything_ready(case, specs, detected)
+    one-folder-in path. Raw evidence comes first, so the tools run before any output loads. RunError when nothing is
+    ready, naming each tool that has evidence here and can't run (cannot_run)."""
+    view = overview(case, specs, detected)
+    tools, groups = everything_ready(case, specs, detected, view)
     plans = [plan for tool in tools for plan in plan_runs(case, tool)]
     if not plans and not groups:
-        raise RunError("Nothing is ready: every tool with evidence here has run, and found output is loaded.")
+        blocked = cannot_run(view)
+        raise RunError(f"Nothing is ready: {' '.join(blocked)}" if blocked else NOTHING_READY)
     return _start(ToolJob("Everything ready", len(plans) + len(groups), "all"), "everything-ready", case, plans, groups,
                   _step_name, after)
 
@@ -412,14 +438,17 @@ def _step_result(label: str, step: RunPlan | dict, records: list[RunRecord]) -> 
     while it read, which records no check), then ok. `hits` says its rows are Hayabusa's hits, which the page counts
     apart from events. `loaded` says a load committed, which a run records with its rows once events.load has committed
     them: a run can fail after that, when the evidence changed while it was read, and a group fails when any of its runs
-    does, so a step's status doesn't say whether the events changed."""
+    does, so a step's status doesn't say whether the events changed. A run's step also names its tool and the result of
+    its tool check (`tool_id`, `tool_check`, "" when the run recorded none), which a group's step, a load of output
+    found in the evidence, has no use for."""
     hits = (step.tool.spec.id if isinstance(step, RunPlan) else step["tool"]) == "hayabusa"
     loaded = any(r.loaded_rows is not None for r in records)
     if isinstance(step, RunPlan):
         (record,) = records
         return {"host": label, "status": record.status, "reason": record.reason, "rows": record.loaded_rows,
                 "hits": hits, "seconds": record.seconds, "evidence": record.evidence_check,
-                "working_copy_changes": len(record.working_copy_changes), "loaded": loaded}
+                "working_copy_changes": len(record.working_copy_changes), "loaded": loaded,
+                "tool_id": step.tool.spec.id, "tool_check": (record.tool_check or {}).get("result", "")}
     bad = [r for r in records if r.status != "ok"]
     checks = {r.evidence_check for r in records}
     if "mismatch" in checks:

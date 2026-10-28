@@ -6,7 +6,7 @@ Each tool is optional. Glessner runs the installed tools that have evidence to r
 
 The commands are for Windows PowerShell, which comes with Windows. Paste the blocks into one PowerShell window, in order. Step 1 has you open a new window once, after uv is installed. Only Npcap's installer needs administrator rights.
 
-These steps were tested on 2026-10-21 on a fresh Windows 11 installation, build 26100, with the versions below.
+The steps for uv, Glessner, Hayabusa, Npcap, and Suricata were tested on 2026-10-21 on a fresh Windows 11 installation, build 26100, with the versions below. The steps for Eric Zimmerman's 2026.10 tools and the .NET 10 runtime have not yet been run on a fresh machine.
 
 ## What you install
 
@@ -15,8 +15,8 @@ These steps were tested on 2026-10-21 on a fresh Windows 11 installation, build 
 | uv | 0.13.4 | Installs Python and the app's dependencies, and runs the app | 15.2 MB |
 | Python | 3.14.8 | Runs the app. uv installs it | 23.3 MB |
 | Glessner | This repository | The app, and its Python packages, which uv installs | About 4 MB, then 65 MB of packages |
-| Eric Zimmerman's tools | 2026.5.0 | Event logs, registry, $MFT and $J, Prefetch, LNK files, jump lists, shellbags, Amcache, SRUM, Recycle Bin, browser history, notifications, and the Windows Timeline | 12 zips, 47.6 MB |
-| .NET 9 runtime | 9.0.21 | Runs RBCmd, SQLECmd, and WxTCmd | 36.0 MB |
+| Eric Zimmerman's tools | 2026.10 | Event logs, registry, $MFT and $J, Prefetch, LNK files, jump lists, shellbags, Amcache, SRUM, Recycle Bin, browser history, notifications, and the Windows Timeline | 12 zips, 49.5 MB |
+| .NET 10 runtime | 10.0.13 | Runs AmcacheParser, RBCmd, SQLECmd, and WxTCmd | 37.0 MB |
 | Hayabusa | 4.1.0 | Sigma and Hayabusa rule hits on event logs | 44.8 MB |
 | Npcap | 1.89 | Lets Suricata read capture files | 1.3 MB |
 | Suricata | 8.0.7 | Network records and alerts from packet captures | 36.7 MB |
@@ -61,23 +61,23 @@ Glessner runs the executables it finds in the tools folder and its subfolders. S
 | Folder | Contents |
 |---|---|
 | `C:\Tools\EZTools\` | One folder per Eric Zimmerman tool, such as `C:\Tools\EZTools\RBCmd\` |
-| `C:\Tools\dotnet-9\` | The .NET 9 runtime, unpacked |
+| `C:\Tools\dotnet-10\` | The .NET 10 runtime, unpacked |
 | `C:\Tools\hayabusa-4.1.0\` | Hayabusa, with its rules and config folders |
 | `C:\Tools\suricata-8.0.7\` | Suricata, unpacked from its installer, with the ET Open rule set |
 
 ## 3. Eric Zimmerman's tools
 
-Glessner uses 12 of Eric Zimmerman's command-line tools. Nine are the .NET Framework 4.7.2 builds, which run on the .NET Framework that comes with Windows 10 and 11. RBCmd, SQLECmd, and WxTCmd are the .NET 9 builds. SQLECmd and WxTCmd have no .NET 4 build. RBCmd has one, but it needs administrator rights to search a folder, and without them it finds no Recycle Bin files.
+Glessner uses 12 of Eric Zimmerman's command-line tools. Eight are the .NET Framework 4.7.2 builds, which run on the .NET Framework that comes with Windows 10 and 11. AmcacheParser, RBCmd, SQLECmd, and WxTCmd are the .NET 10 builds, which Eric's download site keeps in its `net` folder. AmcacheParser, SQLECmd, and WxTCmd have no .NET Framework build, as [his tool list](https://ericzimmerman.github.io/) shows. RBCmd has one, but it needs administrator rights to search a folder, and without them it finds no Recycle Bin files, so Glessner uses its .NET 10 build.
 
-Eric's [Get-ZimmermanTools](https://github.com/EricZimmerman/Get-ZimmermanTools) script now keeps only .NET 10 builds by default, and on 2026-10-21 [his tool list](https://ericzimmerman.github.io/) had none, so its default run would download none of these tools. Use this block instead. It downloads the 12 zips from Eric's download site, unpacks each to its own folder, and checks each tool's .exe. If an .exe isn't signed by ZimTech LLC, Eric's company, the block deletes that tool's folder and stops. It doesn't check the .dll files or the other files in a zip.
+This block downloads the 12 zips from Eric's download site, unpacks each to its own folder, and checks each tool's .exe. If an .exe isn't signed by ZimTech LLC, Eric's company, the block deletes that tool's folder and stops. It doesn't check the .dll files or the other files in a zip.
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $base = 'https://download.ericzimmermanstools.com'
-$tools = 'AmcacheParser', 'EvtxECmd', 'JLECmd', 'LECmd', 'MFTECmd', 'PECmd', 'RECmd', 'SBECmd', 'SrumECmd',
-    'net9/RBCmd', 'net9/SQLECmd', 'net9/WxTCmd'
+$tools = 'EvtxECmd', 'JLECmd', 'LECmd', 'MFTECmd', 'PECmd', 'RECmd', 'SBECmd', 'SrumECmd',
+    'net/AmcacheParser', 'net/RBCmd', 'net/SQLECmd', 'net/WxTCmd'
 foreach ($tool in $tools) {
     $name = Split-Path $tool -Leaf
     $zip = Join-Path $env:TEMP "$name.zip"
@@ -99,29 +99,29 @@ foreach ($tool in $tools) {
 
 To update the tools later, run the block again. It replaces each tool's files, and Glessner records the version each run used.
 
-## 4. The .NET 9 runtime
+## 4. The .NET 10 runtime
 
-RBCmd, SQLECmd, and WxTCmd are framework-dependent: each needs a .NET 9 runtime to start. Glessner finds a runtime unpacked in the tools folder and points those three tools at it for their runs only. Nothing is installed machine-wide.
+AmcacheParser, RBCmd, SQLECmd, and WxTCmd are framework-dependent: each needs a .NET 10 runtime to start. Glessner finds a runtime unpacked in the tools folder and points those four tools at it for their runs only. Nothing is installed machine-wide.
 
-Microsoft ends support for .NET 9 on November 10, 2026, as its [.NET support policy](https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core) states. After that date Microsoft publishes no security fixes for it, and these three tools read evidence files that may be hostile. On 2026-10-21 Eric Zimmerman's .NET 10 builds of the three tools were not yet published: their download links answered 404. Once they are, Glessner's [registry](registry/) moves to them and this step changes to the .NET 10 runtime. Until then, use the .NET 9 runtime, or leave the three tools out and work without their records.
+Microsoft supports .NET 10 until November 14, 2028, as its [.NET support policy](https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core) states.
 
-This block reads Microsoft's release list for .NET 9, downloads the newest runtime zip for 64-bit Windows, checks it against the SHA-512 hash that the list gives, and unpacks it to `C:\Tools\dotnet-9`:
+This block reads Microsoft's release list for .NET 10, downloads the newest runtime zip for 64-bit Windows, checks it against the SHA-512 hash that the list gives, and unpacks it to `C:\Tools\dotnet-10`:
 
 ```powershell
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$release = (Invoke-RestMethod 'https://builds.dotnet.microsoft.com/dotnet/release-metadata/9.0/releases.json').releases[0]
+$release = (Invoke-RestMethod 'https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json').releases[0]
 $file = $release.runtime.files | Where-Object { $_.name -eq 'dotnet-runtime-win-x64.zip' }
-$zip = Join-Path $env:TEMP 'dotnet-runtime-9-win-x64.zip'
+$zip = Join-Path $env:TEMP 'dotnet-runtime-10-win-x64.zip'
 Invoke-WebRequest $file.url -OutFile $zip -UseBasicParsing
 if ((Get-FileHash $zip -Algorithm SHA512).Hash -ne $file.hash) { throw 'The runtime zip does not match the hash Microsoft lists' }
-Expand-Archive -Path $zip -DestinationPath 'C:\Tools\dotnet-9' -Force
+Expand-Archive -Path $zip -DestinationPath 'C:\Tools\dotnet-10' -Force
 Remove-Item $zip
-"Unpacked .NET runtime $($release.'release-version') to C:\Tools\dotnet-9"
+"Unpacked .NET runtime $($release.'release-version') to C:\Tools\dotnet-10"
 ```
 
-If the machine already has the .NET 9 runtime installed from [Microsoft's .NET 9 download page](https://dotnet.microsoft.com/en-us/download/dotnet/9.0), you can skip this step. The three tools then run on the installed runtime.
+If the machine already has the .NET 10 runtime installed from [Microsoft's .NET 10 download page](https://dotnet.microsoft.com/en-us/download/dotnet/10.0), you can skip this step. The four tools then run on the installed runtime.
 
 ## 5. Hayabusa
 
@@ -138,7 +138,7 @@ Expand-Archive -Path $zip -DestinationPath 'C:\Tools\hayabusa-4.1.0' -Force
 Remove-Item $zip
 ```
 
-The zip holds Hayabusa's rules. Updating them with `hayabusa update-rules` needs network access, and that step is yours to run.
+The zip holds Hayabusa's rules. Updating them with `hayabusa update-rules` needs network access, and that step is yours to run. Once you have pinned the tools in [step 7](#7-check-the-setup), pin Hayabusa again after each rules update.
 
 A zip install's rules folder isn't a Git checkout, so from case format 4 Glessner names the rule set of each Hayabusa run `Hayabusa rules` plus the first 8 hex digits of the rules folder's SHA-256, such as `Hayabusa rules a1b2c3d4`. A rules folder that is a Git checkout is named by the first 7 digits of its commit and the first 8 of the folder's SHA-256, such as `Hayabusa rules fffbdd1, files 7c30c465`. A file you edit, add, or remove in the rules folder, `rules\config` included, changes the 8 digits, so an edited checkout reads differently from an unedited one at the same commit. Each run also records the SHA-256 of the `rules` and `config` folders.
 
@@ -205,32 +205,41 @@ Each installed tool shows its version and the executable Glessner found. With ev
 
 ```text
 Tools folder: C:\Tools
-  AmcacheParser 2026.5.0   C:\Tools\EZTools\AmcacheParser\AmcacheParser.exe
-  Windows event XML 0.1.0      C:\Glessner\.venv\Scripts\python.exe
-  EvtxECmd   2026.5.0   C:\Tools\EZTools\EvtxECmd\EvtxeCmd\EvtxECmd.exe
-  Hayabusa   4.1.0      C:\Tools\hayabusa-4.1.0\hayabusa-4.1.0-win-x64.exe
-  JLECmd     2026.5.0   C:\Tools\EZTools\JLECmd\JLECmd.exe
-  LECmd      2026.5.0   C:\Tools\EZTools\LECmd\LECmd.exe
-  MFTECmd    2026.5.0   C:\Tools\EZTools\MFTECmd\MFTECmd.exe
-  MFTECmd ($J) 2026.5.0   C:\Tools\EZTools\MFTECmd\MFTECmd.exe
-  PECmd      2026.5.0   C:\Tools\EZTools\PECmd\PECmd.exe
-  RBCmd      2026.5.0   C:\Tools\EZTools\RBCmd\RBCmd.exe
-  RECmd      2026.5.0   C:\Tools\EZTools\RECmd\RECmd\RECmd.exe
-  SBECmd     2026.5.0   C:\Tools\EZTools\SBECmd\SBECmd.exe
-  SQLECmd    2026.5.0   C:\Tools\EZTools\SQLECmd\SQLECmd\SQLECmd.exe
-  SrumECmd   2026.5.0   C:\Tools\EZTools\SrumECmd\SrumECmd.exe
-  Suricata   8.0.7      C:\Tools\suricata-8.0.7\PFiles\Suricata\suricata.exe
-  WxTCmd     2026.5.0   C:\Tools\EZTools\WxTCmd\WxTCmd.exe
+  AmcacheParser 2026.10.1  C:\Tools\EZTools\AmcacheParser\AmcacheParser.exe  Not pinned
+  Windows event XML 0.3.0      C:\Glessner\.venv\Scripts\python.exe
+  EvtxECmd   2026.10.2  C:\Tools\EZTools\EvtxECmd\EvtxeCmd\EvtxECmd.exe  Not pinned
+  Hayabusa   4.1.0      C:\Tools\hayabusa-4.1.0\hayabusa-4.1.0-win-x64.exe  Not pinned
+  JLECmd     2026.10.5  C:\Tools\EZTools\JLECmd\JLECmd.exe  Not pinned
+  LECmd      2026.10.3  C:\Tools\EZTools\LECmd\LECmd.exe  Not pinned
+  MFTECmd    2026.10.6  C:\Tools\EZTools\MFTECmd\MFTECmd.exe  Not pinned
+  MFTECmd ($J) 2026.10.6  C:\Tools\EZTools\MFTECmd\MFTECmd.exe  Not pinned
+  PECmd      2026.10.3  C:\Tools\EZTools\PECmd\PECmd.exe  Not pinned
+  RBCmd      2026.10.1  C:\Tools\EZTools\RBCmd\RBCmd.exe  Not pinned
+  RECmd      2026.10.2  C:\Tools\EZTools\RECmd\RECmd\RECmd.exe  Not pinned
+  SBECmd     2026.10.2  C:\Tools\EZTools\SBECmd\SBECmd.exe  Not pinned
+  SQLECmd    2026.10.3  C:\Tools\EZTools\SQLECmd\SQLECmd\SQLECmd.exe  Not pinned
+  SrumECmd   2026.10.1  C:\Tools\EZTools\SrumECmd\SrumECmd.exe  Not pinned
+  Suricata   8.0.7      C:\Tools\suricata-8.0.7\PFiles\Suricata\suricata.exe  Not pinned
+  WxTCmd     2026.10.1  C:\Tools\EZTools\WxTCmd\WxTCmd.exe  Not pinned
+Tools manifest C:\Tools\tools_manifest.json: 0 of 15 tools match their pins, 15 are not pinned.
 ```
 
-Windows event XML is Glessner's own reader, so it shows the app's version, with the commit added in a Git clone. A tool that shows `unknown` was found but didn't report its version:
+Windows event XML is Glessner's own reader, so it shows the app's version, with the commit added in a Git clone. A tool that shows `unknown` was found but didn't report its version. When Glessner can tell what the tool lacks, its line adds `Can't run here:` and what it needs. The table gives the usual causes:
 
 | Tool | What `unknown` means |
 |---|---|
-| RBCmd, SQLECmd, WxTCmd | No .NET 9 runtime was found. Repeat step 4, and check that `C:\Tools\dotnet-9\dotnet.exe` exists |
-| Suricata | Npcap isn't installed. Install it as step 6 describes |
+| AmcacheParser, RBCmd, SQLECmd, WxTCmd | No .NET 10 runtime was found, and the line adds `Can't run here:`. Repeat step 4, and check that `C:\Tools\dotnet-10\dotnet.exe` exists. RBCmd, SQLECmd, and WxTCmd from an earlier setup are .NET 9 builds, which a .NET 10 runtime doesn't start. They show `unknown` without that addition, so repeat step 3 as well |
+| Suricata | Npcap isn't installed, and the line adds `Can't run here:`. Install it as step 6 describes |
 
 A tool that shows `not found` isn't in the tools folder or on the PATH. The **Tools** page, in the case's **Case** menu, shows the same list, and names the runtime each .NET tool runs on.
+
+Pin the tools while the check case exists. A pin records the SHA-256 of each tool's own files in `C:\Tools\tools_manifest.json`, so each later run can say whether its tool's files are the ones you pinned. Pin after the signature checks in steps 3 and 6:
+
+```powershell
+uv run glessner tools C:\Cases\SETUPCHECK --pin
+```
+
+The command names the tools it will pin and the manifest, and asks `Pin? [y/N]`. Answer `y`. A pin records what is in the folder. It doesn't check where the files came from. `glessner tools C:\Cases\SETUPCHECK` now ends each tool's line with `Matches pin`, and the Tools page shows the same badge. The pins stay in the tools folder when you delete the check case. After `hayabusa update-rules` or a tool update, pin that tool again by its ID, as in `uv run glessner tools CASE --pin hayabusa`, or with **Pin again** on the Tools page, which appears after **Scan again** shows that the files differ. A run whose tool's files differ from the pin still runs, and it records and warns that they differ.
 
 When the list is right, delete `C:\Cases\SETUPCHECK` and `C:\Evidence\SETUPCHECK`.
 

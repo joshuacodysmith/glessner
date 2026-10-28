@@ -13,12 +13,14 @@ from test_splits import lab_case, split
 from glessner import cli, imports, server
 from glessner import intake as intake_module
 from glessner.audit import markdown
-from glessner.events import Event, load
+from glessner.events import Event, load, to_us
 from glessner.export import _md
 from glessner.heads import forget
+from glessner.identity import HostIdentity
 from glessner.intake import add_new, intake, verify
 from glessner.journal import SYSTEM, entries, replay
-from glessner.overview import _last_action
+from glessner.overview import _clock_text, _last_action
+from glessner.parsers.autoruns import BUILT
 from glessner.queries import investigate
 from glessner.runner import RUN_FILE, RunRecord, _write_record
 from glessner.server import (
@@ -832,3 +834,343 @@ def test_what_the_case_holds_shows_a_split_host_s_skipped_rows_once_on_its_first
         assert skipped_by_host(app) == {"DC1": 7, "LAB": 0, "MSEDGEWIN10": 0, "PC01": 0}
     finally:
         app.con.close()
+
+
+DAY = 86_400 * SEC
+LOW = to_us("1990-01-01T00:00:00Z")
+NEWEST = to_us("2026-10-16T01:00:05Z")   # run_record's finish
+HIGH = NEWEST + DAY                       # the latest time a host's span takes when that run is the newest
+STRAY = to_us("3320-11-16T08:35:52Z")
+LOG = {"DC01": DC_LOG, "DESKTOP": WS_LOG}
+RUN = "20261016T010000Z_evtxecmd_DC01"
+
+
+def timed(case, host, times, run="r20"):
+    """One event log event of the host at each time in `times`, loaded as a run of its own."""
+    events = [logon(ts, 500 + n, LOG.get(host, f"{host}/Security.evtx")) for n, ts in enumerate(times)]
+    load(case.db_path, events, host=host, tool="evtxecmd", tool_version="t", run_id=run, replaces_sources=[],
+         staging_dir=case.folder)
+
+
+def link_times(case, host, times, run):
+    """Autoruns PE link times, which say when an image was built and set no span, one event at each time."""
+    events = [Event(ts_us=ts, ts_desc=BUILT, artifact="autoruns", source_file=f"{host}/autoruns.csv", source_record=str(n),
+                    message=f"image {n}") for n, ts in enumerate(times)]
+    load(case.db_path, events, host=host, tool="autoruns", tool_version="t", run_id=run, replaces_sources=[],
+         staging_dir=case.folder)
+
+
+def rule_hit(case, host, ts, run):
+    """A Hayabusa hit on the host at `ts`. Its rows are counted apart from the host's events and set no span."""
+    load(case.db_path, [hit("900", "Time stomping", "medium", LOG[host], ts)], host=host, tool="hayabusa", tool_version="t",
+         run_id=run, replaces_sources=[], staging_dir=case.folder)
+
+
+def spans(app):
+    """Each host's first and last time, and the note on the events outside them, as the overview gives them."""
+    return {h["host"]: (h["first"], h["last"], h["outside"]) for h in api_overview(app, {})["hosts"]}
+
+
+def test_a_host_s_span_leaves_out_a_time_beyond_a_day_past_the_newest_run_and_names_it(synthetic_case):
+    """A file whose $FN time is dated 3320 does not set the host's last time. The span takes the host's other events,
+    the note counts the one outside with its time, and the host's event count includes it. A Hayabusa hit on that event
+    is not a second event outside."""
+    timed(synthetic_case, "DC01", [STRAY])
+    rule_hit(synthetic_case, "DC01", STRAY, "r25")
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 6)
+    app = App(synthetic_case)
+    try:
+        found = spans(app)
+        assert found["DC01"] == (T0 - 3600 * SEC, T0 + 63 * SEC, {"count": 1, "first": STRAY, "last": STRAY})
+        assert found["DESKTOP"][2] is None
+        assert {h["host"]: h["events"] for h in api_overview(app, {})["hosts"]}["DC01"] == 8
+    finally:
+        app.con.close()
+
+
+def test_the_events_outside_the_span_are_counted_with_the_first_and_last_of_their_times(synthetic_case):
+    """Times before 1990, which are file times among the activity, and times past the newest run are outside together,
+    and the note gives how many with the earliest and the latest."""
+    early, late = to_us("1980-01-01T00:00:00Z"), to_us("2099-01-01T00:00:00Z")
+    timed(synthetic_case, "DESKTOP", [STRAY, early, late, early + 5 * SEC])
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 9)
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DESKTOP"] == (T0 - 3600 * SEC, T0 + 910 * SEC, {"count": 4, "first": early, "last": STRAY})
+    finally:
+        app.con.close()
+
+
+def test_the_bound_takes_its_edges_and_the_host_s_offset(synthetic_case):
+    """Both ends of the bound are inside it: 1990-01-01 00:00:00 and one day after the newest run, as the host's clock
+    shows them, which is the recorded time plus its offset. A microsecond past either end is outside."""
+    timed(synthetic_case, "DC01", [LOW - 1, LOW, HIGH, HIGH + 1])
+    timed(synthetic_case, "DESKTOP", [HIGH - 3600 * SEC, HIGH - 3600 * SEC + 1], run="r21")
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 9)
+    app = App(synthetic_case)
+    try:
+        api_host(app, {"host": "DESKTOP", "offset_seconds": 3600})
+        found = spans(app)
+        assert found["DC01"] == (LOW, HIGH, {"count": 2, "first": LOW - 1, "last": HIGH + 1})
+        assert found["DESKTOP"][1:] == (HIGH, {"count": 1, "first": HIGH + 1, "last": HIGH + 1})
+    finally:
+        app.con.close()
+
+
+def test_a_run_with_no_finish_bounds_the_span_by_its_start(synthetic_case):
+    """The newest run is by its finish, or by its start when it has none, as a run still going has not."""
+    started = to_us("2026-10-16T01:00:00Z")
+    timed(synthetic_case, "DC01", [started + DAY, started + DAY + 1])
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 6)
+    rewrite_record(synthetic_case, RUN, finished_utc="")
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DC01"][1:] == (started + DAY, {"count": 1, "first": started + DAY + 1, "last": started + DAY + 1})
+    finally:
+        app.con.close()
+
+
+def test_a_run_s_finish_outranks_its_start_in_finding_the_newest_run(synthetic_case):
+    """A run that started earlier and finished later is the newest, and a run with no finish does not make an earlier
+    start the newest."""
+    after = to_us("2026-10-19T00:00:00Z")   # the finish of 2026-10-18, and one day
+    timed(synthetic_case, "DC01", [after, after + 1])
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 6)
+    rewrite_record(synthetic_case, RUN, finished_utc="")
+    run_record(synthetic_case, "20261014T000000Z_evtxecmd_DESKTOP", "evtxecmd", "DESKTOP", "ok", 1)
+    rewrite_record(synthetic_case, "20261014T000000Z_evtxecmd_DESKTOP", started_utc="2026-10-14T00:00:00Z",
+                   finished_utc="2026-10-18T00:00:00Z")
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DC01"][1:] == (after, {"count": 1, "first": after + 1, "last": after + 1})
+    finally:
+        app.con.close()
+
+
+def test_a_time_before_the_newest_run_stays_in_the_span_though_it_follows_the_case_s_creation(synthetic_case):
+    """Evidence can be added to a case for as long as it is worked, so a time after the case was created is no stray:
+    only the newest run bounds the span."""
+    later = to_us(synthetic_case.settings.created_utc) + 400 * DAY
+    timed(synthetic_case, "DC01", [later])
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 6)
+    rewrite_record(synthetic_case, RUN, finished_utc="2099-06-01T00:00:00Z")
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DC01"][1:] == (later, None)
+    finally:
+        app.con.close()
+
+
+def test_a_case_with_no_run_has_no_upper_bound_but_keeps_the_lower_one(synthetic_case):
+    """Without a run record nothing says when the evidence was read, so a time in 3320 stays in the span; the lower
+    bound needs no run."""
+    early = to_us("1980-01-01T00:00:00Z")
+    timed(synthetic_case, "DC01", [STRAY, early])
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DC01"] == (T0 - 3600 * SEC, STRAY, {"count": 1, "first": early, "last": early})
+    finally:
+        app.con.close()
+
+
+def test_a_link_time_sets_no_span_and_counts_as_no_stray_unless_the_host_holds_nothing_else(synthetic_case):
+    """Windows 10 hashes the PE link times of its own binaries into 1902 to 2037, so on a host with other events they
+    are in neither the span nor the count outside, whether or not the host has an event outside the bound of its own.
+    A host with nothing else takes its span from them, with the same bound."""
+    in_2085 = to_us("2085-05-05T00:00:00Z")
+    timed(synthetic_case, "DC01", [STRAY], "r24")
+    link_times(synthetic_case, "DC01", [in_2085, to_us("1975-01-01T00:00:00Z")], "r22")
+    link_times(synthetic_case, "BUILDS", [to_us("2010-03-01T00:00:00Z"), to_us("2012-04-02T00:00:00Z"), in_2085], "r23")
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 5)
+    app = App(synthetic_case)
+    try:
+        found = spans(app)
+        assert found["DC01"] == (T0 - 3600 * SEC, T0 + 63 * SEC, {"count": 1, "first": STRAY, "last": STRAY})
+        assert found["BUILDS"] == (to_us("2010-03-01T00:00:00Z"), to_us("2012-04-02T00:00:00Z"),
+                                   {"count": 1, "first": in_2085, "last": in_2085})
+    finally:
+        app.con.close()
+
+
+def test_a_link_time_inside_the_bound_stays_out_of_a_host_s_span(synthetic_case):
+    """Most PE link times fall between 1990 and the newest run. One before the host's first event and one after its
+    last, both inside the bound, leave its span, and its note, as its other events give them."""
+    link_times(synthetic_case, "DC01", [to_us("2010-03-01T00:00:00Z"), to_us("2023-01-01T00:00:00Z")], "r22")
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 5)
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["DC01"] == (T0 - 3600 * SEC, T0 + 63 * SEC, None)
+    finally:
+        app.con.close()
+
+
+def test_a_host_with_nothing_inside_the_bound_keeps_the_span_of_all_its_events(synthetic_case):
+    """With no event inside the bound there is no rest for the others to lie outside of, so the host reads from its
+    first to its last time, with no note."""
+    timed(synthetic_case, "WS9", [STRAY, STRAY + 5 * SEC], run="r24")
+    run_record(synthetic_case, RUN, "evtxecmd", "DC01", "ok", 6)
+    app = App(synthetic_case)
+    try:
+        assert spans(app)["WS9"] == (STRAY, STRAY + 5 * SEC, None)
+    finally:
+        app.con.close()
+
+
+def test_the_overview_words_each_clock_state_from_the_shared_words_with_the_offset_where_it_has_one():
+    """The Hosts table's clock cell gives each state in the clock check's words: the offset follows an aligned host in
+    parentheses and a host not measured after a semicolon, and a reference lane has no offset in it."""
+    def text(state, offset=0.0, host="DC01", **clock):
+        ident = HostIdentity(host=host, role="Servers", role_source="guess", offset_seconds=offset)
+        return _clock_text(ident, {"state": state, "reference": "network", **clock})
+
+    assert text("suggest", skew_seconds=-3599.5, skew_text="59 m 59.5 s") == {
+        "state": "suggest", "text": "59 m 59.5 s behind the capture, not aligned", "flag": True, "reason": ""}
+    assert text("suggest", 2, skew_seconds=3599.5, skew_text="59 m 59.5 s")["text"] == (
+        "59 m 59.5 s ahead of the capture, not aligned")
+    assert text("agrees")["text"] == "matches the capture"
+    assert text("agrees", -3599.5)["text"] == "aligned to the capture (-3,599.5 s)"
+    assert text("disagree", 5)["text"] == "pairs with the capture disagree" and text("disagree")["flag"]
+    assert text("none")["text"] == "not measured" and text("none", 90)["text"] == "not measured; offset +90 s"
+    assert _clock_text(None, {}) == {"state": "none", "text": "not measured", "flag": False, "reason": ""}
+    assert text("none", 90, host="network", reference="network")["text"] == "the reference clock"
+    assert text("none", host="network", reference="network")["flag"] is False
+
+
+RLO = "\u202e"   # right-to-left override
+ODD_TOOL = f"evil|*_{RLO}tool"   # a tool ID in a run.json that holds a pipe, Markdown characters, and a bidi control
+CHECK_WHERE = ("The Tools page shows the check of each tool's latest successful run. "
+               "Each run's record names up to 20 of the paths that differed.")
+
+
+def recorded_checks(root):
+    """The tool_check that check_tool writes for each result a run can record, from a fake tools folder under `root`: a
+    tool's files against its pin before and after a change, a tool the manifest lacks, a folder with no manifest, and a
+    folder whose manifest is not JSON. The keys are the result words."""
+    from test_tools_manifest import checked, evtx, hayabusa, pinned
+
+    tool = evtx(root)
+    pinned(root, tool)
+    matches = checked(root, tool)
+    tool.executable.write_bytes(b"MZ changed")
+    bare, broken = root / "bare", root / "broken"
+    bare.mkdir()
+    broken.mkdir()
+    (broken / "tools_manifest.json").write_text("{not json", encoding="utf-8")
+    return {"matches": matches, "differs": checked(root, tool), "not pinned": checked(root, hayabusa(root)),
+            "no manifest": checked(root, tool, bare), "unreadable": checked(root, tool, broken)}
+
+
+def tool_check_line(case):
+    """The overview's Integrity line about runs whose tools differed from their pins, from a new app on the case."""
+    app = App(case)
+    try:
+        return api_overview(app, {})["integrity"]["tool_check"]
+    finally:
+        app.con.close()
+
+
+def test_the_fake_tools_folder_records_each_result_word_check_tool_writes(tmp_path):
+    """The records the tool check tests use are check_tool's own output, so a result word it changes shows here."""
+    checks = recorded_checks(tmp_path / "fake_tools")
+    assert {word: check["result"] for word, check in checks.items()} == {word: word for word in checks}
+    assert list(checks) == ["matches", "differs", "not pinned", "no manifest", "unreadable"]
+    assert [f["path"] for f in checks["differs"]["files"]] == ["EvtxECmd.exe"]
+
+
+def test_the_integrity_section_has_no_tool_check_line_unless_a_run_recorded_a_difference(synthetic_case, tmp_path):
+    """No run records, a run made before the check (tool_check null), and runs whose check matched, found no pin, found no
+    manifest, or couldn't read it give no line. Only the result differs counts."""
+    checks = recorded_checks(tmp_path / "fake_tools")
+    assert tool_check_line(synthetic_case) is None
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["matches"])
+    run_record(synthetic_case, "r2", "evtxecmd", "DESKTOP", "ok", 5, tool_check=checks["not pinned"])
+    run_record(synthetic_case, "r3", "recmd", "DC01", "ok", 1, tool_check=checks["no manifest"])
+    run_record(synthetic_case, "r4", "recmd", "DESKTOP", "ok", 1, tool_check=checks["unreadable"])
+    run_record(synthetic_case, "r5", "hayabusa", "DC01", "ok", 1)
+    assert tool_check_line(synthetic_case) is None
+
+
+def test_the_integrity_section_counts_one_differing_run_and_names_its_tool(synthetic_case, tmp_path):
+    """One run whose check differs gives the line, with the run in the singular, the tool by its registry name, and the
+    sentence that says where the checks are shown."""
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["differs"])
+    run_record(synthetic_case, "r2", "evtxecmd", "DESKTOP", "ok", 5, tool_check=checks["matches"])
+    assert tool_check_line(synthetic_case) == {
+        "runs": 1, "tools": ["EvtxECmd"],
+        "text": f"1 run used tool files that differed from the pin: EvtxECmd. {CHECK_WHERE}"}
+
+
+def test_the_integrity_section_counts_every_differing_run_and_names_each_tool_once(synthetic_case, tmp_path):
+    """A later run that matched doesn't erase an earlier run's difference, and each tool is named once however many of its
+    runs differed. Five runs of three tools: EvtxECmd's earlier run differed and its newer one matched, and RECmd's two
+    runs and Hayabusa's one differed, so four count."""
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["differs"])
+    run_record(synthetic_case, "r2", "evtxecmd", "DC01", "ok", 5, tool_check=checks["matches"])
+    rewrite_record(synthetic_case, "r2", started_utc="2026-10-17T01:00:00Z", finished_utc="2026-10-17T01:00:05Z")
+    run_record(synthetic_case, "r3", "recmd", "DC01", "ok", 1, tool_check=checks["differs"])
+    run_record(synthetic_case, "r4", "recmd", "DESKTOP", "ok", 1, tool_check=checks["differs"])
+    run_record(synthetic_case, "r5", "hayabusa", "DC01", "ok", 1, tool_check=checks["differs"])
+    assert tool_check_line(synthetic_case) == {
+        "runs": 4, "tools": ["EvtxECmd", "Hayabusa", "RECmd"],
+        "text": f"4 runs used tool files that differed from the pin: EvtxECmd, Hayabusa, and RECmd. {CHECK_WHERE}"}
+
+
+def test_the_integrity_section_counts_a_differing_run_the_tools_page_no_longer_shows(synthetic_case, tmp_path):
+    """A run differs, the tool is pinned again, and a rerun on the same host matches. The Tools page shows the check of
+    each tool's latest successful run, here the rerun's match, so the line counts the first run from its record and says
+    where the page's check and the run's record each stand."""
+    from glessner.toolbox import overview
+    from glessner.tools import load_registry
+
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["differs"])
+    run_record(synthetic_case, "r9", "evtxecmd", "DC01", "ok", 5, tool_check=checks["matches"])
+    rewrite_record(synthetic_case, "r9", started_utc="2026-10-17T01:00:00Z", finished_utc="2026-10-17T01:00:05Z")
+    (evtxecmd,) = [t for t in overview(synthetic_case, load_registry(), {})["tools"] if t["id"] == "evtxecmd"]
+    assert evtxecmd["last_run"]["latest"]["run_id"] == "r9"
+    assert evtxecmd["last_run"]["latest"]["text"] == "tool check matches"
+    assert tool_check_line(synthetic_case) == {
+        "runs": 1, "tools": ["EvtxECmd"],
+        "text": f"1 run used tool files that differed from the pin: EvtxECmd. {CHECK_WHERE}"}
+
+
+def test_the_integrity_section_counts_a_differing_run_that_failed_after_a_matching_one(synthetic_case, tmp_path):
+    """A tool file goes missing, so the tool's newer run records differs and fails. The Tools page shows the check of the
+    latest successful run, the earlier match, and lists the failed run under its gaps without a check, so the line counts
+    the failed run from its record and its pointer says the page shows the latest successful run's check."""
+    from glessner.toolbox import overview
+    from glessner.tools import load_registry
+
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["matches"])
+    run_record(synthetic_case, "r9", "evtxecmd", "DC01", "failed", 0, reason="exit code 1", tool_check=checks["differs"])
+    rewrite_record(synthetic_case, "r9", started_utc="2026-10-17T01:00:00Z", finished_utc="2026-10-17T01:00:05Z")
+    page = overview(synthetic_case, load_registry(), {})
+    (evtxecmd,) = [t for t in page["tools"] if t["id"] == "evtxecmd"]
+    assert evtxecmd["last_run"]["latest"]["run_id"] == "r1"
+    assert evtxecmd["last_run"]["latest"]["text"] == "tool check matches"
+    assert [(gap["run_id"], gap["status"]) for gap in page["gaps"]] == [("r9", "failed")]
+    assert "tool_check" not in page["gaps"][0]
+    assert tool_check_line(synthetic_case) == {
+        "runs": 1, "tools": ["EvtxECmd"],
+        "text": f"1 run used tool files that differed from the pin: EvtxECmd. {CHECK_WHERE}"}
+
+
+def test_the_integrity_section_names_two_tools_with_and(synthetic_case, tmp_path):
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", "evtxecmd", "DC01", "ok", 5, tool_check=checks["differs"])
+    run_record(synthetic_case, "r3", "recmd", "DC01", "ok", 1, tool_check=checks["differs"])
+    assert tool_check_line(synthetic_case)["text"] == (
+        f"2 runs used tool files that differed from the pin: EvtxECmd and RECmd. {CHECK_WHERE}")
+
+
+def test_the_integrity_section_names_a_tool_the_registry_lacks_by_its_id_as_recorded(synthetic_case, tmp_path):
+    """The overview holds the name as the record has it. The page draws it through el, which shows a bidi control as
+    [U+XXXX] (test_browser_overview_tool_check.py)."""
+    checks = recorded_checks(tmp_path / "fake_tools")
+    run_record(synthetic_case, "r1", ODD_TOOL, "DC01", "ok", 5, tool_check=checks["differs"])
+    assert tool_check_line(synthetic_case) == {
+        "runs": 1, "tools": [ODD_TOOL],
+        "text": f"1 run used tool files that differed from the pin: {ODD_TOOL}. {CHECK_WHERE}"}

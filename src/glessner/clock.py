@@ -257,6 +257,26 @@ def alignment(hosts: list[HostIdentity]) -> str:
     return "recorded" if not any(h.offset_seconds for h in deciding) else "neither"
 
 
+NOT_MEASURED = "not measured"
+
+
+def state_words(result: dict, host: str, applied: bool) -> str:
+    """The clock check's state for `host` in a few words, without the offset: how the Overview's Hosts table words it,
+    and the report's Clock offset column for every state but a suggestion, which the report words with the seconds
+    suggested. `result` is the host's `clock` (_result), empty for a host not checked yet, and `applied` whether the host
+    has an offset applied. A host that agrees reads aligned with an offset and matching without one. A sensor lane, which
+    the check measures against itself, is the reference clock. Any other host with no state is not measured."""
+    state = result.get("state")
+    if state == "suggest":
+        direction = "behind" if result["skew_seconds"] < 0 else "ahead of"
+        return f"{result['skew_text']} {direction} the capture, not aligned"
+    if state == "agrees":
+        return "aligned to the capture" if applied else "matches the capture"
+    if state == "disagree":
+        return "pairs with the capture disagree"
+    return "the reference clock" if result.get("reference") == host else NOT_MEASURED
+
+
 def sensor_lanes(con: duckdb.DuckDBPyConnection) -> list[str]:
     """Lanes whose events all come from a packet sensor, as analysis.role_evidence finds the network devices."""
     artifacts = ", ".join(sql_literal(a) for a in SENSOR_ARTIFACTS)

@@ -189,11 +189,11 @@ export function clockNote(ev) {
 }
 
 // The controls that take the focus back after a re-render: a host's offset in the Hosts panel, and the Event page's
-// first clock button (Show the pair), or else its clock note, or the header's chip that holds the note once aligning
-// folded it.
+// first clock button (Show the pair), or else its clock note, or the header's time or chip that holds the note once
+// aligning folded it.
 const hostOffsetInput = (host) => $('hostsTable').querySelector(`tr[data-host="${CSS.escape(host)}"] input[type=number]`);
 const eventClockControl = () => $('details').querySelector('.ev-clock button') || $('details').querySelector('.ev-clock')
-  || $('details').querySelector('.ev-ident [data-clock]');
+  || $('details').querySelector('.ev-ident [data-clock], .ev-sum [data-clock]');
 
 // ---------- the link from the focused event to its pair, drawn by draw.js's drawPairLink ----------
 

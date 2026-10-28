@@ -517,7 +517,7 @@ const pill = (label) => el('span', { class: `status ${label.toLowerCase()}` }, l
 export function verdictZone(ev, uid, n, chosen = null) {
   const several = n > 1;
   const label = ev.mark.label;
-  // The placeholder is the box's only label and the box is 180 px, so it is short; the long wording is in the title.
+  // The placeholder is the box's only label and the box is 120 px, so it is short; the long wording is in the title.
   const noteFor = several ? `Note for marking ${n} events (optional)` : 'Note for this mark (optional)';
   const note = el('input', { type: 'text', class: 'mark-note', placeholder: 'Note (optional)', title: noteFor,
                              'aria-label': noteFor });
@@ -655,7 +655,8 @@ export async function loadDetails(uid, ts = null) {
   setPairLink(uid, ev);   // the dashed link to its pair, when the clock check paired it with the capture
 
   // The header: two rows over the two columns, and a third only when it has something to say. Row 1 is the
-  // identity, with the verdict and its one decision beside it; row 2 is the summary, with the other marks beside it.
+  // identity (the badge, the time, the host, and the kind), with the verdict and its one decision beside it; row 2 is the
+  // host's clock chip, when the host has an offset, then the summary, with the other marks beside it.
   // Its left edge takes the color of the current mark. The time's hover has the recorded time and the host's own clock.
   const offsetS = ev.offset_us / 1e6;
   const offsetText = `${offsetS > 0 ? '+' : ''}${offsetS} s`;
@@ -670,21 +671,22 @@ export async function loadDetails(uid, ts = null) {
   const timeTitle = [folded && !offsetS ? clockHover(ev) : '', offsetS ? `Recorded ${fmtUs(ev.ts_us)} UTC` : '',
                      hostClock ? hostLocalText(ev) : ''].filter(Boolean).join('\n');
   const chip = !offsetS ? null
-    : hostClock ? el('span', { class: 'chip', title: `${folded ? `${clockHover(ev)}\n` : ''}Recorded ${fmtUs(ev.ts_us)} UTC`, ...holds },
+    : hostClock ? el('span', { class: 'chip clock-chip', title: `${folded ? `${clockHover(ev)}\n` : ''}Recorded ${fmtUs(ev.ts_us)} UTC`,
+                               ...holds },
                      `${folded ? 'Aligned' : 'Clock adjusted'} ${offsetText}`)
-    : el('span', { class: 'chip', title: `Recorded ${fmtUs(ev.ts_us)} UTC\nThe offset set for ${ev.host} moves every time on ` +
-                                         `${ev.host}, this one too, though ${ev.host}'s clock didn't write it.` },
+    : el('span', { class: 'chip clock-chip', title: `Recorded ${fmtUs(ev.ts_us)} UTC\nThe offset set for ${ev.host} moves every ` +
+                                                    `time on ${ev.host}, this one too, though ${ev.host}'s clock didn't write it.` },
          `Host offset ${offsetText}`);
   // The identity line starts with the badge, whose hover says who marked the event and when
   const ident = el('div', { class: 'ev-ident' }, eventBadge(ev),
     el('span', { class: 'time', ...(timeTitle ? { title: timeTitle } : {}), ...(offsetS ? {} : holds) },
        ev.adjusted_ts_us == null ? 'No time' : `${fmtUs(ev.adjusted_ts_us)} UTC`),
     el('span', { class: 'host' }, ev.host),
-    ...(chip ? [chip] : []),
     el('span', { class: 'kind', title: kind }, kind));
   const hits = hitChips(ev.hits);
   const summary = eventSummary(ev).join(' · ');
-  const sum = el('div', { class: 'ev-sum' }, ...hits.lead,
+  // The clock chip is the summary row's first item, under the time it explains, so it takes no room from the kind
+  const sum = el('div', { class: 'ev-sum' }, ...(chip ? [chip] : []), ...hits.lead,
                  ...(summary ? [el('span', { class: 'ev-summary', title: summary }, summary)] : []));
   const verdict = verdictZone(ev, uid, n, chosen);
   const headMore = [

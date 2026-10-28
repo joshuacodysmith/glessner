@@ -2,7 +2,7 @@
 
 ## What this check is
 
-This is an open-answer check. The case was worked with its published answers at hand, so the check shows whether the evidence each answer rests on is present and readable in Glessner. It doesn't show that an analyst who doesn't know the answer would find it. Blind rounds do that, and none has run yet.
+This is an open-answer check. The case was worked with its published answers at hand, so the check shows whether the evidence each answer rests on is present and readable in Glessner. It doesn't show that an analyst who doesn't know the answer would find it. Blind rounds do that, and none has been finished yet.
 
 The check scored 25 items from the published answers. Its score is 19, 5, 0 of 24, plus 1 out of scope. Of the 24 items in scope, 19 are reached, 5 are partly reached, and none is missed. The recommendations item is out of scope. Two more questions aren't in the score: the domain users' passwords, which only memory holds, and the original contents of Beth's secret file, which the next full run of this check scores.
 
@@ -87,7 +87,7 @@ Item numbers are this page's own, in the order of the table. Gap numbers refer t
 
 The score is 19, 5, 0 of 24, plus 1 out of scope. Of the 24 items in scope, 19 were reached (1, 2, 4 to 13, 17, 18, and 20 to 24), 5 were partly reached (3, 14, 15, 16, and 19), and 0 were missed. Item 25, the recommendations, is out of scope and isn't counted. Item 5's move into spoolsv.exe shows only in memory, so that part of the item is out of scope, and the item is scored on the rest.
 
-The table gives each item's state on the build the check ran on, before any fix. No item has been scored again on a release. Since the fixes, item 7's C2 flows sit at the right times. Items 15 and 16 would stay partly reached. The transfers ride the encrypted C2 sessions, whose start times are now right, but nothing in the evidence names the files inside them.
+The table gives each item's state on the build the check ran on, before any fix. Since the fixes, item 7's C2 flows sit at the right times. Items 15 and 16 would stay partly reached. The transfers ride the encrypted C2 sessions, whose start times are now right, but nothing in the evidence names the files inside them.
 
 ### What the check showed
 
@@ -206,7 +206,7 @@ The case format upgrade in v0.2.0 doesn't recover them either. It changes IDs ke
 
 - The answers were known during the work. The check shows the evidence is present and readable, not that an analyst would find it without the answers.
 - The case was worked through the app's search and event queries, not by clicking through the page. How easily an analyst finds things in the page isn't measured.
-- The states come from a build that predates v0.1.0. Each fixed gap was checked on this case before v0.1.0, but no item has been scored again on a release.
+- The states come from a build that predates v0.1.0. Each fixed gap was checked on this case before v0.1.0. The page gives the first run's states.
 - It covers one case: two hosts and one capture from a public practice set. It includes no real incident and no real KAPE collection.
 - Answers that rest on memory are out of scope. File contents are in scope, but the original contents of Beth's secret file aren't among the 25 items scored here.
 - The step that unpacks the images into the evidence folder isn't part of this repository, so a reader can't yet rebuild the same folder from the published images.

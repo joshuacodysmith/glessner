@@ -28,9 +28,10 @@ from .journal import host_layout
 from .long_paths import long_path
 from .parsers import COUNTS_SKIPPED, LOCAL_TIME, PARSERS, ParseContext
 from .parsers.common import LOCAL_TIME_NOTE, SKIPPED_NOTE
-from .parsers.sbecmd import MESSAGES
+from .parsers.sbecmd import CONSOLE_LOG, MESSAGES
 from .timezones import ZoneError, fmt_offset, host_timezones, resolve_zone
-from .tools import DetectedTool, ToolSpec, load_registry, rules_file, rules_label, rules_version, tool_env, tool_files
+from .tools import DetectedTool, ToolSpec, load_registry, rules_file, rules_label, rules_version, tool_env, tool_listing
+from .tools_manifest import check_tool
 from .version import build_id
 
 RUN_FILE = "run.json"
@@ -100,17 +101,17 @@ class RunRecord:
     # same way after the zone changes; None when the host had none or the output needs none
     zone: dict | None = None
     # Case format 4's keys (FORMAT_4_KEYS), which a case below format 4 never fills. The SHA-256 of the files in the
-    # tool's folder that the run names (tools.tool_files): its executable and the .dll of the same name, what its
-    # arguments name there, its rules block's version file, and the files and folders its registry entry lists, by
-    # their paths there, a folder's with a trailing /. Other files the tool loads from its folder, such as further
-    # libraries, are left out. {} for a builtin tool, and None for an import, found output, or a run made before the case
-    # was at format 4
+    # tool's folder that the run names (tools.tool_files): its executable, each .dll beside it with its
+    # runtimeconfig.json and deps.json, what its arguments name there, its rules block's version file, and the files and
+    # folders its registry entry lists, by their paths there, a folder's with a trailing /. {} for a builtin tool, and
+    # None for an import, found output, or a run made before the case was at format 4
     tool_files: dict[str, str] | None = None
     # The rows or lines the parser made no event of, for a parser that counts them (parsers.COUNTS_SKIPPED); a rebuild
     # counts them for every run it loads
     rows_skipped: int | None = None
-    # A check of the tool's files against a list of their hashes: read and written back as it is, and filled by
-    # nothing in this build
+    # The check of those files against the tool's pin in the tools folder's manifest, made as the run starts
+    # (tools_manifest.check_tool); None where tool_files is None or {}. A rebuild, a reload, and the mark of an
+    # interrupted run write it back as it is
     tool_check: dict | None = None
 
 
@@ -373,13 +374,14 @@ def _paths(paths: list[str]) -> str:
 def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> RunRecord:
     """Run a tool on its plan's evidence, check its output and the evidence, load the output, and record it all in the
     run's folder. The evidence check covers the run's inputs and the files the tool reads beside them (read_beside). In
-    a case at format 4 the record holds the SHA-256 of the tool's files (tools.tool_files), with a note naming any link
-    in their folders that the hashes leave out, and the rule set as named when the run starts (tools.rules_label).
-    Refused before anything is made: RunError when the tool can't run here, would read none of its inputs, as its name
-    patterns select files (check_selected), has arguments that can't be filled, has a host folder that holds what
-    intake didn't hash, or a file that became a cloud placeholder after it (check_host_folder), would read a file that
-    became a cloud placeholder after intake (check_not_placeholders), or, in a case at format 4, has a file
-    tools.tool_files can't hash; CaseError for a run folder that can't be made safely (_new_run_folder)."""
+    a case at format 4 the record holds the SHA-256 of the tool's files (tools.tool_listing), with a note naming any link
+    in their folders that the hashes leave out, the check of those files against the tool's pin
+    (tools_manifest.check_tool, which never refuses a run), and the rule set as named when the run starts
+    (tools.rules_label). Refused before anything is made: RunError when the tool can't run here, would read none of its
+    inputs, as its name patterns select files (check_selected), has arguments that can't be filled, has a host folder
+    that holds what intake didn't hash, or a file that became a cloud placeholder after it (check_host_folder), would
+    read a file that became a cloud placeholder after intake (check_not_placeholders), or, in a case at format 4, has a
+    file tools.tool_listing can't hash; CaseError for a run folder that can't be made safely (_new_run_folder)."""
     spec = plan.tool.spec
     if plan.tool.missing:
         raise RunError(f"{spec.name} can't run here: {plan.tool.missing}.")
@@ -390,13 +392,17 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
     argv = build_argv(case, plan, output_dir, options or {}, copies_root)   # validate before creating anything
     check_host_folder(case, plan)
     check_not_placeholders(case, plan, evidence_read(case, plan))
-    hashes, links = None, []
+    hashes, links, tool_check = None, [], None
     if records_format_4(case):
         try:
-            hashes = tool_files(plan.tool, argv, links)
+            listing = tool_listing(plan.tool, argv, links)
         except OSError as exc:
             raise RunError(f"{spec.name} wasn't run on {plan.host}: one of its files that a run records by SHA-256 "
                            f"couldn't be hashed: {exc}") from exc
+        hashes = listing.hashes
+        if not spec.builtin:   # checked before the run's first write, so a run that is stopped keeps it
+            tools_folder = Path(case.settings.tools_folder) if case.settings.tools_folder else None
+            tool_check = check_tool(tools_folder, plan.tool, listing, links)
         # Named now rather than at detection, which the server keeps, so a rule set updated since is named as it runs
         rules = rules_label(spec, plan.tool.executable, hashes)
     else:
@@ -430,7 +436,7 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
                        inputs=[*plan.inputs, *related], notes=notes,
                        started_utc=_utc_now(), parser=spec.parser or "", dotnet_root=plan.tool.dotnet_root,
                        rules=rules, evidence_root=str(case.evidence), input_root=str(copies_root or ""),
-                       tool_files=hashes)
+                       tool_files=hashes, tool_check=tool_check)
     if copies_root is not None:
         try:
             record.working_copies = _make_copies(case, plan, copies_root)
@@ -833,26 +839,45 @@ LEFT_OUT = " left it out: "
 
 
 FOUND_OUTPUT = "found output"   # the tool version of a load of output found in the evidence; the CSV doesn't say
-# The files a parser reads beside a found output's inputs, by parser: SBECmd's messages file names each CSV's hive
-COMPANIONS = {"sbecmd_csv": (MESSAGES,)}
+# The files a parser reads beside a found output's inputs, by parser, as name patterns matched without regard to case:
+# SBECmd's messages file, or the console log of a 2026.10 build, names each CSV's hive
+COMPANIONS = {"sbecmd_csv": (MESSAGES, CONSOLE_LOG)}
 
 
 def companions(case: Case, record: RunRecord) -> tuple[list[str], list[str]]:
     """The files a load of found output reads beside its inputs (COMPANIONS): each one in an input's folder that the
-    manifest lists, and each that is on disk but not in the manifest (named as given), as two lists of evidence-relative
-    paths, sorted and without repeats. Both are empty for any other run."""
-    names = COMPANIONS.get(record.parser, ()) if record.from_output else ()
-    listed = {e.path.lower(): e.path for e in current_entries(case)} if names else {}
+    manifest lists, and each that is on disk but not in the manifest (named as the folder holds it), as two lists of
+    evidence-relative paths, sorted and without repeats. Both are empty for any other run."""
+    patterns = COMPANIONS.get(record.parser, ()) if record.from_output else ()
+    if not patterns:
+        return [], []
+    folders = {rel.rpartition("/")[0] for rel in record.inputs}
+    in_folders = {folder.lower() for folder in folders}
+    listed = {e.path.lower(): e.path for e in current_entries(case)}
+    found = {path for lower, path in listed.items()
+             if lower.rpartition("/")[0] in in_folders and _fits(lower.rpartition("/")[2], patterns)}
     base = long_path(case.evidence)
-    found, unlisted = set(), set()
-    for folder in {rel.rpartition("/")[0] for rel in record.inputs}:
-        for name in names:
+    unlisted = set()
+    for folder in folders:
+        for name in _names_fitting(long_path(base, folder), patterns):
             rel = f"{folder}/{name}" if folder else name
-            if rel.lower() in listed:
-                found.add(listed[rel.lower()])
-            elif long_path(base, rel).is_file():
+            if rel.lower() not in listed:
                 unlisted.add(rel)
     return sorted(found), sorted(unlisted)
+
+
+def _fits(name: str, patterns: tuple[str, ...]) -> bool:
+    """Whether a file name fits one of the name patterns, without regard to case."""
+    return any(fnmatch.fnmatchcase(name.lower(), pattern.lower()) for pattern in patterns)
+
+
+def _names_fitting(folder: Path, patterns: tuple[str, ...]) -> list[str]:
+    """The names of the files in a folder that fit one of the name patterns; none for a folder that can't be listed."""
+    try:
+        with os.scandir(folder) as entries:
+            return [entry.name for entry in entries if _fits(entry.name, patterns) and entry.is_file()]
+    except OSError:
+        return []
 
 
 NOT_CHECKED = "not checked"   # the evidence_check of a run refused before it read anything
@@ -988,14 +1013,17 @@ def _changed_copies(case: Case, root: Path, copies: list[str]) -> list[str]:
 
 def _check_outputs(spec: ToolSpec, output_dir: Path, record: RunRecord) -> None:
     """Note each expected output that is missing, and hash every file under the output folder, which a rebuild checks
-    the folder against (output_problems). The registry's patterns name only some of a tool's files, so most CSVs
-    that AmcacheParser, SrumECmd, and SBECmd write, which their parsers read, would have no hash. A file
-    that can't be read fails the run, as an expected output always has."""
+    the folder against (output_problems). An entry of the registry's outputs that is a group is missing when none of its
+    patterns matches, and is noted as the patterns joined by " or ". The patterns name only some of a tool's files, so
+    most CSVs that AmcacheParser, SrumECmd, and SBECmd write, which their parsers read, and the console log that 2026.10
+    builds write, are hashed though no pattern names them, apart from SBECmd's group, which a console log can meet. A
+    file that can't be read fails the run, as an expected output always has."""
     named = set()
-    for pattern in spec.outputs:
-        matches = sorted(output_dir.glob(pattern))
+    for entry in spec.outputs:
+        patterns = (entry,) if isinstance(entry, str) else entry
+        matches = sorted(path for pattern in patterns for path in output_dir.glob(pattern))
         if not matches:
-            record.missing_outputs.append(pattern)
+            record.missing_outputs.append(" or ".join(patterns))
         named.update(matches)
     for path in sorted(named | {p for p in output_dir.rglob("*") if p.is_file()}):
         rel = path.relative_to(output_dir).as_posix()

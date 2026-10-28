@@ -8,8 +8,9 @@ a stream change, such as a Zone.Identifier written on download; else the first r
 the reasons gathered since the file was opened.
 
 The folder comes from the $MFT given with -m, as MFTECmd resolves it, written like the $MFT parser's paths, such as
-\\Windows\\Prefetch\\X.pf. Without -m it's empty; a folder gone from the $MFT reads .\\PathUnknown\\Directory with ID ...
-The record's update sequence number identifies it within the journal.
+\\Windows\\Prefetch\\X.pf. Without -m it's empty. A folder gone from the $MFT read .\\PathUnknown\\Directory with ID ...
+before 2026.10; from 2026.10, MFTECmd can resolve such a folder from the journal's own records. The record's update
+sequence number identifies it within the journal.
 """
 
 from __future__ import annotations

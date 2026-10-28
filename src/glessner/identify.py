@@ -129,6 +129,8 @@ def identify_bytes(name: str, header: bytes) -> Identification:
         found = _text_log(lower, text)
         if found:
             return found
+    if CONSOLE_LOG.fullmatch(lower):
+        return Identification(None, "unidentified", CONSOLE_LOG_NOTE)
     return Identification(None, "unidentified", _name_hint(lower, header[:HEADER_BYTES]))
 
 
@@ -232,6 +234,10 @@ def _hive_type(lower_name: str) -> str:
     return HIVE_TYPES.get(lower_name, "unknown hive")
 
 
+# The log each of Eric Zimmerman's tools writes to its output folder from release 2026.10, named
+# <yyyyMMddHHmmss>_<Tool>_<version>_ConsoleLog.txt. SBECmd's parser reads its own to name each CSV's hive.
+CONSOLE_LOG = re.compile(r"\d{14}_\w+?_\d+(?:\.\d+)+_consolelog\.txt")
+CONSOLE_LOG_NOTE = "an Eric Zimmerman tool's console log; no events are loaded from it"
 NAME_HINTS = {".evtx": "evtx", ".pf": "prefetch", ".lnk": "lnk", ".automaticdestinations-ms": "jumplist",
               ".customdestinations-ms": "jumplist"}
 # Names worth reading again when an older intake left them unidentified (intake.current_entries).

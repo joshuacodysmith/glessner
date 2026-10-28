@@ -550,15 +550,15 @@ def test_the_hosts_panel_opens_with_the_details_band(browser, synthetic_case):  
 
 def test_an_aligned_hosts_plain_event_keeps_a_two_row_header(clock_page):  # noqa: F811
     """On a case aligned to its capture, nearly every event is on an aligned host, so the clock note must not draw a
-    third row. Its sentence is the hover of the row-1 chip, "Aligned -3599.5 s". An event with a pair in the capture
-    still draws the note, since it has Show the pair."""
+    third row. Its sentence is the hover of the chip that starts row 2, "Aligned -3599.5 s". An event with a pair in the
+    capture still draws the note, since it has Show the pair."""
     p = clock_page
     p.locator("#clockAligned").click()
     p.wait_for_selector("#clockAligned[aria-pressed='true']")
     plain = p.evaluate(PLAIN_DC01)
     assert plain, "no drawn 4624 on DC01"
     select(p, plain)
-    chip = p.locator("#details .ev-ident .chip")
+    chip = p.locator("#details .ev-sum .clock-chip")
     assert chip.inner_text() == "Aligned -3599.5 s"
     assert "Times here are aligned to the capture." in chip.get_attribute("title")
     assert "DC01's clock ran 59 m 59.5 s ahead of the capture (10 of 10 pairs agree)." in chip.get_attribute("title")
@@ -609,23 +609,25 @@ def test_aligning_a_plain_event_keeps_the_focus_on_its_clock(clock_page):  # noq
     select(p, p.evaluate(PLAIN_DC01))
     p.locator("#details .ev-clock").get_by_role("button", name="Align DC01 to the capture").focus()
     p.keyboard.press("Enter")
-    p.locator("#details .ev-ident .chip", has_text="Aligned -3599.5 s").wait_for()
+    p.locator("#details .ev-sum .clock-chip", has_text="Aligned -3599.5 s").wait_for()
     p.wait_for_selector("#clockSwitch button[aria-disabled]", state="detached")
     assert p.locator("#details .ev-clock").count() == 0
-    p.wait_for_function("() => document.activeElement.matches('#details .ev-ident .chip')")
+    p.wait_for_function("() => document.activeElement.matches('#details .ev-sum .clock-chip')")
 
 
 def test_the_kind_gives_way_with_an_ellipsis(clock_page):  # noqa: F811
-    """Where row 1 is short of room, the event's kind is cut inside its row with an ellipsis. A minimum width on the kind
-    would cut it at the row's edge with no ellipsis, and the cut wouldn't show."""
+    """Where row 1 is short of room, the event's kind is cut inside its row with an ellipsis. A minimum width above the
+    room the kind gets would cut it at the row's edge with no ellipsis, and the cut wouldn't show. The window is 1160 px
+    wide, inside the two-column header, which starts at 1151 px, where the plain event's short kind has less room than it
+    needs."""
     p = clock_page
     p.locator("#clockAligned").click()
     p.wait_for_selector("#clockAligned[aria-pressed='true']")
     select(p, p.evaluate(PLAIN_DC01))
-    p.set_viewport_size({"width": 1200, "height": 900})
+    p.set_viewport_size({"width": 1160, "height": 900})
     p.wait_for_timeout(300)
     kind, ident = box(p, ".ev-ident .kind"), box(p, ".ev-ident")
-    assert kind["right"] <= ident["right"] + 0.5, (kind, ident)
+    assert kind["width"] > 0 and kind["right"] <= ident["right"] + 0.5, (kind, ident)
     assert p.locator(".ev-ident .kind").evaluate("(n) => n.scrollWidth > n.clientWidth")   # cut, so the ellipsis shows
 
 
@@ -643,7 +645,7 @@ def test_a_host_whose_clock_was_right_keeps_a_two_row_header(browser, synthetic_
     for p in served_page(browser, synthetic_case):
         assert p.evaluate("window.__app.S.meta.hosts.find((h) => h.host === 'DC01').clock.state") == "agrees"
         select(p, p.evaluate(PLAIN_DC01))
-        assert p.locator("#details .ev-ident .chip").count() == 0
+        assert p.locator("#details .clock-chip").count() == 0
         assert p.locator("#details .ev-clock").count() == 0
         assert not p.locator("#details .ev-head-more").is_visible()
         assert box(p, ".ev-head")["height"] <= 72
@@ -652,17 +654,184 @@ def test_a_host_whose_clock_was_right_keeps_a_two_row_header(browser, synthetic_
 
 
 def test_the_verdict_note_box_shows_its_whole_label(browser, synthetic_case):  # noqa: F811
-    """The note box's placeholder is its only visible label, so the 180 px box must not cut it, as to
-    'Note for this mark (optional'. The placeholder is short and the long wording is the box's title and its name."""
+    """The note box's placeholder is its only visible label, so the 120 px box must not cut it, as to
+    'Note for this mark (optional'. The placeholder is short and the long wording is the box's title and its name. The
+    box is 120 px wide at 1280 by 720, which leaves the identity line room for the kind."""
     for p in served_page(browser, synthetic_case):
         p.set_viewport_size({"width": 1280, "height": 720})
         open_event(p)
         note = p.locator("#details .ev-verdict .mark-note")
         note.wait_for()
+        assert box(p, "#details .ev-verdict .mark-note")["width"] == 120
         assert note.evaluate(
             "(i) => { i.value = i.placeholder; const fits = i.scrollWidth <= i.clientWidth; i.value = ''; return fits; }")
         assert note.get_attribute("placeholder") == "Note (optional)"
         assert note.get_attribute("title") == "Note for this mark (optional)"
+
+
+LOGON_LOG = "DC01/Windows/System32/winevt/Logs/Security_header.evtx"
+LOGON_KIND = "4624 Successful logon, Security"
+LONG_KIND = "4624 Successful logon of a remote interactive session, Security"
+LOGON_TEXT = ("{} | Target: C137\\Administrator | LogonType 10 | Source: 203.0.113.50:49822 (WS02) | "
+              "AuthenticationPackage: Negotiate")
+HIT_TITLE = "Logon (RemoteInteractive) from the internet"
+TWO_TAGS = {"MitreTactics": "LatMov", "MitreTags": "T1021.001"}   # Hayabusa suggests TA0008 and T1021.001
+KIND_ROOM = """() => {
+    const kind = document.querySelector('#details .ev-ident .kind');
+    const k = kind.getBoundingClientRect(), row = document.querySelector('#details .ev-ident').getBoundingClientRect();
+    return { text: kind.textContent, width: k.width, needs: kind.scrollWidth, shown: kind.clientWidth, right: k.right,
+             edge: row.right, overflow: getComputedStyle(kind).textOverflow };
+}"""
+
+
+def add_logon(case, tags=False, kind=LOGON_KIND):
+    """A 4624 on DC01 whose kind reads `kind`, with a medium Hayabusa hit on it, which suggests Suspicious, and with the
+    hit's ATT&CK tags when `tags` is true, which Hayabusa suggests too. The event's ID."""
+    text = LOGON_TEXT.format(kind.removesuffix(", Security"))
+    logon_event = Event(T0 + 5 * SEC, "Event Recorded", "evtx", LOGON_LOG, "401", text, record_id=401,
+                        event_code="4624", log_channel="Security", user_name="Administrator", user_domain="C137",
+                        logon_type="10", source_ip="203.0.113.50", source_port="49822", source_workstation="WS02")
+    hit = Event(T0 + 5 * SEC, "Event Recorded", "hayabusa", LOGON_LOG, "401:rule", f"{HIT_TITLE} [medium]", record_id=401,
+                log_channel="Security", rule_title=HIT_TITLE, rule_level="medium", extra=TWO_TAGS if tags else None)
+    for i, (loaded, tool) in enumerate(((logon_event, "evtxecmd"), (hit, "hayabusa"))):
+        load(case.db_path, [loaded], host="DC01", tool=tool, tool_version="t", run_id=f"header-{i}",
+             replaces_sources=[], staging_dir=case.folder)
+    return uid(case, f"tool = 'evtxecmd' AND source_file = '{LOGON_LOG}'")
+
+
+@pytest.fixture
+def logon_event(synthetic_case, request):
+    """add_logon's event in the case before a page serves it. A test parametrizes it, indirectly, with add_logon's
+    keywords to add the suggested tags or to lengthen the kind."""
+    return add_logon(synthetic_case, **getattr(request, "param", {}))
+
+
+@pytest.fixture
+def aligned_logon(logon_event, clock_page):  # noqa: F811
+    """clock_page with DC01 aligned to the capture at 1280 by 720, and the event's ID: DC01's events are offset by
+    -3599.5 s, so each has a chip."""
+    clock_page.locator("#clockAligned").click()
+    clock_page.wait_for_selector("#clockAligned[aria-pressed='true']")
+    clock_page.set_viewport_size({"width": 1280, "height": 720})
+    clock_page.wait_for_timeout(300)
+    return clock_page, logon_event
+
+
+@pytest.fixture
+def plain_logon(logon_event, browser, synthetic_case):  # noqa: F811
+    """The page on the synthetic case at 1280 by 720 and the event's ID: DC01 has no capture to be measured against, so
+    its events have no offset and no chip."""
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1280, "height": 720})
+        p.wait_for_timeout(300)
+        yield p, logon_event
+
+
+def open_logon(p, logon, mark=None, tags_open=False):
+    """The Event page of `logon`, marked `mark` first when it names one, with Hayabusa's suggested tags open when asked, and
+    the kind's measure as KIND_ROOM reads it."""
+    select(p, logon)
+    if mark:
+        p.locator("#details .ev-verdict").get_by_role("button", name=mark, exact=True).click()
+        p.locator(f"#details .ev-verdict .status.{mark.lower()}").wait_for()
+    if tags_open:
+        toggle = p.locator("#details .ev-verdict button.tw")
+        toggle.click()
+        assert toggle.get_attribute("aria-expanded") == "true"
+        p.locator("#details .ev-head-more .tagchip.suggested").first.wait_for()
+    return p.evaluate(KIND_ROOM)
+
+
+def test_the_clock_chip_starts_the_summary_row(aligned_logon):
+    """The chip that names a host's clock offset, "Aligned -3599.5 s", is the first item of the header's second row, before
+    Hayabusa's chips and under the time it explains. Row 1 holds the badge, the time, the host, and the kind. The chip's
+    hover is the clock note's sentence and the recorded time."""
+    p, logon = aligned_logon
+    open_logon(p, logon, "Suspicious")
+    assert p.locator("#details .ev-ident .chip").count() == 0
+    assert p.locator("#details .ev-ident > *").evaluate_all("(nodes) => nodes.map((n) => n.className)") == [
+        "badge s", "time", "host", "kind"]
+    assert p.locator("#details .ev-sum > .chip").evaluate_all("(nodes) => nodes.map((n) => n.textContent)") == [
+        "Aligned -3599.5 s", f"Hayabusa medium: {HIT_TITLE}"]
+    assert p.locator("#details .ev-sum > *").first.get_attribute("class") == "chip clock-chip"
+    chip, hayabusa, time = box(p, ".ev-sum .clock-chip"), box(p, ".ev-sum .level-medium"), box(p, ".ev-ident .time")
+    assert chip["right"] <= hayabusa["left"] and abs(chip["top"] - hayabusa["top"]) <= 2
+    assert chip["top"] >= time["bottom"] - 1 and chip["left"] < time["right"] and chip["right"] > time["left"]
+    assert p.locator("#details .ev-sum .clock-chip").evaluate("(n) => n.scrollWidth <= n.clientWidth")   # its words are whole
+    title = p.locator("#details .ev-sum .clock-chip").get_attribute("title")
+    assert "Times here are aligned to the capture." in title and "Recorded 2020-09-19 03:21:53.000000 UTC" in title
+
+
+def test_a_host_with_no_offset_leaves_no_empty_slot_at_the_start_of_the_summary_row(plain_logon):
+    """Where the host has no clock offset there is no chip, and the summary row starts with Hayabusa's chip at the row's
+    own left edge, with no empty item or gap before it."""
+    p, logon = plain_logon
+    open_logon(p, logon, "Suspicious")
+    assert p.locator("#details .clock-chip").count() == 0
+    assert p.locator("#details .ev-sum > *").first.get_attribute("class") == "chip level-medium"
+    assert abs(box(p, ".ev-sum .level-medium")["left"] - box(p, ".ev-sum")["left"]) <= 0.5
+
+
+@pytest.mark.parametrize("mark", ["Suspicious", None], ids=["marked", "suggestion_waiting"])
+def test_the_kind_draws_in_full_when_the_header_is_not_crowded(aligned_logon, mark):
+    """At 1280 by 720 a 4624's kind, "4624 Successful logon, Security", is drawn whole in row 1 when the event is marked
+    Suspicious, and when Hayabusa's mark suggestion waits for a decision: the clock chip is in row 2 and the note box is
+    narrow."""
+    p, logon = aligned_logon
+    room = open_logon(p, logon, mark)
+    assert room["text"] == LOGON_KIND
+    assert room["needs"] <= room["shown"] and room["right"] <= room["edge"] + 0.5, room
+
+
+NARROW_WINDOW = {"width": 1151, "height": 800}   # the first width of the two-column header, where the kind has the least room
+
+
+@pytest.mark.parametrize("window", [None, NARROW_WINDOW], ids=["1280", "1151"])
+@pytest.mark.parametrize(
+    ("logon_event", "mark", "tags_open"),
+    [({"tags": True, "kind": LONG_KIND}, "Suspicious", True), ({"tags": True, "kind": LONG_KIND}, None, False)],
+    indirect=["logon_event"], ids=["marked_tags_open", "suggestion_and_tags_waiting"])
+def test_the_kind_is_cut_with_an_ellipsis_not_hidden_when_the_header_is_crowded(aligned_logon, mark, tags_open, window):
+    """With Hayabusa's suggested tags open, and with a mark suggestion and suggested tags both waiting, the verdict column
+    is at its widest, and a kind longer than the room it gets, here LONG_KIND, is wider than 0 and cut inside its row with
+    an ellipsis, not at the row's edge. That holds at 1280 px and at 1151 px, where the room is under 50 px: the kind has
+    no minimum width, since one above the room it gets is cut at the row's edge with no ellipsis."""
+    p, logon = aligned_logon
+    if window:
+        p.set_viewport_size(window)
+        p.wait_for_timeout(300)
+    room = open_logon(p, logon, mark, tags_open)
+    assert room["text"] == LONG_KIND
+    assert room["width"] > 0 and room["needs"] > room["shown"] + 50, room
+    assert room["overflow"] == "ellipsis" and room["right"] <= room["edge"] + 0.5, room
+
+
+@pytest.mark.parametrize(
+    ("logon_event", "mark", "tags_open"), [({"tags": True}, "Suspicious", True), ({"tags": True}, None, False)],
+    indirect=["logon_event"], ids=["marked_tags_open", "suggestion_and_tags_waiting"])
+def test_a_host_with_no_offset_gives_the_kind_as_much_room_as_an_aligned_one(plain_logon, mark, tags_open):
+    """With no chip to leave, the kind of a host with no clock offset gets room for most of its text beside Hayabusa's
+    suggested tags, and is cut inside its row with an ellipsis if at all."""
+    p, logon = plain_logon
+    room = open_logon(p, logon, mark, tags_open)
+    assert room["text"] == LOGON_KIND
+    assert room["width"] >= 150 and room["right"] <= room["edge"] + 0.5, room
+    assert room["needs"] <= room["shown"] or room["overflow"] == "ellipsis", room
+
+
+@pytest.mark.parametrize(
+    ("logon_event", "mark", "tags_open"), [({"tags": True}, "Suspicious", True), ({"tags": True}, None, False)],
+    indirect=["logon_event"], ids=["marked_tags_open", "suggestion_and_tags_waiting"])
+def test_a_host_with_no_offset_cuts_the_kind_with_an_ellipsis_in_the_narrowest_two_column_header(plain_logon, mark, tags_open):
+    """At 1151 px, the first width of the two-column header, the kind of a host with no clock offset has under 50 px beside
+    Hayabusa's suggested tags. It is wider than 0 and ends in an ellipsis inside its row, not cut at the row's edge."""
+    p, logon = plain_logon
+    p.set_viewport_size(NARROW_WINDOW)
+    p.wait_for_timeout(300)
+    room = open_logon(p, logon, mark, tags_open)
+    assert room["text"] == LOGON_KIND
+    assert room["width"] > 0 and room["needs"] > room["shown"], room
+    assert room["overflow"] == "ellipsis" and room["right"] <= room["edge"] + 0.5, room
 
 
 def test_the_band_does_not_grow_when_a_trail_shows(browser, pcase):  # noqa: F811
@@ -902,7 +1071,7 @@ def test_a_time_the_hosts_clock_did_not_write_has_no_clock_note_or_local_time(cl
     ident.wait_for()
     assert p.locator("#details .ev-clock").count() == 0
     assert "Local time on" not in (ident.locator(".time").get_attribute("title") or "")
-    assert ident.locator(".chip").count() == 0
+    assert p.locator("#details .clock-chip").count() == 0
     case_menu(p, "hostsButton")
     offset = p.locator("#hostsTable tr[data-host='DC01'] input[type=number]")
     offset.fill("86400")
@@ -910,7 +1079,7 @@ def test_a_time_the_hosts_clock_did_not_write_has_no_clock_note_or_local_time(cl
     p.wait_for_function("() => window.__app.S.meta.hosts.find((h) => h.host === 'DC01').offset_seconds === 86400")
     p.evaluate("(u) => window.__app.select(u, false)", pe)
     p.locator("#details .ev-ident .time", has_text="2008-01-11 21:20:00.000000 UTC").wait_for()
-    chip = p.locator("#details .ev-ident .chip")
+    chip = p.locator("#details .ev-sum .clock-chip")
     assert chip.inner_text() == "Host offset +86400 s"
     assert "Recorded 2008-01-10 21:20:00.000000 UTC" in chip.get_attribute("title")
     assert "Local time on" not in (p.locator("#details .ev-ident .time").get_attribute("title") or "")

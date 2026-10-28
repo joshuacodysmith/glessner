@@ -1547,3 +1547,324 @@ def test_a_group_of_found_output_loaded_by_its_parser_says_how_many_rows_it_skip
     assert (record.status, record.rows_skipped) == ("ok", 2)
     loaded = group()["loaded"]
     assert (group()["status"], loaded["rows"], loaded["without_time"], loaded["skipped"]) == ("loaded", 3, 0, 2)
+
+
+def pinning(app, case, tmp_path):
+    """The synthetic case with the tools folder at tmp_path/tools, where the stand-in tool "fake" that runs (a batch file)
+    and EvtxECmd are unpacked, and the app's tools: those two, Windows event XML, which is built in, PECmd, run from
+    outside the tools folder, and RECmd, which isn't installed. Returns the first two."""
+    from dataclasses import replace
+
+    from test_tools_manifest import evtx, runnable
+
+    from glessner.tools import DetectedTool, detect, load_registry
+
+    fake_tool_case(case, tmp_path)   # the case's event log, taken in
+    fake, other = runnable(tmp_path), evtx(tmp_path)
+    app.case = replace(app.case, settings=replace(app.case.settings, tools_folder=str(tmp_path / "tools")))
+    registry = load_registry()
+    specs = {"fake": fake.spec, "evtxecmd": other.spec, **{i: registry[i] for i in ("event_xml", "pecmd", "recmd")}}
+    detected = {"fake": fake, "evtxecmd": other, **detect([registry["event_xml"]], None),
+                "pecmd": DetectedTool(registry["pecmd"], tmp_path / "elsewhere" / "PECmd.exe", "1")}
+    app.tool_cache = (specs, detected)
+    return fake, other
+
+
+def run_fake(port, session):
+    """Run the stand-in tool from the Tools page and wait for its job to finish."""
+    res, _ = request(port, "POST", "/api/run_tool", session=session, body={"tool": "fake"})
+    assert res.status == 200
+    for _ in range(200):
+        job = json.loads(request(port, "GET", "/api/run_status", session=session)[1])["job"]
+        if job["finished"]:
+            return job
+        time.sleep(0.05)
+    pytest.fail("the job didn't finish")
+
+
+def test_a_tool_s_pin_state_follows_a_pin_made_elsewhere_and_a_run_of_it_and_a_run_hashes_none_for_the_cache(
+        running, synthetic_case, tmp_path, monkeypatch):
+    """The page's pin states are read when the page asks: from the files hashed at the last scan, so a change to a file
+    shows after a scan or a run of the tool, and from the manifest as it is, so a pin the command line makes shows at the
+    next load. A run's own check is the run's hashes, and hashes no tool for the page."""
+    from test_tools_manifest import pinned
+
+    from glessner import tools
+    from glessner.runner import read_runs
+
+    app, port, _ = running
+    session = login(port, app)
+    fake, other = pinning(app, synthetic_case, tmp_path)
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
+    states = lambda path="/api/tools": {t["id"]: t["pin"]["state"] for t in get(path)["tools"] if t["pin"]}
+    hashed, real = [], tools.pin_files
+    monkeypatch.setattr(tools, "pin_files", lambda tool, links=None: hashed.append(tool.spec.id) or real(tool, links))
+    job = run_fake(port, session)   # a fresh server: the page hasn't asked yet
+    assert job["results"][0]["tool_id"] == "fake" and job["results"][0]["tool_check"] == "no manifest"
+    assert hashed == [] and len(app.pin_cache) == 0
+    (check,) = [r.tool_check for r in read_runs(app.case)]
+    assert check == {"result": "no manifest", "reason": "the tools folder has no tools_manifest.json"}
+    assert states() == {"fake": "not_pinned", "evtxecmd": "not_pinned", "pecmd": "outside"}
+    assert sorted(hashed) == ["evtxecmd", "fake"]
+    pinned(tmp_path, fake, other)   # as `glessner tools --pin` pins
+    hashed.clear()
+    assert states() == {"fake": "matches", "evtxecmd": "matches", "pecmd": "outside"} and hashed == []   # no scan
+    (fake.executable.parent / "Maps" / "a.map").write_bytes(b"a, edited\n")
+    (other.executable.parent / "Maps" / "a.map").write_bytes(b"a, edited\n")
+    assert states()["fake"] == "matches"   # as hashed at the scan
+    job = run_fake(port, session)
+    assert job["results"][0]["tool_check"] == "differs"
+    assert states() == {"fake": "differs", "evtxecmd": "matches", "pecmd": "outside"}   # the tool that ran is hashed again
+    assert hashed == ["fake"]
+    page = {t["id"]: t for t in get("/api/tools")["tools"]}
+    latest = page["fake"]["last_run"]["latest"]
+    assert latest["check"]["result"] == "differs" and latest["check"]["files"][0]["path"] == "Maps/a.map"
+    assert latest["text"] == "tool check differs, 1 changed in Maps/"
+    assert states("/api/tools?rescan=1")["evtxecmd"] == "differs"   # a scan hashes every tool again
+
+
+def pin_request(state, **changes):
+    """What the page sends to pin a tool: the executable, hashes, and links its state showed."""
+    return {"executable": state["executable"], "files": state["files"], "links": state["links"], **changes}
+
+
+def test_pin_tools_pins_the_named_tools_with_what_the_page_showed_and_keeps_the_fresh_listing(
+        running, synthetic_case, tmp_path, monkeypatch):
+    from glessner import tools
+    from glessner.tools_manifest import manifest_file, read_manifest
+
+    app, port, _ = running
+    session = login(port, app)
+    fake, _ = pinning(app, synthetic_case, tmp_path)
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
+    shown = {t["id"]: t["pin"] for t in get("/api/tools")["tools"] if t["pin"]}
+    path = manifest_file(tmp_path / "tools")
+    hashed, real = [], tools.pin_files
+    monkeypatch.setattr(tools, "pin_files", lambda tool, links=None: hashed.append(tool.spec.id) or real(tool, links))
+    res, body = request(port, "POST", "/api/pin_tools", session=session, body={"tools": {"fake": pin_request(shown["fake"])}})
+    assert res.status == 200 and json.loads(body)["pinned"] == ["fake"] and json.loads(body)["path"] == str(path)
+    assert read_manifest(path).tools.keys() == {"fake"}   # EvtxECmd, found and unpinned, stays so
+    assert hashed == ["fake"]   # the files hashed again for the pin
+    again = {t["id"]: t["pin"] for t in get("/api/tools")["tools"] if t["pin"]}
+    assert (again["fake"]["state"], again["evtxecmd"]["state"]) == ("matches", "not_pinned")
+    assert hashed == ["fake"]   # the pin's listing is the cache's
+    assert again["fake"]["pinned"]["version"] == fake.version and again["fake"]["pinned"]["by"]
+    res, body = request(port, "POST", "/api/pin_tools", session=session,
+                        body={"tools": {"fake": pin_request(again["fake"]), "evtxecmd": pin_request(again["evtxecmd"])}})
+    assert res.status == 200 and read_manifest(path).tools.keys() == {"fake", "evtxecmd"}   # pinned again, and a second
+
+
+def test_pin_tools_refuses_what_cannot_be_pinned_and_writes_nothing(running, synthetic_case, tmp_path):
+    from dataclasses import replace
+
+    from glessner.toolbox import ToolJob
+    from glessner.tools_manifest import manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    get = lambda path: json.loads(request(port, "GET", path, session=session)[1])
+    shown = {t["id"]: t["pin"] for t in get("/api/tools")["tools"] if t["pin"]}
+    path = manifest_file(tmp_path / "tools")
+
+    def refused(tools_body, *, text):
+        res, body = request(port, "POST", "/api/pin_tools", session=session, body=tools_body)
+        assert res.status == 400 and text in json.loads(body)["error"], (res.status, body)
+        assert not path.exists() or path.read_text(encoding="utf-8") == "not json {"
+
+    refused({"tools": {"nope": pin_request(shown["fake"])}}, text="No tool 'nope' in the registry")
+    refused({"tools": {"event_xml": pin_request(shown["fake"])}}, text="Windows event XML is built in")
+    refused({"tools": {"recmd": pin_request(shown["fake"])}}, text="RECmd isn't installed")
+    refused({"tools": {"pecmd": {"executable": "x", "files": {}, "links": []}}}, text="outside the tools folder")
+    refused({"tools": {}}, text="Name the tools to pin")
+    refused({}, text="Name the tools to pin")
+    refused({"tools": {"fake": "no"}}, text="Scan again")
+    refused({"tools": {"fake": {"files": shown["fake"]["files"]}}}, text="Scan again")
+    path.write_text("not json {", encoding="utf-8")
+    refused({"tools": {"fake": pin_request(shown["fake"])}}, text="can't be read")
+    path.unlink()
+    app.job = ToolJob("Fake", 1)   # a job that hasn't finished
+    refused({"tools": {"fake": pin_request(shown["fake"])}}, text="Fake is still running.")
+    app.job = None
+    app.case = replace(app.case, settings=replace(app.case.settings, tools_folder=""))
+    refused({"tools": {"fake": pin_request(shown["fake"])}}, text="needs a tools folder")
+
+
+def test_pin_tools_refuses_when_a_file_changed_since_the_page_showed_it(running, synthetic_case, tmp_path):
+    """The pin covers what the confirm described: files that differ from the hashes the page sent, an executable that
+    isn't the one it showed, or a link it didn't list are refused, and nothing is written."""
+    from conftest import junction
+
+    from glessner.tools_manifest import manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    fake, _ = pinning(app, synthetic_case, tmp_path)
+    shown = {t["id"]: t["pin"] for t in json.loads(request(port, "GET", "/api/tools", session=session)[1])["tools"]
+             if t["pin"]}
+    sent = {"tools": {"fake": pin_request(shown["fake"])}}
+    path = manifest_file(tmp_path / "tools")
+    mismatch = "Fake's files changed since the page showed them. Scan again, then pin."
+    post = lambda body: request(port, "POST", "/api/pin_tools", session=session, body=body)
+    wrong_exe = {"tools": {"fake": pin_request(shown["fake"], executable=str(tmp_path / "elsewhere" / "Fake.bat"))}}
+    res, body = post(wrong_exe)
+    assert res.status == 400 and json.loads(body)["error"] == mismatch
+    (fake.executable.parent / "Maps" / "a.map").write_bytes(b"a, edited\n")
+    res, body = post(sent)
+    assert res.status == 400 and json.loads(body)["error"] == mismatch and not path.exists()
+    (fake.executable.parent / "Maps" / "a.map").write_bytes(b"a\n")   # back as it was shown
+    (tmp_path / "outside").mkdir()
+    junction(fake.executable.parent / "Maps" / "linked", tmp_path / "outside")
+    res, body = post(sent)
+    assert res.status == 400 and json.loads(body)["error"] == mismatch and not path.exists()
+
+
+def test_pin_tools_needs_the_session_and_the_same_origin(running, synthetic_case, tmp_path):
+    from glessner.tools_manifest import manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    shown = {t["id"]: t["pin"] for t in json.loads(request(port, "GET", "/api/tools", session=session)[1])["tools"]
+             if t["pin"]}
+    body = {"tools": {"fake": pin_request(shown["fake"])}}
+    assert request(port, "POST", "/api/pin_tools", body=body)[0].status == 403
+    assert request(port, "POST", "/api/pin_tools", session="wrong", body=body)[0].status == 403
+    assert request(port, "POST", "/api/pin_tools", session=session, body=body,
+                   headers={"Origin": "http://evil.example"})[0].status == 403
+    assert request(port, "POST", "/api/pin_tools", session=session, body=body,
+                   headers={"Content-Type": "text/plain"})[0].status == 415
+    assert not manifest_file(tmp_path / "tools").exists()
+    assert request(port, "POST", "/api/pin_tools", session=session, body=body)[0].status == 200
+
+
+def states_of(port, session):
+    """The pin state of each tool that has one on the Tools page, by registry ID."""
+    page = json.loads(request(port, "GET", "/api/tools", session=session)[1])
+    return {t["id"]: t["pin"]["state"] for t in page["tools"] if t["pin"]}
+
+
+def with_mft(app, tmp_path):
+    """MFTECmd under both of its registry IDs, which run one executable, among the app's tools. Returns the two."""
+    from test_tools_manifest import mft
+
+    pair = mft(tmp_path)
+    specs, detected = app.tool_cache
+    app.tool_cache = ({**specs, **{tool_id: tool.spec for tool_id, tool in pair.items()}}, {**detected, **pair})
+    return pair
+
+
+def test_pin_tools_refuses_a_request_that_leaves_out_a_tool_that_runs_the_executable_of_one_it_names(
+        running, synthetic_case, tmp_path):
+    from glessner.tools_manifest import manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    with_mft(app, tmp_path)
+    shown = {t["id"]: t["pin"] for t in json.loads(request(port, "GET", "/api/tools", session=session)[1])["tools"]
+             if t["pin"]}
+    post = lambda ids: request(port, "POST", "/api/pin_tools", session=session,
+                               body={"tools": {i: pin_request(shown[i]) for i in ids}})
+    res, body = post(["mftecmd"])
+    assert res.status == 400 and json.loads(body)["error"] == (
+        "Tools that run one executable are pinned together. Name each of them: the request leaves out MFTECmd ($J).")
+    assert not manifest_file(tmp_path / "tools").exists()
+    res, body = post(["mftecmd", "mftecmd_j"])
+    assert res.status == 200 and json.loads(body)["pinned"] == ["mftecmd", "mftecmd_j"]
+
+
+def test_pin_tools_refuses_a_tools_folder_it_cannot_write_naming_the_manifest(running, synthetic_case, tmp_path):
+    from glessner.tools_manifest import LOCK_FILE, manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    shown = {t["id"]: t["pin"] for t in json.loads(request(port, "GET", "/api/tools", session=session)[1])["tools"]
+             if t["pin"]}
+    (tmp_path / "tools" / LOCK_FILE).mkdir()   # a lock file that can't be opened for writing
+    path = manifest_file(tmp_path / "tools")
+    res, body = request(port, "POST", "/api/pin_tools", session=session, body={"tools": {"fake": pin_request(shown["fake"])}})
+    assert res.status == 400 and json.loads(body)["error"].startswith(f"The tools manifest at {path} can't be written: ")
+    assert not path.exists()
+
+
+def test_pin_tools_checks_for_a_job_again_when_one_starts_while_the_files_are_hashed(
+        running, synthetic_case, tmp_path, monkeypatch):
+    """The files are hashed outside the app's lock, which takes seconds for a large folder. A job that starts in that time
+    is found by the check made under the lock with the write, and nothing is written."""
+    import threading
+
+    from glessner import server
+    from glessner.toolbox import ToolJob
+    from glessner.tools_manifest import manifest_file
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    shown = {t["id"]: t["pin"] for t in json.loads(request(port, "GET", "/api/tools", session=session)[1])["tools"]
+             if t["pin"]}
+    hashed, release, real = threading.Event(), threading.Event(), server.take_pin
+
+    def hash_then_wait(tool):
+        pin = real(tool)
+        hashed.set()
+        assert release.wait(20)
+        return pin
+
+    monkeypatch.setattr(server, "take_pin", hash_then_wait)
+    monkeypatch.setattr(server, "start_tool_job", lambda case, tool, hosts, after: ToolJob("Fake", 1))
+    answers = []
+    pin = threading.Thread(target=lambda: answers.append(request(
+        port, "POST", "/api/pin_tools", session=session, body={"tools": {"fake": pin_request(shown["fake"])}})))
+    pin.start()
+    try:
+        assert hashed.wait(20)
+        assert request(port, "POST", "/api/run_tool", session=session, body={"tool": "fake"})[0].status == 200
+    finally:
+        release.set()
+        pin.join(20)
+        app.job = None
+    ((res, body),) = answers
+    assert res.status == 400 and json.loads(body)["error"] == "Fake is still running."
+    assert not manifest_file(tmp_path / "tools").exists()
+
+
+def test_a_job_s_end_hashes_again_every_tool_that_runs_the_executable_of_one_it_ran(running, synthetic_case, tmp_path):
+    from types import SimpleNamespace
+
+    from test_tools_manifest import pinned
+
+    app, port, _ = running
+    session = login(port, app)
+    pinning(app, synthetic_case, tmp_path)
+    pair = with_mft(app, tmp_path)
+    pinned(tmp_path, *pair.values())
+    both = lambda: tuple(states_of(port, session)[tool_id] for tool_id in ("mftecmd", "mftecmd_j"))
+    assert both() == ("matches", "matches")   # hashed now, and kept
+    (pair["mftecmd"].executable.parent / "MFTECmd.dll").write_bytes(b"MZ updated")
+    assert both() == ("matches", "matches")   # as hashed
+    app.after_job(SimpleNamespace(error="", results=[{"tool_id": "mftecmd", "status": "ok"}]))
+    assert both() == ("differs", "differs")
+
+
+def test_a_job_that_ends_with_an_error_makes_the_next_tools_page_hash_every_tool_again(
+        running, synthetic_case, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from test_tools_manifest import pinned
+
+    from glessner import tools
+
+    app, port, _ = running
+    session = login(port, app)
+    fake, other = pinning(app, synthetic_case, tmp_path)
+    pinned(tmp_path, fake, other)
+    assert states_of(port, session) == {"fake": "matches", "evtxecmd": "matches", "pecmd": "outside"}
+    for tool in (fake, other):
+        (tool.executable.parent / "Maps" / "a.map").write_bytes(b"a, edited\n")
+    hashed, real = [], tools.pin_files
+    monkeypatch.setattr(tools, "pin_files", lambda tool, links=None: hashed.append(tool.spec.id) or real(tool, links))
+    app.after_job(SimpleNamespace(error="The evidence changed.", results=[]))
+    assert states_of(port, session) == {"fake": "differs", "evtxecmd": "differs", "pecmd": "outside"}
+    assert sorted(hashed) == ["evtxecmd", "fake"]

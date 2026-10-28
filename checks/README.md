@@ -1,28 +1,30 @@
 # Checks
 
-Each write-up here is an open-answer check of Glessner on a public practice set whose answers are published. Each check ran with the answers at hand, and each item of the published key was scored by what the app showed of it.
+Each write-up here is an open-answer check of Glessner on a public practice set whose answers are published. Each check ran with the answers at hand, and each answer item was scored by what the app showed of it.
 
 ## The checks
 
-Each write-up gives the dataset, how the check ran, each item's state, the gaps found, and the check's limits.
+Each write-up gives the dataset, how the check ran, each item's state, the gaps found, and the check's limits. This page calls the checks Szechuan, EVTX, MTA, APT29, and CFReDS for short.
 
 | Write-up | Dataset | Score | Build |
 |---|---|---|---|
 | [szechuan_sauce.md](szechuan_sauce.md) | [The Stolen Szechuan Sauce](https://dfirmadness.com/the-stolen-szechuan-sauce/), from DFIR Madness: two Windows hosts and a packet capture | 19, 5, 0 of 24, plus 1 out of scope | Before v0.1.0, run on 2026-10-14 |
-| [evtx_attack_samples.md](evtx_attack_samples.md) | [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES), its Lateral Movement folder: 47 event logs from 11 machines | 42, 5, 0 of 47. Seven files wait on a written list of their facts, which could lower the score as far as 35, 12, 0. | Before v0.1.0, run on 2026-10-14 |
+| [evtx_attack_samples.md](evtx_attack_samples.md) | [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES), its Lateral Movement folder: 47 event logs from 11 machines | 37, 10, 0 of 47. Each file is scored on the records and values that show its technique. | Before v0.1.0, run on 2026-10-14 |
 | [mta_2016_01_07.md](mta_2016_01_07.md) | [The Malware-Traffic-Analysis.net exercise of 2016-01-07](https://www.malware-traffic-analysis.net/2016/01/07/index.html): a packet capture of three hosts and two sensor alert files | 6, 7, 0 of 13, plus 1 out of scope | Before v0.1.0, run on 2026-10-15 |
+| [otrf_apt29_day1.md](otrf_apt29_day1.md) | [OTRF Security Datasets](https://github.com/OTRF/Security-Datasets), APT29 Day 1: Windows events from four machines, exported as JSON, and packet captures and Zeek logs of two of them | 19, 6, 0 of 25 | After v0.2.0, run on 2026-10-22 |
+| [cfreds_data_leakage.md](cfreds_data_leakage.md) | [The Data Leakage Case](https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html), from NIST's CFReDS project: a Windows 7 PC, two USB drives, and a CD-R | 26, 21, 10 of 57, plus 3 out of scope | After v0.2.0, run on 2026-10-22 |
 
-[How each item is scored](#how-each-item-is-scored) defines the states and the form of a score. Each score measures the build the check ran on, before the fixes its gaps led to. v0.1.0 is the first build with a version number. [CHANGELOG.md](../CHANGELOG.md) lists each release's changes, and each write-up gives each gap's state in v0.2.0.
+[How each item is scored](#how-each-item-is-scored) defines the states and the form of a score. Each score measures the build the check ran on, before the fixes its gaps led to. v0.1.0 is the first build with a version number. [CHANGELOG.md](../CHANGELOG.md) lists each release's changes. The Szechuan and MTA write-ups give each gap's state in v0.2.0, and the EVTX, APT29, and CFReDS write-ups give it in v0.3.0.
 
 A check shows that the evidence for each answer is present and readable in the app. It doesn't show that an analyst who doesn't know the answer would find it. [known_limitations.md](../known_limitations.md#what-has-been-checked) lists what else hasn't been shown.
 
 ## How each item is scored
 
-All three checks use one rubric, so their scores can be compared, and so can one check's scores across releases. The examples below come from these checks, called Szechuan, EVTX, and MTA for short. Item and gap numbers are each write-up's own. [glossary.md](../glossary.md) defines the app's terms, such as lane, pivot, and suggestion.
+All five checks use one rubric, so their scores can be compared, and so can one check's scores across releases. The examples below come from these checks. Item and gap numbers are each write-up's own. [glossary.md](../glossary.md) defines the app's terms, such as lane, pivot, and suggestion.
 
 An item's state says what the app shows of the item on the build the check ran on. How the item was found, and how hard that was, go in the write-up's notes and its gap list.
 
-An item's facts are what its row in the answer key names, with any correction the write-up makes against the evidence. In a list item, each row of the list is a fact, and rows the app shows beyond the key's don't count against it. EVTX has no answer key. Each of its files is an item, scored against the technique the file is named for, and its facts are the records and values that show that technique.
+An item's facts are what its row in the answer key names, with any correction the write-up makes against the evidence. In a list item, each row of the list is a fact, and rows the app shows beyond the key's don't count against it. EVTX has no answer key. Each of its files is an item, scored against the technique the file is named for, and its facts are the records and values that show that technique. APT29 has no answer key either. Its items are the steps of the attack's published emulation plan, one item per step.
 
 An item's evidence is the records that hold its facts. A record that shows without the values the item needs still shows one fact: that its event happened, on its host, at its time.
 
@@ -30,7 +32,7 @@ An item's evidence is the records that hold its facts. A record that shows witho
 |---|---|---|
 | Reached | The app shows every fact the item names, correctly. Search, pivot, suggestion, lane, and raw field all count, and so does a join under the rules below. | Szechuan item 13: DESKTOP-SDN1RPT's type 3 and type 10 logons from 10.42.85.10, and the timeline's logon arrow from DC01 to that host |
 | Partly reached | The app shows some of the item's facts but not all. A fact is missing from what loaded or from the evidence, shows only through a comparison or decoding done by hand, or shows in the wrong order. | MTA item 2: JENNIFER-PC's address and MAC address show in its DHCP records, and no event holds its name |
-| Missed | The app shows none of the item's evidence. | None of the 84 items in scope in these checks. An item whose only records sat in MTA's two alert files, which didn't load, would be missed. |
+| Missed | The app shows none of the item's evidence. | CFReDS item 31: the account that synced Google Drive is named in Google Drive's own files, which the collection left out, and in Internet Explorer's WebCache database, which was collected and not read, so none of the item's evidence loaded |
 | Out of scope | The item needs something the app doesn't do by design, such as reading memory or giving recommendations, which it leaves to the analyst. [scope.md](../scope.md#not-in-scope) lists what the app leaves out. The write-up lists the item, and the score doesn't count it. | Szechuan item 25 and MTA item 14, the answers' recommendations |
 
 When only part of an item is out of scope, the rest is scored, and the row names the part left out. Szechuan item 5 is reached on coreupdater's file, service, and download. Its migration into spoolsv.exe, which only memory shows, is the out-of-scope part.

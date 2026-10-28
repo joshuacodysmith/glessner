@@ -15,7 +15,8 @@ import duckdb
 from .analysis import HAYABUSA_SOURCE, IDS_ALERT_SOURCE, NETWORK_DEVICE_ARTIFACTS, SURICATA_SOURCE, level_rank
 from .audit import describe, recovered_words, short
 from .case import MANIFEST_FILE
-from .events import from_us
+from .clock import NOT_MEASURED, state_words
+from .events import from_us, to_us
 from .identity import Identity
 from .intake import FAILED_STATES, UNLISTED
 from .journal import (
@@ -30,13 +31,20 @@ from .journal import (
     unvouched_words,
 )
 from .journal import last_action as _last_action
-from .queries import TS
+from .queries import FIT_SETS_WINDOW, TS
 from .runner import RULES_NOT_RECORDED, RunRecord, rows_skipped_by_host, rule_sets
 from .tools import ToolSpec
+from .tools_manifest import RECORD_PATHS, differing_tools, differs_sentence
 
 MINUTE = 60_000_000
 CLUSTER_GAP_US = 30 * MINUTE   # alerts more than this far apart start a new lead
 TOP_TITLES = 3                 # rule titles or signatures a lead's why line names
+# A host's first and last time take the events from 1990 on and up to a day past the newest run. A run reads its evidence
+# after it was collected, so only a skewed or broken clock dates an event later, and an earlier time is a placeholder or
+# a file time among the activity.
+SPAN_FLOOR_US = to_us("1990-01-01T00:00:00Z")
+SPAN_SLACK_US = 24 * 60 * MINUTE
+NO_UPPER_BOUND = 2**62   # past any time an event can have
 # The alerts behind the red box and the alert suggestion sources, ranked as queries._SEVERITY ranks them: Hayabusa hits
 # at medium level or above (3 to 5), Suricata alerts at severity 1 (high, 4) or 2 (medium, 3), and imported fast alerts
 # at priority 1 or 2, ranked the same. They're the events those built-in sources suggest Suspicious.
@@ -118,7 +126,7 @@ def case_overview(con: duckdb.DuckDBPyConnection, *, identity: Identity, state: 
     events = _events_of_interest(con, last)
     leads = _alert_leads(con, runs, specs, tool_names) + _rule_leads(con, state, report) + _clock_leads(identity)
     leads.sort(key=lambda lead: (TIER_ORDER[lead["level"]], lead["first"] is None, lead["first"] or 0, lead["id"]))
-    hosts = _hosts(con, identity, artifact_names, rows_skipped_by_host(runs, specs))
+    hosts = _hosts(con, identity, artifact_names, rows_skipped_by_host(runs, specs), _span_bound(runs))
     if last and last.get("action"):
         last = {"seq": last.get("seq"), "at": last.get("at", ""), "who": analyst(last),
                 "text": describe(last, events)}
@@ -130,7 +138,7 @@ def case_overview(con: duckdb.DuckDBPyConnection, *, identity: Identity, state: 
             "integrity": {**_integrity(files, checks, journal_path, build, alignment, identity),
                           "manifest": _manifest_row(checks["last_full"], state.manifests,
                                                     not (journal_path.parent / MANIFEST_FILE).exists()),
-                          "journal": journal}}
+                          "journal": journal, "tool_check": _tool_check_row(runs, tool_names)}}
 
 
 # Where each journal was read to, its entries, and its newest close (journal_facts)
@@ -398,12 +406,25 @@ def _by_host(con: duckdb.DuckDBPyConnection, identity: Identity, leads: list[dic
     return rows
 
 
+def _span_bound(runs: list[RunRecord]) -> tuple[int, int]:
+    """The shown times a host's first and last time are taken within: from 1990-01-01 UTC to a day after the newest run,
+    by its finish or, for a run that has none, its start. A case with no run, which says when the evidence was read, has
+    no upper bound."""
+    newest = max((t for run in runs if (t := to_us(run.finished_utc or run.started_utc)) is not None), default=None)
+    return SPAN_FLOOR_US, NO_UPPER_BOUND if newest is None else newest + SPAN_SLACK_US
+
+
 def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: dict[str, str],
-           skipped: dict[str, int]) -> dict:
+           skipped: dict[str, int], bound: tuple[int, int]) -> dict:
     """What each host holds, from one pass over its events: timeline events, the first and last time, the kinds of
     evidence loaded, and Hayabusa's rows; then its events with a hit, and its log clears. The first and last times are
     recorded ones plus the host's offset, which is the same for all of a host's events, so the pass reads no join: with
     the hosts joined for each event's shown time, it took 0.8 to 1.4 s at 10.4 million events, and 0.1 s without.
+
+    The first and last time lie within `bound` (_span_bound), so one event dated 3320 stretches nothing. A host with
+    events outside it also gets `outside`, their count with the first and last of their times (_host_span). Autoruns' PE link
+    times say when an image was built, not when anything happened, so they set no span and count as no event outside
+    (queries.FIT_SETS_WINDOW), unless the host holds nothing else.
 
     A Hayabusa row stays under the host it was loaded under, and after a host split, one whose record names no
     computer stays on the split host while the event it matched moves. So the hits are counted by the lane of
@@ -415,11 +436,11 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
     offsets = dict(con.execute("SELECT host, COALESCE(offset_us, 0) FROM hosts").fetchall())
     found: dict[str, dict] = {}
     lanes_of: dict[str, set[str]] = defaultdict(set)   # the lanes that hold rows of each host folder
-    for host, origin, tool, artifact, timed, rows, first, last in con.execute(
-            "SELECT host, origin_host, tool, artifact, count(*) FILTER (WHERE ts_us IS NOT NULL), count(*), min(ts_us), "
-            "max(ts_us) FROM events GROUP BY ALL ORDER BY 1, 4").fetchall():
-        h = found.setdefault(host, {"events": 0, "untimed": 0, "first": None, "last": None, "hits": 0, "hit_rows": 0,
-                                    "kinds": {}, "clears": [], "skipped": 0})
+    for host, origin, tool, artifact, timed, rows, first, last, sets in con.execute(
+            f"SELECT host, origin_host, tool, artifact, count(*) FILTER (WHERE ts_us IS NOT NULL), count(*), min(ts_us), "
+            f"max(ts_us), {FIT_SETS_WINDOW} AS sets FROM events e GROUP BY ALL ORDER BY 1, 4").fetchall():
+        h = found.setdefault(host, {"events": 0, "untimed": 0, "span": None, "link_times": None, "hits": 0,
+                                    "hit_rows": 0, "kinds": {}, "clears": [], "skipped": 0})
         lanes_of[origin].add(host)
         if tool == "hayabusa":
             h["hit_rows"] += rows
@@ -429,8 +450,9 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
         h["kinds"][artifact] = h["kinds"].get(artifact, 0) + rows
         if first is not None:
             first, last = first + offsets.get(host, 0), last + offsets.get(host, 0)
-            h["first"] = first if h["first"] is None else min(h["first"], first)
-            h["last"] = last if h["last"] is None else max(h["last"], last)
+            extent = "span" if sets else "link_times"
+            seen = h[extent]
+            h[extent] = (first, last) if seen is None else (min(seen[0], first), max(seen[1], last))
     for host, n in con.execute("SELECT v.host, count(*) FROM hits x JOIN ov_ev v ON v.event_uid = x.event_uid "
                                "GROUP BY 1").fetchall():
         if host in found:
@@ -438,6 +460,9 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
     for origin, n in skipped.items():
         if origin in lanes_of:
             found[min(lanes_of[origin])]["skipped"] += n
+    for host, h in found.items():
+        h["first"], h["last"], h["outside"] = _host_span(con, host, offsets.get(host, 0), h.pop("span"),
+                                                         h.pop("link_times"), bound)
     for uid, host, ts, code, channel, msg in con.execute(f"""
             SELECT e.event_uid, e.host, {TS}, e.event_code, e.log_channel, left(e.message, 120)
             FROM events e LEFT JOIN hosts h ON h.host = e.host WHERE {CLEAR_WHERE}
@@ -452,7 +477,8 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
         rows_out.append({
             "host": name, "role": ident.role if ident else "", "guessed": bool(ident and ident.role_source == "guess"),
             "os": (ident.os or {}).get("display", "") if ident else "", "events": h["events"], "untimed": h["untimed"],
-            "skipped": h["skipped"], "first": h["first"], "last": h["last"], "hits": h["hits"], "hit_rows": h["hit_rows"],
+            "skipped": h["skipped"], "first": h["first"], "last": h["last"], "outside": h["outside"], "hits": h["hits"],
+            "hit_rows": h["hit_rows"],
             "kinds": [{"artifact": a, "label": artifact_names.get(a, a), "events": n}
                       for a, n in sorted(h["kinds"].items(), key=lambda kv: -kv[1])],
             "clock": _clock_text(ident, clock), "review": list(ident.review) if ident else []})
@@ -463,21 +489,44 @@ def _hosts(con: duckdb.DuckDBPyConnection, identity: Identity, artifact_names: d
     return {"rows": rows_out, "clears": clears_out, "no_event_logs": no_logs}
 
 
+def _host_span(con: duckdb.DuckDBPyConnection, host: str, offset: int, span: tuple[int, int] | None,
+               link_times: tuple[int, int] | None,
+               bound: tuple[int, int]) -> tuple[int | None, int | None, dict | None]:
+    """A host's first and last shown time within `bound`, and `outside` for its events beyond it: their count with the
+    first and last of their times, or None for no event. `span` is the first and last shown time of the events that set
+    the host's span, and `link_times` of its Autoruns link times, each None for no event, from the pass over all its
+    events. When the extent that sets the span lies within the bound, the pass already gave the answer. Otherwise one
+    query reads the host's own events apart. A host with no event inside the bound has nothing for the others to lie
+    outside of, so its span holds them all and has no note."""
+    low, high = bound
+    sets = span is not None
+    first, last = span or link_times or (None, None)
+    if first is None or (low <= first and last <= high):
+        return first, last, None
+    query = f"""
+        SELECT min(s) FILTER (WHERE inside), max(s) FILTER (WHERE inside), count(*) FILTER (WHERE NOT inside),
+               min(s) FILTER (WHERE NOT inside), max(s) FILTER (WHERE NOT inside)
+        FROM (SELECT s, s BETWEEN ? AND ? AS inside
+              FROM (SELECT e.ts_us + ? AS s FROM events e WHERE e.host = ? AND e.tool <> 'hayabusa'
+                    AND e.ts_us IS NOT NULL AND {FIT_SETS_WINDOW if sets else 'true'}))"""
+    inside_first, inside_last, count, outside_first, outside_last = con.execute(query, [low, high, offset, host]).fetchone()
+    if inside_first is None:
+        return first, last, None
+    return inside_first, inside_last, {"count": count, "first": outside_first, "last": outside_last}
+
+
 def _clock_text(ident, clock: dict) -> dict:
-    """A host's clock in a few words, as the Hosts panel's clock check finds it."""
+    """A host's clock in a few words, as the Hosts panel's clock check finds it: the words clock.state_words gives,
+    with the host's offset where it has one."""
     offset = ident.offset_seconds if ident else 0
     state = clock.get("state") or "none"
-    if state == "suggest":
-        direction = "behind" if clock["skew_seconds"] < 0 else "ahead of"
-        text = f"{clock['skew_text']} {direction} the capture, not aligned"
-    elif state == "agrees":
-        text = f"aligned to the capture ({offset:+,g} s)" if offset else "matches the capture"
-    elif state == "disagree":
-        text = "pairs with the capture disagree"
-    elif ident and clock.get("reference") == ident.host:   # a sensor lane is measured against itself (clock.py)
-        text = "the reference clock"
+    words = state_words(clock, ident.host if ident else "", bool(offset))
+    if offset and state == "agrees":
+        text = f"{words} ({offset:+,g} s)"
+    elif offset and words == NOT_MEASURED:
+        text = f"{words}; offset {offset:+,g} s"
     else:
-        text = f"not measured; offset {offset:+,g} s" if offset else "not measured"
+        text = words
     return {"state": state, "text": text, "flag": state in ("suggest", "disagree"), "reason": clock.get("reason", "")}
 
 
@@ -498,6 +547,22 @@ def _integrity(files: dict, checks: dict, journal_path: Path, build: str, alignm
             "problems": checks["problems"], "changed_files": len(changed), "not_reread": len(not_reread),
             "found_at": checks["found_at"], "unreadable_lines": checks["unreadable_lines"], "journal_entries": entries,
             "times": times, "offsets": offsets, "build": build}
+
+
+# Where the Tool check line sends the reader. The Tools page shows the check of each tool's latest successful run
+# (toolbox.overview), so a differing run that a later run of the tool replaced, or one that failed or was stopped, is
+# counted by the line but is not on the page.
+TOOL_CHECK_WHERE = f"The Tools page shows the check of each tool's latest successful run. {RECORD_PATHS}"
+
+
+def _tool_check_row(runs: list[RunRecord], tool_names: dict[str, str]) -> dict | None:
+    """Integrity's tool check line: how many run records say their tool's files differed from the pin, the tools of those
+    runs by the names the page uses (a tool the page has no name for goes by its ID, as recorded), and the sentence. None
+    when no record says so. The page draws the sentence as text, which shows a bidi control in a name as its code point."""
+    count, names = differing_tools(runs, lambda tool: tool_names.get(tool, tool))
+    if not count:
+        return None
+    return {"runs": count, "tools": names, "text": differs_sentence(count, names, TOOL_CHECK_WHERE)}
 
 
 # Integrity's manifest line for the state the newest full re-hash found (intake.manifest_state); {entry} is the entry

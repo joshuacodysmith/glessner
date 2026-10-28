@@ -7,7 +7,9 @@
 // Case overview: a new tab from the printed link (sessionStorage is the tab's own), a new serve run or another open of the
 // case (each has its own open ID, /api/meta's case_id), and a link or an address opened in the same tab, which is a
 // navigation and not a reload. The Sources and View filters start off, as on every load, and the status line says so
-// when they were on.
+// when they were on. The window isn't put back when the case had no events, nor when it lies wholly before the case's
+// first event or after its last, as after a load that moves them all elsewhere in time: the reload opens on the
+// address's window, or fits the events.
 
 import { showAudit } from './audit.js';
 import { $, LISTED_EVENTS, S } from './core.js';
@@ -52,7 +54,10 @@ function place() {
   const view = S.anim ? S.anim.view : S.view;   // where a window still moving is going
   return {
     open: S.meta.case_id, tab: S.tab, preset: Number($('groupby').value) || 0,
-    view: { start: view.start, end: view.end }, focus: S.focus, selected, trail: S.trail, trailAt: S.trailAt,
+    // S.meta.rows is the count when this page opened. A page opened on a case with no events keeps no window, even after
+    // a load brings events and reloads it: fit() gave it 2 s around time 0, with nothing on the timeline
+    view: S.meta.rows ? { start: view.start, end: view.end } : null,
+    focus: S.focus, selected, trail: S.trail, trailAt: S.trailAt,
     details: detailsPlace(), draft: findingsDraft(), search: $('search').value,
     filtered: { sources: filterCount() > 0, view: viewCount() > 0 },
   };
@@ -75,7 +80,10 @@ export function savedPlace() {
   const tabs = ['overview', 'timeline', ...Object.keys(TAB_PAGES)];
   if (!saved || typeof saved !== 'object' || saved.open !== S.meta.case_id || !tabs.includes(saved.tab)) return null;
   const { start, end } = saved.view || {};
-  return { ...saved, view: Number.isFinite(start) && Number.isFinite(end) && start < end ? saved.view : null,
+  // Whether the window, which takes in its start and not its end, shows any of the span from the case's first event to
+  // its last; the span is in microseconds where the window is in milliseconds, and a case with no events has none
+  const shows = S.meta.start != null && start <= S.meta.end / 1000 && end > S.meta.start / 1000;
+  return { ...saved, view: Number.isFinite(start) && Number.isFinite(end) && start < end && shows ? saved.view : null,
            preset: Number.isInteger(saved.preset) && S.meta.presets[saved.preset] ? saved.preset : null };
 }
 
