@@ -48,8 +48,11 @@ jobs:
       # Each outgoing TCP connection takes a local port from Windows' dynamic range, 16,384 ports by default, and the side
       # that closes a connection first keeps its port for 2 minutes after. When Windows can't give a socket a port or
       # buffer space, the browser reports net::ERR_NO_BUFFER_SPACE. The tests use 127.0.0.1 only. The runner is
-      # discarded after the job, so the IPv4 range is widened here. The step fails unless the range in effect is the
-      # wider one, and it logs the range and the ports Windows excludes from it, for a failure to be read against. Only
+      # discarded after the job, so the IPv4 range is widened here. The wider range holds 10080, the one port from 10000
+      # to 65535 that Chromium, and so Edge, refuses as unsafe (kRestrictedPorts in net/base/port_util.cc). A server
+      # that binds port 0 can draw it, and its page then fails to load with net::ERR_UNSAFE_PORT, so the step excludes
+      # 10080 from the range. The step fails unless the range in effect is the wider one and the exclusions in effect
+      # list 10080, and it logs the range and the ports Windows excludes from it, for a failure to be read against. Only
       # here does the range take in the app's preferred port, 47613 (server.PREFERRED_PORT); the tests that bind that
       # port set one of their own.
       - name: Widen the dynamic port range
@@ -61,7 +64,12 @@ jobs:
           if ($range -notmatch 'Start Port\s*:\s*10000\s' -or $range -notmatch 'Number of Ports\s*:\s*55536\s') {
             throw 'The dynamic port range in effect is not 10000 to 65535.'
           }
-          netsh interface ipv4 show excludedportrange protocol=tcp
+          netsh interface ipv4 add excludedportrange protocol=tcp startport=10080 numberofports=1
+          $excluded = netsh interface ipv4 show excludedportrange protocol=tcp store=active | Out-String
+          $excluded
+          if ($excluded -notmatch '(?m)^\s*10080\s+10080\s') {
+            throw 'Port 10080 is not excluded from the dynamic port range in effect.'
+          }
 
       # The browser tests drive the runner's Microsoft Edge. With GLESSNER_REQUIRE_BROWSER set, a runner image without Edge
       # fails them, where otherwise each would be skipped and the job would pass.

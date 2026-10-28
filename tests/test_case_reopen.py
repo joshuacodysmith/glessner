@@ -174,7 +174,7 @@ def test_a_reopen_that_waits_too_long_leaves_a_case_opened_meanwhile_open(synthe
 def test_a_reopen_waiting_for_its_case_does_not_hold_up_the_open_of_another(synthetic_case, tmp_path, monkeypatch):
     """The wait for an earlier open of a case to close runs outside the hub's lock, so an open of a different case
     meanwhile goes through at once."""
-    monkeypatch.setattr(server, "REOPEN_WAIT_SECONDS", 3)
+    monkeypatch.setattr(server, "REOPEN_WAIT_SECONDS", 10)
     second = copy_case(synthetic_case, tmp_path / "second", "Second", "cody")
     third = copy_case(synthetic_case, tmp_path / "third", "Third", "cody")
     hub = Hub(synthetic_case)
@@ -187,7 +187,7 @@ def test_a_reopen_waiting_for_its_case_does_not_hold_up_the_open_of_another(synt
         time.sleep(0.3)
         started = time.monotonic()
         hub.open(third)
-        assert time.monotonic() - started < 1
+        assert time.monotonic() - started < 5   # a lock held through the reopen's wait would take over 9.7 s
         first.leave()
         held = False
         thread.join(10)

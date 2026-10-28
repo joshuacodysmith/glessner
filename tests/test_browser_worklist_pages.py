@@ -403,11 +403,16 @@ def test_a_page_of_events_all_listed_already_lists_the_marked_events_again(brows
     uids = {}
     for p in served_page(browser, synthetic_case, setup=mark_four(uids)):
         open_worklist(p)
+        p.evaluate(RECORD_REQUESTS)
         again = lambda url: url.endswith(f"{NEXT}=1")
         p.route(again, lambda route: route.fulfill(
             response=route.fetch(url=route.request.url.replace("offset=1", "offset=0"))))
         p.get_by_role("button", name="Show the next 1").click()
-        p.wait_for_function("(want) => document.getElementById('status').textContent === want", arg=CHANGED)
+        # Wait until the page has drawn the list it read again. The status line changes as that read goes out, and until it
+        # answers, the list before it stays on screen with a button the click below would take.
+        taken_all(p, "/api/investigate")
+        assert p.locator("#status").inner_text() == CHANGED
+        assert asked(p, "/api/investigate") == [f"{NEXT}=1", "/api/investigate"]
         p.unroute(again)
         p.wait_for_function(COUNTED)
         assert listed_uids(p) == [uids[0]]
