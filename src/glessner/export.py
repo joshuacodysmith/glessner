@@ -33,7 +33,7 @@ from .journal import Journal, State, analyst, head_of
 from .parsers.common import file_key, normalize_ip
 from .pivot_names import extra_of, service_names, task_names
 from .queries import BASE_FROM, BASE_WHERE, MARK_EXPR, TS, event_pairs
-from .runner import FOUND_OUTPUT, RunRecord, read_runs, rules_text
+from .runner import FOUND_OUTPUT, RunRecord, read_runs, rules_text, tool_names
 from .tools import load_registry
 from .tools_manifest import RECORD_PATHS, check_words, differing_tools, differs_sentence
 from .version import build_id
@@ -356,9 +356,11 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     ]
     if not rows:
         lines.append("No events are marked malicious or suspicious yet.")
+    specs = load_registry()
+    names = tool_names(specs)   # what the Case overview and the Tools page call each tool
     for number, row in enumerate(rows[:listed], 1):
         lines += _event_lines(number, row, identity, state.notes, tagged.get(row[0], []), pairs.get(row[0]), manifest,
-                              records, in_finding.get(row[0], []))
+                              records, names, in_finding.get(row[0], []))
     if listed is not None and len(rows) > listed:
         lines += ["", f"The preview lists the first {listed:,} of {len(rows):,} events. Write report lists them all."]
     lines += _tactics_section(rows, tagged)
@@ -366,7 +368,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
     lines += ["", heading[3], "", *_indicators_section(indicators(con, [r[0] for r in rows if r[3] == "Malicious"], identity),
                                                       malicious)]
     lines += ["", heading[4], "", *_hosts_section(identity, splits)]
-    differed = differs_sentence(*differing_tools(records.values(), _md), TOOL_CHECK_WHERE)
+    differed = differs_sentence(*differing_tools(records.values(), lambda tool: _md(names.get(tool, tool))), TOOL_CHECK_WHERE)
     lines += ["", heading[5], "", f"Evidence folder: `{_tick(case.settings.evidence_path)}`. {check}", "",
               *(head_lines(journal) if journal else []),
               *([f"Tool check: {differed}", ""] if differed else [])]
@@ -374,8 +376,7 @@ def report_text(con: duckdb.DuckDBPyConnection, case: Case, identity: Identity, 
               "on; the marks and the findings are the analyst's, and a rule's or a tool's suggestion counts only once the "
               "analyst accepts it.", "",
               "| Run | Tool | Version | Host | Events | Rules | Tool check |", "|---|---|---|---|---|---|---|"]
-    specs = load_registry()
-    lines += [f"| `{run_id}` | {tool} | {version} | {_md(host)} | {count:,} | "
+    lines += [f"| `{_cell_tick(run_id)}` | {_md(names.get(tool, tool))} | {_md(version)} | {_md(host)} | {count:,} | "
               f"{_md(rules_text(records[run_id], specs)) if run_id in records else ''} | "
               f"{_md(check_words(records[run_id].tool_check)) if run_id in records else ''} |"
               for run_id, tool, version, host, count in runs]
@@ -397,7 +398,7 @@ def _tool_files_lines(run_ids: list[str], records: dict[str, RunRecord]) -> list
                  "as the lines `sha256sum` prints for its files, by their paths in the folder with forward slashes, sorted in "
                  "code point order, leaving out a .git folder and links.", ""]
     for files, ids in by_files.items():
-        lines.append(f"- {'Run' if len(ids) == 1 else 'Runs'} {', '.join(f'`{run_id}`' for run_id in ids)}:")
+        lines.append(f"- {'Run' if len(ids) == 1 else 'Runs'} {', '.join(f'`{_tick(run_id)}`' for run_id in ids)}:")
         lines += [f"  - `{_tick(path)}`: `{sha}`" for path, sha in files]
     return lines
 
@@ -541,11 +542,12 @@ SYSTEM_VOLUME = re.compile(r"^SYSVOL(?=[\\/])", re.IGNORECASE)
 def _in_windows_folder(path: str) -> bool:
     """Whether a file path is one of the Windows folder's own files, or is below its System32, SysWOW64, or Sysnative
     folder, on any drive, in any case, and with either slash. The path is read as the file key reads it (file_key), so a
-    prefetch volume, a device path, NT's \\??\\ and \\SystemRoot, a variable such as %SystemRoot%, and a doubled backslash
-    count; SYSVOL is a domain controller's system volume, as the registry parser reads it. A path that starts with one
-    forward slash is a URL or Unix path, and a path with no root names no volume, so neither counts. The Windows folder's
-    other subfolders, such as Temp and Tasks, where a dropped file can sit, and look-alike names do not count. Everything
-    below System32, SysWOW64, and Sysnative does, such as System32\\Tasks and System32\\spool."""
+    prefetch volume, a device path, a volume GUID path, the \\\\?\\ and \\\\.\\ prefixes, NT's \\??\\ and \\SystemRoot, a
+    variable such as %SystemRoot%, and a doubled backslash count; SYSVOL is a domain controller's system volume, as the
+    registry parser reads it. A path that starts with one forward slash is a URL or Unix path, and a path with no root
+    names no volume, so neither counts. The Windows folder's other subfolders, such as Temp and Tasks, where a dropped
+    file can sit, and look-alike names do not count. Everything below System32, SysWOW64, and Sysnative does, such as
+    System32\\Tasks and System32\\spool."""
     below = file_key(SYSTEM_VOLUME.sub("C:", path)).split("\\")[1:]
     return len(below) > 1 and below[0] == "windows" and (len(below) == 2 or below[1] in SYSTEM_FOLDERS)
 
@@ -651,8 +653,8 @@ def _indicators_section(found: list[dict], malicious: int) -> list[str]:
         return lines + ["The events marked Malicious carry no parsed value of these kinds."]
     lines += ["| Type | Value | Marked events | First seen | Last seen | Note |", "|---|---|---|---|---|---|"]
     seen = lambda us: "No time recorded" if us is None else _time(us)
-    lines += [f"| {g['type']} | `{_tick(g['value'])}` | {g['events']:,} | {seen(g['first'])} | {seen(g['last'])} | {g['note']} |"
-              for g in found]
+    lines += [f"| {g['type']} | `{_cell_tick(g['value'])}` | {g['events']:,} | {seen(g['first'])} | {seen(g['last'])} | "
+              f"{g['note']} |" for g in found]
     return lines
 
 
@@ -744,12 +746,12 @@ def _hosts_section(identity: Identity, splits: list[tuple]) -> list[str]:
 
 
 def _event_lines(number: int, row: tuple, identity: Identity, notes: dict[str, list[dict]], tags: list[tuple],
-                 pair: dict | None, manifest: dict[str, str], records: dict[str, RunRecord],
+                 pair: dict | None, manifest: dict[str, str], records: dict[str, RunRecord], names: dict[str, str],
                  findings: list[str] = ()) -> list[str]:
     """One numbered event of the timeline: its time, host, mark, and message, then the findings it supports, its clock,
     notes, Hayabusa rules, tags, source, and ID. `row` is report_text's query's, `tags` the event's (kind, label, ord),
-    `pair` its other half in the clock check, if any, `records` the case's run records by run ID, and `findings` the open
-    findings it is linked to, as "1. Title"."""
+    `pair` its other half in the clock check, if any, `records` the case's run records by run ID, `names` each tool's
+    name by ID (tool_names), and `findings` the open findings it is linked to, as "1. Title"."""
     uid, ts, host, label, note, message, tool, version, run_id, artifact, source, record, rules, offset = row
     lines = [f"{number}. **{'No time recorded' if ts is None else _time(ts)}, {_md(host)}, {label}.** {_md(message)}"]
     if findings:
@@ -770,7 +772,8 @@ def _event_lines(number: int, row: tuple, identity: Identity, notes: dict[str, l
         own = [label for kind, label, _ in tags if kind == "tag"]
         lines.append("   - " + "; ".join(([f"ATT&CK: {_md(', '.join(phases))}"] if phases else []) +
                                          ([f"Tags: {_md(', '.join(own))}"] if own else [])))
-    lines.append(f"   - Source: {tool} {version}, run `{run_id}`, {artifact} `{_tick(source)}` record `{_tick(record)}`, "
+    lines.append(f"   - Source: {_md(names.get(tool, tool))} {_md(version)}, run `{_tick(run_id)}`, {artifact} `{_tick(source)}` "
+                 f"record `{_tick(record)}`, "
                  f"{_evidence_hash(cited_files(source or '', records.get(run_id), version), source or '', manifest)}.")
     lines.append(f"   - Event ID: `{uid}`")
     return lines
@@ -868,6 +871,12 @@ def _tick(text) -> str:
     """Evidence text for a Markdown code span: a backtick would end the span, and a line break could end its
     paragraph, letting the rest render as Markdown. A bidi control is written as its code point, which stays literal."""
     return _show_controls(str(text or "")).replace("`", "'").replace("\r", " ").replace("\n", " ")
+
+
+def _cell_tick(text) -> str:
+    """Evidence text for a code span in a table row: _tick's, with each pipe escaped. GFM ends a cell at a pipe even
+    inside a code span, and drops the backslash of an escaped one, so the span shows the pipe."""
+    return _tick(text).replace("|", r"\|")
 
 
 def _line_start(line: str) -> str:

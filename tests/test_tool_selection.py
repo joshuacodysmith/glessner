@@ -10,7 +10,7 @@ from test_runner import fake_spec, with_spec
 from glessner.case import create_case
 from glessner.identify import EVTX_MAGIC, LNK_CLSID, LNK_HEADER_SIZE, REGF_MAGIC
 from glessner.intake import add_new, current_entries, intake
-from glessner.runner import RunError, build_argv, inputs_without, plan_runs, run
+from glessner.runner import RunError, build_argv, evidence_read, inputs_without, plan_runs, read_beside, run
 from glessner.tools import DetectedTool, load_registry
 
 LNK = LNK_HEADER_SIZE + LNK_CLSID + bytes(60)
@@ -34,7 +34,10 @@ def selecting_tool(tmp_path):
     return with_spec(tool, args=tool.spec.args[:-1] + ("ok",))
 
 
-SELECTING = {"lecmd": ("*.lnk",), "pecmd": ("*.pf",), "evtxecmd": ("*.evtx",), "hayabusa": ("*.evtx",)}
+RECMD_NAMES = ("*USRCLASS*", "*SYSTEM*", "*SAM*", "*SOFTWARE*", "*AMCACHE*", "*SYSCACHE*", "*SECURITY*", "*DRIVERS*",
+               "*COMPONENTS*", "*DEFAULT*", "*USER*", "*SETTINGS*", "*REGISTRY*")
+SELECTING = {"lecmd": ("*.lnk",), "pecmd": ("*.pf",), "evtxecmd": ("*.evtx",), "hayabusa": ("*.evtx",),
+             "recmd": RECMD_NAMES}
 
 
 def test_the_registry_names_the_patterns_the_tools_read():
@@ -136,15 +139,72 @@ def test_a_run_whose_every_input_is_left_out_is_refused_before_anything_is_made(
 
 
 HIVE = REGF_MAGIC + bytes(100)
+# Names of hives RECmd reads in a folder, and names it passes over: it reads a file whose name holds one of the hive
+# names it knows, without regard to case, wherever the name stands in it
+READ_BY_RECMD = ("NTUSER.DAT.bak", "SYSTEM.old", "x_SOFTWARE_y", "SAM", "SECURITY", "DEFAULT", "COMPONENTS", "DRIVERS",
+                 "UsrClass.dat", "Amcache.hve", "SYSCACHE.hve", "Settings.dat", "user.dat", "registry.dat")
+NOT_READ_BY_RECMD = ("other.dat", "nameless.hve", "plain_hive", "odd.bak", "renamed_hive.bak", "BCD", "ELAM")
 
 
-def hive_case(tmp_path):
-    """HOST holds a user's NTUSER.DAT with both of its transaction logs beside it."""
+def recmd_case(tmp_path):
+    """HOST holds hives with names RECmd reads and hives with names it passes over; ONLY holds a hive it passes over
+    and that hive's transaction log."""
+    evidence = tmp_path / "evidence"
+    for host, names in (("HOST", READ_BY_RECMD + NOT_READ_BY_RECMD), ("ONLY", ("other.dat", "other.dat.LOG1"))):
+        (evidence / host).mkdir(parents=True)
+        for name in names:
+            (evidence / host / name).write_bytes(HIVE)
+    case = create_case(tmp_path / "case", "Selects", evidence, "cody")
+    intake(case)
+    return case
+
+
+def test_a_plan_names_the_hives_recmd_would_not_read(tmp_path):
+    case = recmd_case(tmp_path)
+    tool = DetectedTool(load_registry()["recmd"], Path("RECmd.exe"), "2026.10.2")
+    plans = {plan.host: plan for plan in plan_runs(case, tool)}
+    assert sorted(plans["HOST"].inputs) == sorted(f"HOST/{name}" for name in READ_BY_RECMD + NOT_READ_BY_RECMD)
+    assert sorted(plans["HOST"].left_out) == sorted(f"HOST/{name}" for name in NOT_READ_BY_RECMD)
+    assert plans["ONLY"].left_out == plans["ONLY"].inputs == ("ONLY/other.dat", "ONLY/other.dat.LOG1")
+
+
+def test_a_run_on_a_host_with_a_renamed_hive_notes_it(tmp_path):
+    """The fake tool reads hives as RECmd does, and selects what RECmd's registry entry selects."""
+    evidence = tmp_path / "evidence"
+    (evidence / "HOST").mkdir(parents=True)
+    for name in ("NTUSER.DAT", "NTUSER.DAT.LOG1", "other.dat"):
+        (evidence / "HOST" / name).write_bytes(HIVE)
+    case = create_case(tmp_path / "case", "Selects", evidence, "cody")
+    intake(case)
+    base = fake_spec(tmp_path)
+    tool = with_spec(base, handles=("registry", "registry_log"), selects=load_registry()["recmd"].selects,
+                     args=base.spec.args[:-1] + ("ok",))
+    (plan,) = plan_runs(case, tool)
+    record = run(case, plan)
+    assert record.status == "ok" and record.inputs == ["HOST/NTUSER.DAT", "HOST/NTUSER.DAT.LOG1", "HOST/other.dat"]
+    assert record.notes == [f"1 file that intake identified for Fake was not read: it reads only files named "
+                            f"{' or '.join(RECMD_NAMES)} in a folder, and this one is named otherwise: HOST/other.dat."]
+
+
+def test_a_host_whose_hives_are_all_renamed_is_refused_by_recmd_before_anything_is_made(tmp_path):
+    case = recmd_case(tmp_path)
+    tool = DetectedTool(load_registry()["recmd"], Path("RECmd.exe"), "2026.10.2")
+    (plan,) = plan_runs(case, tool, ["ONLY"])
+    with pytest.raises(RunError) as refused:
+        run(case, plan)
+    assert str(refused.value) == (
+        f"RECmd wasn't run on ONLY: it reads only files named {' or '.join(RECMD_NAMES)}, and the 2 files intake "
+        "identified for it are named otherwise: ONLY/other.dat; ONLY/other.dat.LOG1.")
+    assert not case.runs_folder.exists() or list(case.runs_folder.iterdir()) == []
+
+
+def hive_case(tmp_path, log2=HIVE):
+    """HOST holds a user's NTUSER.DAT with both of its transaction logs beside it, the second holding `log2`."""
     evidence = tmp_path / "evidence"
     folder = evidence / "HOST" / "Users" / "u"
     folder.mkdir(parents=True)
-    for name in ("NTUSER.DAT", "NTUSER.DAT.LOG1", "NTUSER.DAT.LOG2"):
-        (folder / name).write_bytes(HIVE)
+    for name, data in (("NTUSER.DAT", HIVE), ("NTUSER.DAT.LOG1", HIVE), ("NTUSER.DAT.LOG2", log2)):
+        (folder / name).write_bytes(data)
     case = create_case(tmp_path / "case", "Hives", evidence, "cody")
     intake(case)
     return case
@@ -256,6 +316,65 @@ def test_a_log_the_tool_reads_is_covered_by_the_evidence_check_though_it_is_not_
     assert "--nl" not in record.argv and record.inputs == ["HOST/Users/u/NTUSER.DAT"]
     assert (record.status, record.evidence_check) == ("failed", "mismatch")
     assert record.evidence_problems == ["HOST/Users/u/NTUSER.DAT.LOG1: SHA-256 changed"]
+
+
+def test_a_log_intake_left_unidentified_is_covered_by_the_evidence_check_when_the_tool_reads_the_logs(tmp_path):
+    """A zeroed NTUSER.DAT.LOG2 has no regf signature, so intake leaves it unidentified, but a tool that replays the logs
+    beside a hive reads it with the signed NTUSER.DAT.LOG1."""
+    case = hive_case(tmp_path, log2=bytes(len(HIVE)))
+    log2 = "HOST/Users/u/NTUSER.DAT.LOG2"
+    assert next(e for e in current_entries(case) if e.path == log2).artifact is None
+    (plan,) = plan_runs(case, logging_tool(tmp_path, "ntuser.dat.log2"))
+    assert read_beside(case, plan) == ["HOST/Users/u/NTUSER.DAT.LOG1", log2]
+    record = run(case, plan)
+    assert "--nl" not in record.argv
+    assert (record.status, record.evidence_check) == ("failed", "mismatch")
+    assert record.evidence_problems == [f"{log2}: SHA-256 changed"]
+
+
+AMCACHE_FOLDER = "HOST/Windows/AppCompat/Programs"
+
+
+def amcache_case(tmp_path, logs=("Amcache.hve.LOG1", "Amcache.hve.LOG2")):
+    """HOST holds Amcache.hve with the given transaction logs beside it."""
+    folder = tmp_path / "evidence" / AMCACHE_FOLDER
+    folder.mkdir(parents=True)
+    for name in ("Amcache.hve", *logs):
+        (folder / name).write_bytes(HIVE)
+    case = create_case(tmp_path / "case", "Amcache", tmp_path / "evidence", "cody")
+    intake(case)
+    return case
+
+
+def amcacheparser(case, tmp_path):
+    (plan,) = plan_runs(case, DetectedTool(load_registry()["amcacheparser"], Path("AmcacheParser.exe"), "2026.10.1"))
+    return plan, build_argv(case, plan, tmp_path / "out", {})
+
+
+def test_amcacheparser_reads_the_transaction_logs_beside_its_hive_and_its_run_checks_them(tmp_path):
+    case = amcache_case(tmp_path)
+    plan, argv = amcacheparser(case, tmp_path)
+    hive = f"{AMCACHE_FOLDER}/Amcache.hve"
+    assert "--nl" not in argv
+    assert evidence_read(case, plan) == [hive, f"{hive}.LOG1", f"{hive}.LOG2"]
+
+
+def test_amcacheparser_skips_the_logs_when_its_hive_has_none_beside_it(tmp_path):
+    """Without --nl AmcacheParser stops at a dirty hive whose logs weren't collected."""
+    case = amcache_case(tmp_path, logs=())
+    plan, argv = amcacheparser(case, tmp_path)
+    assert argv[-1] == "--nl" and read_beside(case, plan) == []
+
+
+def test_a_run_on_one_hive_notes_that_it_skipped_the_logs_of_its_hive(tmp_path):
+    case = amcache_case(tmp_path, logs=())
+    tool = with_spec(logging_tool(tmp_path), handles=("registry:AMCACHE",), input="each_file")
+    tool = with_spec(tool, args=(tool.spec.args[0], "{input_file}", "{output_dir}", "ok"))
+    (plan,) = plan_runs(case, tool)
+    record = run(case, plan)
+    assert record.status == "ok" and record.argv[-1] == "--nl"
+    assert record.notes == [f"Ran with --nl, so Fake skipped the transaction logs of its hive: {AMCACHE_FOLDER}/Amcache.hve "
+                            "has none beside it."]
 
 
 def test_a_changed_hive_still_fails_the_evidence_check(tmp_path):

@@ -15,7 +15,8 @@ from glessner.intake import add_new, check_files, intake, read_manifest, unverif
 from glessner.long_paths import long_path
 from glessner.start import check
 
-pytestmark = pytest.mark.skipif(os.name != "nt", reason="the Win32 path rules are Windows'")
+pytestmark = [pytest.mark.skipif(os.name != "nt", reason="the Win32 path rules are Windows'"),
+              pytest.mark.usefixtures("tmp_path_removed")]
 
 
 def put(root: Path, rel: str, data: bytes) -> None:

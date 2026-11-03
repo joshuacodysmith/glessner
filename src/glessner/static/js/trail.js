@@ -1,4 +1,4 @@
-import { $, el, plural, S } from './core.js';
+import { $, el, lookup, plural, S } from './core.js';
 
 // ---------- the pivot trail ----------
 // How the analyst reached the event on screen: the event they started from, each pivot taken, and each event opened from
@@ -11,10 +11,9 @@ import { $, el, plural, S } from './core.js';
 // artifactName reads it: only a name the table holds itself, so an import named constructor reads as written.
 function eventWhat(ev) {
   const channel = ev.log_channel ? ` ${ev.log_channel}` : '';
-  const names = S.meta?.artifact_names || {};
   return ev.artifact === 'evtx' ? `${ev.event_code || 'event'}${ev.logon_type ? ` type ${ev.logon_type}` : ''}`
     : ev.artifact === 'suricata' || ev.artifact === 'zeek' ? `${ev.artifact === 'zeek' ? 'Zeek' : 'Suricata'}${channel}`
-    : (Object.hasOwn(names, ev.artifact) && names[ev.artifact]) || ev.artifact;
+    : lookup(S.meta?.artifact_names, ev.artifact) || ev.artifact;
 }
 
 // What an event is, and where.

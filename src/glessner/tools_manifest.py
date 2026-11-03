@@ -8,6 +8,7 @@ states (pin_states) compare the files as last hashed (PinCache) with the pin."""
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -15,12 +16,11 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from . import tools
-from .case import write_atomically
+from .case import utc_now, write_atomically
 from .tools import DetectedTool, ToolListing, ToolSpec, in_folder
 from .version import build_id
 
@@ -82,16 +82,13 @@ def manifest_file(folder: Path) -> Path:
     return folder / MANIFEST_FILE
 
 
-def utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 # ---------- Reading ----------
 
 def read_manifest(path: Path) -> Manifest | None:
     """The manifest at `path`, or None when there is no file. ManifestError, naming what is wrong, when the file can't be
     opened, isn't JSON, names a format this build doesn't read, holds a key it doesn't know or lacks one, or holds a hash
-    that isn't 64 lowercase hex digits."""
+    that isn't 64 lowercase hex digits. A byte order mark at the start, which some editors write, is read past; the
+    digest covers the file's bytes as they are."""
     try:
         data = path.read_bytes()
     except FileNotFoundError:
@@ -100,7 +97,7 @@ def read_manifest(path: Path) -> Manifest | None:
         raise ManifestError(f"{path} can't be opened: {exc.strerror or exc}") from exc
     digest = hashlib.sha256(data).hexdigest()
     try:
-        found = json.loads(data.decode("utf-8"))
+        found = json.loads(data.decode("utf-8-sig"))
     except ValueError as exc:   # a UnicodeDecodeError and a JSONDecodeError both
         raise ManifestError(f"it isn't JSON ({exc})", digest) from exc
     except RecursionError as exc:
@@ -212,9 +209,18 @@ def differences(entry: dict, listing: ToolListing, links: list[str]) -> list[dic
     return found
 
 
+def _state(pinned: str | None, now: str | None) -> str:
+    """A path's state from its pinned hash or target and its present one, either None when it has none: same, added,
+    missing, or changed."""
+    if pinned == now:
+        return "same"
+    if pinned is None:
+        return "added"
+    return "missing" if now is None else "changed"
+
+
 def _difference(path: str, pinned: str | None, now: str | None) -> dict:
-    state = "added" if pinned is None else "missing" if now is None else "changed"
-    return {"path": path, "state": state, **({"pinned": pinned} if pinned is not None else {}),
+    return {"path": path, "state": _state(pinned, now), **({"pinned": pinned} if pinned is not None else {}),
             **({"now": now} if now is not None else {})}
 
 
@@ -230,8 +236,7 @@ def link_states(pinned: list[str], now: list[str]) -> list[dict]:
     states = []
     for path in sorted(before.keys() | after.keys()):
         old, new = before.get(path), after.get(path)
-        state = "same" if old == new else "added" if old is None else "missing" if new is None else "changed"
-        states.append({"path": path, "state": state, **({"pinned": old} if old is not None else {}),
+        states.append({"path": path, "state": _state(old, new), **({"pinned": old} if old is not None else {}),
                        **({"now": new} if new is not None else {})})
     return states
 
@@ -484,16 +489,25 @@ def _take(tool: DetectedTool) -> Taken:
     return Taken(str(tool.executable), utc_now(), pin.listing, pin.links, "")
 
 
+class _Kept(NamedTuple):
+    """A tool's files as PinCache keeps them, with `began`, the cache's count when their hash began or their pin was
+    kept: the higher count is the newer."""
+    began: int
+    taken: Taken
+
+
 class PinCache:
     """The files of each found tool as last hashed for the Tools page, by tool ID, so the page compares them with the
-    manifest without hashing each time it is drawn. Filled by the page alone (get); dropped for the tools a job ran, since
-    its run may have changed what the tool reads, and cleared by a scan. A hash taken while an entry was dropped is not
-    kept, so it can't bring back what the drop removed."""
+    manifest without hashing each time it is drawn. Filled by the page (get) and by a pin (put); dropped for the tools a
+    job ran, since its run may have changed what the tool reads, and cleared by a scan. A hash taken while an entry was
+    dropped is not kept, so it can't bring back what the drop removed, and neither is one that began before the kept
+    entry's own hash or pin, so a slow hash of older files can't replace newer ones."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._items: dict[str, Taken] = {}
+        self._items: dict[str, _Kept] = {}
         self._generation = 0
+        self._count = itertools.count()
 
     def __len__(self) -> int:
         return len(self._items)
@@ -504,20 +518,21 @@ class PinCache:
         tool_id = tool.spec.id
         with self._lock:
             kept = self._items.get(tool_id)
-            if kept is not None and kept.executable == str(tool.executable):
-                return kept
-            generation = self._generation
+            if kept is not None and kept.taken.executable == str(tool.executable):
+                return kept.taken
+            generation, began = self._generation, next(self._count)
         taken = _take(tool)   # outside the lock: a folder of thousands of files takes seconds
         with self._lock:
-            if generation == self._generation:
-                self._items[tool_id] = taken
+            newer = self._items.get(tool_id)
+            if generation == self._generation and (newer is None or newer.began < began):
+                self._items[tool_id] = _Kept(began, taken)
         return taken
 
     def put(self, tool: DetectedTool, pin: Pin) -> None:
-        """Keep the files of a pin just made as the tool's."""
+        """Keep the files of a pin just made as the tool's. A hash that began before this and ends after it isn't kept."""
         taken = Taken(str(tool.executable), utc_now(), pin.listing, pin.links, "")
         with self._lock:
-            self._items[tool.spec.id] = taken
+            self._items[tool.spec.id] = _Kept(next(self._count), taken)
 
     def drop(self, tool_ids: list[str]) -> None:
         with self._lock:
@@ -641,7 +656,7 @@ def _rows(entry: dict, listing: ToolListing, diffs: list[dict]) -> list[dict]:
     rows = []
     for key in sorted(entry["files"].keys() | listing.hashes.keys()):
         pinned, now = entry["files"].get(key), listing.hashes.get(key)
-        state = "same" if pinned == now else "added" if pinned is None else "missing" if now is None else "changed"
+        state = _state(pinned, now)
         row = {"path": key, "pinned": pinned or "", "now": now or "", "state": state, "depth": 0}
         inside = [d for d in diffs if d["path"].startswith(key) and not d.get("link")] if key.endswith("/") else []
         if state == "changed" and inside:

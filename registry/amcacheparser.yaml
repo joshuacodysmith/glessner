@@ -10,8 +10,13 @@ detect:
 dotnet: 10
 handles: ["registry:AMCACHE"]   # only the Amcache.hve hive, not every registry file
 input: each_file
+# AmcacheParser replays a dirty hive's transaction logs when they sit beside it, so the newest entries are read. --nl
+# skips them, and lets it process a dirty hive whose logs were not collected, where it would otherwise stop. So the
+# runner adds --nl only when the hive has no transaction log beside it.
+without_related:
+  - {artifact: registry_log, args: ["--nl"]}
 run:
-  # -i adds the file entries linked to programs. Transaction logs beside the hive are used when present.
+  # -i adds the file entries linked to programs.
   args: ["-f", "{input_file}", "-i", "--csv", "{output_dir}"]
   timeout_minutes: 15
 options: []

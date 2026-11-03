@@ -1,7 +1,7 @@
-// The page after a reload. F5 in the same tab, while the server still has the same
-// open of the case, comes back to the path's step, the Details page, the selection and the event in focus with the pivot
-// trail, the search box's text, the Lanes preset, and the timeline's window. On the Findings page it also comes back to
-// the open finding forms, new or an edit, as they were typed, and the report summary's unsaved text; a saved finding or
+// The page after a reload. F5 in the same tab, while the server still has the same open of the case, comes back to the
+// path's step, the Details page, the selection with its list's unticked rows, the event in focus with the pivot trail,
+// the search box's text, the Lanes preset, and the timeline's window. On the Findings page it also comes back to the
+// open finding forms, new or an edit, as they were typed, and the report summary's unsaved text; a saved finding or
 // summary leaves none to bring back. When the Findings page can't draw them, as its read failed or another page came
 // first, they wait for its next draw, through further reloads on any step. Every other load opens on the
 // Case overview: a new tab from the printed link (sessionStorage is the tab's own), a new serve run or another open of the
@@ -9,19 +9,21 @@
 // navigation and not a reload. The Sources and View filters start off, as on every load, and the status line says so
 // when they were on. The window isn't put back when the case had no events, nor when it lies wholly before the case's
 // first event or after its last, as after a load that moves them all elsewhere in time: the reload opens on the
-// address's window, or fits the events.
+// address's window, or fits the events, and the status line says which.
 
 import { showAudit } from './audit.js';
 import { $, LISTED_EVENTS, S } from './core.js';
+import { windowUs } from './data.js';
 import { draw } from './draw.js';
-import { claimDetails, fillFocusEvent, loadDetails } from './event_page.js';
+import { claimDetails, fillFocusEvent, loadDetails, newListing } from './event_page.js';
 import { filterCount } from './filters.js';
-import { findingsDraft, keepFindingsDraft, showFindings } from './findings.js';
+import { findingsDraft, keepFindingsDraft, retiredWords, showFindings } from './findings.js';
 import { behindOverview, markTab } from './frame.js';
 import { showImport } from './import.js';
 import { pivot, showInvestigate, showRules } from './pages.js';
+import { groupReviewOf } from './review.js';
 import { showSearch, showSearchHelp } from './search.js';
-import { showSuggestions, shownSuggestions } from './suggestions.js';
+import { reopenGroupPage, showSuggestions, shownSuggestions } from './suggestions.js';
 import { showTools } from './tools.js';
 import { viewCount } from './view.js';
 
@@ -39,6 +41,9 @@ const LISTS = ['pile', 'opened'];
 function detailsPlace() {
   const panel = $('details'), name = panel.dataset.page, key = panel.dataset.key || '';
   if (name === 'event' && S.focus && key === `event:${S.focus}`) {
+    // A review doesn't outlast a reload, so a group's review lands on the group's page
+    const reviewed = groupReviewOf(S.focus);
+    if (reviewed) return { name: 'suggestions', ...reviewed.group.place, reviewStopped: true };
     const p = S.pivotResult && S.pivotResult.uid === S.focus ? S.pivotResult : null;   // its list is on the page
     return { name, uid: S.focus, pivot: p && { kind: p.kind, seconds: p.seconds, ip: p.ip, more: p.more || {} } };
   }
@@ -49,24 +54,50 @@ function detailsPlace() {
 }
 
 function place() {
-  // A selection longer than a list holds is kept as its event in focus alone, rather than cut to part of it
-  const selected = S.selected.size <= LISTED_EVENTS ? [...S.selected] : (S.focus ? [S.focus] : []);
+  // The selection list, when it lists the event in focus and events the selection doesn't hold
+  const listing = S.listed?.of === S.selected && S.listed.uids.has(S.focus) && S.listed.uids.size > S.selected.size
+    ? S.listed : null;
+  let selected = [...S.selected], listed = null, ticks = null;
+  if (listing) {
+    // The list is kept whole. Each listed event is saved once, the event in focus first so that a list longer than
+    // LISTED_EVENTS shows it among its first rows, and `ticks` has a 1 for each event the selection holds and a 0 for
+    // the others.
+    listed = [...new Set([S.focus, ...listing.uids])];
+    ticks = listed.map((uid) => (S.selected.has(uid) ? 1 : 0));
+    selected = null;
+  } else if (selected.length > LISTED_EVENTS) {
+    // A selection longer than a list holds is kept as its event in focus alone, rather than cut to part of it
+    selected = S.focus ? [S.focus] : [];
+  }
   const view = S.anim ? S.anim.view : S.view;   // where a window still moving is going
   return {
     open: S.meta.case_id, tab: S.tab, preset: Number($('groupby').value) || 0,
     // S.meta.rows is the count when this page opened. A page opened on a case with no events keeps no window, even after
     // a load brings events and reloads it: fit() gave it 2 s around time 0, with nothing on the timeline
     view: S.meta.rows ? { start: view.start, end: view.end } : null,
-    focus: S.focus, selected, trail: S.trail, trailAt: S.trailAt,
+    focus: S.focus, selected, listed, ticks, trail: S.trail, trailAt: S.trailAt,
     details: detailsPlace(), draft: findingsDraft(), search: $('search').value,
     filtered: { sources: filterCount() > 0, view: viewCount() > 0 },
   };
 }
 
-// Saved as the page goes, which a reload, a closed tab, and a navigation all pass through
+// Whether the tab's storage took the place; it refuses one when it is blocked or full
+function save(kept) {
+  try {
+    sessionStorage.setItem(PLACE_KEY, JSON.stringify(kept));
+    return true;
+  } catch (_) { return false; }
+}
+
+// Saved as the page goes, which a reload, a closed tab, and a navigation all pass through. A place too large for the
+// tab's storage is saved with the selection cut to its event in focus. A place that still can't be saved is removed, so
+// the reload opens the overview rather than a place saved before.
 export function keepPlace() {
   window.addEventListener('pagehide', () => {
-    try { sessionStorage.setItem(PLACE_KEY, JSON.stringify(place())); } catch (_) { /* storage blocked: the reload opens the overview */ }
+    const kept = place();
+    const cut = { ...kept, selected: kept.focus ? [kept.focus] : [], listed: null, ticks: null, cut: true };
+    if (save(kept) || save(cut)) return;
+    try { sessionStorage.removeItem(PLACE_KEY); } catch (_) { /* storage blocked: the reload opens the overview */ }
   });
 }
 
@@ -81,18 +112,31 @@ export function savedPlace() {
   if (!saved || typeof saved !== 'object' || saved.open !== S.meta.case_id || !tabs.includes(saved.tab)) return null;
   const { start, end } = saved.view || {};
   // Whether the window, which takes in its start and not its end, shows any of the span from the case's first event to
-  // its last; the span is in microseconds where the window is in milliseconds, and a case with no events has none
-  const shows = S.meta.start != null && start <= S.meta.end / 1000 && end > S.meta.start / 1000;
+  // its last. The span is in microseconds, and the window is compared in them as the view asks for it; a case with no
+  // events has no span.
+  const asked = windowUs({ start, end });
+  const shows = S.meta.start != null && asked.start <= S.meta.end && asked.end > S.meta.start;
   return { ...saved, view: Number.isFinite(start) && Number.isFinite(end) && start < end && shows ? saved.view : null,
            preset: Number.isInteger(saved.preset) && S.meta.presets[saved.preset] ? saved.preset : null };
 }
 
 // Put the place back, once the lanes have loaded and the window is set (main.init), and return the status line's words.
-// The Details page is drawn behind the overview when the overview was up, so the Timeline step shows it again.
-export async function restorePlace(saved) {
-  S.selected = new Set(Array.isArray(saved.selected) ? saved.selected : []);
+// The Details page is drawn behind the overview when the overview was up, so the Timeline step shows it again. In place
+// of a window savedPlace didn't put back, the reload opened on the address's window when `addressed`, or fitted the
+// case's events, and the words say which.
+export async function restorePlace(saved, addressed = false) {
   S.focus = typeof saved.focus === 'string' ? saved.focus : null;
-  if (S.focus) S.selected.add(S.focus);
+  // A selection list comes back with its ticks when it listed the event in focus and another event, so the event in
+  // focus stays unselected when its row was unticked. Otherwise the saved selection comes back with the event in focus.
+  const listed = Array.isArray(saved.listed) && saved.listed.length > 1 && saved.listed.includes(S.focus) ? saved.listed : null;
+  if (listed) {
+    const ticks = Array.isArray(saved.ticks) ? saved.ticks : [];
+    S.selected = new Set(listed.filter((_, i) => ticks[i] === 1));
+    S.listed = newListing(S.selected, listed);
+  } else {
+    S.selected = new Set(Array.isArray(saved.selected) ? saved.selected : []);
+    if (S.focus) S.selected.add(S.focus);
+  }
   if (Array.isArray(saved.trail)) {
     S.trail = saved.trail;
     S.trailAt = Number.isInteger(saved.trailAt) && saved.trailAt < S.trail.length ? saved.trailAt : S.trail.length - 1;
@@ -103,6 +147,8 @@ export async function restorePlace(saved) {
   const details = saved.details || {};
   // The page the Details panel had in place of the event's, or null when the event in focus draws its own
   const page = details.name === 'search' ? () => showSearch(details.q)
+    : details.name === 'suggestions' && typeof details.group === 'string'
+      ? () => reopenGroupPage(details.source, details.groupBy || '', details.limit || 0, details.group)
     : details.name === 'suggestions' ? () => showSuggestions(details.source, details.groupBy || '', details.limit || 0)
     : Object.hasOwn(PAGES, details.name) ? PAGES[details.name] : null;
   const drawDetails = async () => {
@@ -131,11 +177,11 @@ export async function restorePlace(saved) {
     }
   }
   const words = ['Back where the page was before the reload.'];
+  if (saved.cut) words.push(`The selection was too large to keep across a reload${S.focus ? ', so it is cut to the open event' : ''}.`);
+  if (!saved.view) words.push(addressed ? 'The window is the one in the address now.' : "The window fits the case's events now.");
   if (details.name === 'list') words.push('Its list of events is not kept across a reload.');
-  if (retired) {
-    words.push(retired === 1 ? 'The finding being edited was retired, so its changes are not kept.'
-      : `${retired} findings being edited were retired, so their changes are not kept.`);
-  }
+  if (details.reviewStopped) words.push("A review stops at a reload, so this is the group's page.");
+  if (retired) words.push(retiredWords(retired));
   const { sources, view } = saved.filtered || {};
   if (sources || view) {
     const which = sources && view ? 'the Sources and View filters' : sources ? 'the Sources filter' : 'the View filter';

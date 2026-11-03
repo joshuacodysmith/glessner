@@ -19,7 +19,16 @@ const LIVE_TITLES = new Set(['fit', 'filtersButton', 'viewButton', 'investigateB
 let hint = null;   // the Details panel's opening hint, which the Timeline step shows when no event is in focus
 let behind = false;   // a page is being drawn behind the overview (behindOverview)
 
+// The status line takes two lines only in the row of the case's name and state, whose two lines set that row's height. In
+// any other row a second line would make the header grow, so it keeps to one. A status that changes rows changes the
+// header's height, which calls this again.
+function fitStatus() {
+  const status = $('status').getBoundingClientRect(), name = $('caseId').getBoundingClientRect();
+  $('status').classList.toggle('beside-case', status.top < name.bottom && name.top < status.bottom);
+}
+
 export function setupFrame() {
+  new ResizeObserver(fitStatus).observe(document.querySelector('header'));
   for (const [id, text] of Object.entries(HINTS)) {
     const node = $(id);
     if (node && !LIVE_TITLES.has(id)) node.title = text;

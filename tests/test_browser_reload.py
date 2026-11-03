@@ -5,10 +5,11 @@ page it brings back an open finding form, new or an edit, and the report summary
 can't draw them, as its read fails or another page comes first, they wait for its next draw, which says what of them it
 couldn't open; New finding from an Event page then opens the kept form's words over its own events. A new tab, the link
 opened again in the same tab, another open of the case, and blocked storage still start on the Case overview, and the
-status line says what a reload drops. The window isn't put back when the case had no events, nor when it lies wholly
-before the case's first event or after its last, as after a load that moves them all elsewhere in time: the reload fits
-the events. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke does, and are skipped
-without it."""
+status line says what a reload drops. A place too large for the tab's storage comes back with the selection cut to the
+open event, and one the storage refuses opens on the overview. The window isn't put back when the case had no events,
+nor when it lies wholly before the case's first event or after its last, as after a load that moves them all elsewhere
+in time: the reload fits the events, or opens on the address's window, and the status line says which. They drive the
+installed Microsoft Edge through Playwright, as test_browser_smoke does, and are skipped without it."""
 
 import json
 import re
@@ -25,6 +26,7 @@ from glessner.server import api_finding, api_mark, api_setting
 pytestmark = pytest.mark.browser
 READY = "() => window.__ready === true && window.__app.S.data !== null"
 BACK = "Back where the page was before the reload."
+FITS = f"{BACK} The window fits the case's events now."   # after a reload that doesn't put the window back
 WINDOW = "() => [window.__app.S.view.start, window.__app.S.view.end]"
 # What a reload puts back, read from the page: the window, the selection and focus, the trail, and the Details page.
 # Back's history is not kept (its pages reopen through functions), so the band is read without its Back link.
@@ -117,8 +119,8 @@ def test_the_reload_after_a_first_load_in_a_case_with_no_events_fits_the_events_
         browser, tmp_path, times, button):  # noqa: F811
     """A case with no events has no span to fit, so its window is 2 s around 1970. The Import page's first load reloads
     the page, which fits the events loaded rather than putting that window back, also when one is from before 1970, as a
-    file's link time can be, and their span takes in that window. The status line says the page is back, with no word on
-    the window. The case is made and taken in as the start page makes one."""
+    file's link time can be, and their span takes in that window. The status line says the page is back, and that the
+    window fits the case's events now. The case is made and taken in as the start page makes one."""
     from glessner.case import create_case
     from glessner.intake import intake
 
@@ -143,14 +145,16 @@ def test_the_reload_after_a_first_load_in_a_case_with_no_events_fits_the_events_
         p.wait_for_function("(n) => document.getElementById('stInWindow').textContent === `In this window: ${n}`",
                             arg=len(times))
         p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
-        assert status(p) == BACK
+        assert status(p) == FITS
 
 
 def test_the_reload_after_a_load_that_moves_every_event_elsewhere_in_time_fits_the_events(browser, tmp_path):  # noqa: F811
     """A log imported with the wrong time field, then again with the right one, has its only event replaced by one five
     years later. The reload after the second import fits that event rather than putting back the first one's window,
-    which now shows nothing. The status line says the page is back, with no word on the window. A window takes in its
-    start and not its end, so one that ends at the event isn't put back either, and one that starts at it is."""
+    which now shows nothing, and the status line says so. A window takes in its start and not its end, so one that ends
+    at the event isn't put back either, and one that starts at it is, as is one that starts under a microsecond after it,
+    since the view asks for the window from its start's microsecond. On an address that names a window, a reload that
+    doesn't put the window back opens on the address's, and the status line says that instead."""
     from glessner.case import create_case
     from glessner.imports import guess_mapping, run_import, sniff
     from glessner.intake import intake
@@ -174,11 +178,22 @@ def test_the_reload_after_a_load_that_moves_every_event_elsewhere_in_time_fits_t
         fitted = p.evaluate(WINDOW)
         assert fitted[0] < when < fitted[1]
         p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
-        assert status(p) == BACK
-        for window, kept in (([when - 5000, when], False), ([when, when + 5000], True)):
+        assert status(p) == FITS
+        for window, kept in (([when - 5000, when], False), ([when, when + 5000], True), ([when + 0.0005, when + 5000], True)):
             p.evaluate("(w) => window.__app.setView(...w)", window)
             reload(p)
             assert p.evaluate(WINDOW) == pytest.approx(window if kept else fitted, abs=1)
+            p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
+            assert status(p) == (BACK if kept else FITS)
+        named = [datetime(2020, 9, 19, hour, tzinfo=UTC).timestamp() * 1000 for hour in (3, 4)]
+        p.goto(f"{p.url.split('?')[0]}?start=2020-09-19T03:00:00Z&end=2020-09-19T04:00:00Z")
+        p.wait_for_function(READY)
+        assert p.evaluate(WINDOW) == named
+        p.evaluate("(w) => window.__app.setView(...w)", [when - 5000, when])
+        reload(p)
+        assert p.evaluate(WINDOW) == named
+        p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
+        assert status(p) == f"{BACK} The window is the one in the address now."
 
 
 def test_a_reload_comes_back_to_the_path_s_step_a_search_and_a_page_of_the_case_menu(browser, synthetic_case):  # noqa: F811
@@ -261,6 +276,42 @@ def test_a_new_tab_the_link_again_another_open_and_blocked_storage_start_on_the_
         p.add_init_script("Object.defineProperty(window, 'sessionStorage', { get() { throw new Error('blocked'); } });")
         reload(p)
         assert p.locator("#overview").is_visible() and current(p) == "Overview"
+
+
+def test_a_place_too_large_to_save_keeps_the_open_event_and_one_storage_refuses_opens_the_overview(
+        browser, synthetic_case):  # noqa: F811
+    """A place too large for the tab's storage, as a selection list of 200,000 events makes, is saved with the selection
+    cut to the open event. F5 comes back to that event alone and says so, rather than to the place an earlier reload
+    saved. When the storage takes no place at all, the one saved before is removed, so F5 opens on the overview."""
+    for p in served_page(browser, synthetic_case):
+        first, second, third = p.evaluate("() => [...new Set(window.__app.S.data.events.map((e) => e.uid))].slice(0, 3)")
+        open_event(p, first)
+        reload(p)
+        p.wait_for_selector(f"#details[data-key='event:{first}'] .ev-ident")
+        open_event(p, second)
+        # The open event unticked in a list of 200,000 events, whose IDs are more than the tab's storage holds
+        p.evaluate("""async (u) => {
+            const { newListing } = await import('/js/event_page.js');
+            const S = window.__app.S;
+            S.selected = new Set(Array.from({ length: 200000 }, (_, i) => i.toString(16).padStart(32, '0')));
+            S.listed = newListing(S.selected, [u, ...S.selected]);
+        }""", second)
+        reload(p)
+        p.wait_for_selector(f"#details[data-key='event:{second}'] .ev-ident")
+        p.wait_for_function("(text) => (document.getElementById('status').title || '').startsWith(text)", arg=BACK)
+        assert status(p) == f"{BACK} The selection was too large to keep across a reload, so it is cut to the open event."
+        assert p.evaluate("[...window.__app.S.selected]") == [second]
+        # Storage that refuses every place
+        p.evaluate("""() => {
+            const setItem = Storage.prototype.setItem;
+            Storage.prototype.setItem = function (key, value) {
+                if (this === sessionStorage) throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+                return setItem.call(this, key, value);
+            };
+        }""")
+        open_event(p, third)
+        reload(p)
+        assert p.locator("#overview").is_visible() and current(p) == "Overview" and not status(p).startswith(BACK)
 
 
 def test_the_status_line_says_what_a_reload_turned_off_and_could_not_keep(browser, synthetic_case):  # noqa: F811

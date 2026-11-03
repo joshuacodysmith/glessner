@@ -7,7 +7,7 @@ detect:
   executables: [SQLECmd.exe]
   version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
 # Browser history, downloads, searches, and typed URLs (Chrome, Edge, Brave, Firefox), and Windows notifications, by
-# the maps in the tool's Maps folder. The .NET 10 build; .NET 10 from the tools folder.
+# the maps in the tool's Maps folder and the app's (compose). The .NET 10 build; .NET 10 from the tools folder.
 # SQLite may write beside a database it opens, so it runs on copies, with each database's log files. --hunt false: a
 # map applies to the database file it names, rather than to every SQLite file.
 dotnet: 10
@@ -17,14 +17,23 @@ work_on_copies: true
 copy_also: [sqlite_log]
 run_in_run_folder: true
 run:
-  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--hunt", "false"]
+  args: ["-d", "{host_dir}", "--csv", "{output_dir}", "--hunt", "false", "--maps", "{maps_dir}"]
   timeout_minutes: 30
 options: []
 outputs: ["*.csv"]
-# The database maps it reads from its Maps folder, and the native SQLite library that parses the databases, which the
-# 2026.10 build loads from runtimes\<platform>\native in its own folder: a run and a pin record their SHA-256, and the
-# set is named by its count of maps. Builds before 2026.10 have no runtimes folder; they hold that code in SQLECmd.dll,
-# which is hashed, and unpack SQLite.Interop.dll into their working folder, so the tool starts in the run's folder.
+# The maps folder a run gives SQLECmd, written into its output folder: the files of SQLECmd's Maps folder, then the
+# app's maps in sqlecmd_maps, which read what SQLECmd's maps don't, such as the downloads of a History without a
+# downloads.guid column.
+compose:
+  maps_dir:
+    tool: Maps
+    app: sqlecmd_maps
+    label: {kind: count, path: 'sqlecmd_maps/*.smap', text: "with {value} Glessner maps"}
+# The database maps it composes from its Maps folder, and the native SQLite library that parses the databases, which
+# the 2026.10 build loads from runtimes\<platform>\native in its own folder: a run and a pin record their SHA-256, and
+# the set is named by its count of maps and the app's. Builds before 2026.10 have no runtimes folder; they hold that
+# code in SQLECmd.dll, which is hashed, and unpack SQLite.Interop.dll into their working folder, so the tool starts in
+# the run's folder.
 tool_files: [Maps, runtimes]
 rules_label: {kind: count, path: 'Maps\*.smap', text: "Maps, {value} maps"}
 empty_result: "SQLECmd's maps matched none of the host's SQLite databases."

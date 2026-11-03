@@ -1,9 +1,9 @@
-import { askGroupDecision, markWord } from './confirm.js';
-import { $, api, codePrefix, el, fmtAt, fmtGap, fmtUs, gapTitle, markBadge, markState, PIVOT_LABELS, plural, post, reportAction, RULE_TEMPLATE, S, setStatus } from './core.js';
+import { askGroupDecision, markWord, rejectMeans } from './confirm.js';
+import { $, api, codePrefix, el, fmtAt, fmtGap, fmtUs, gapTitle, markBadge, MARKS, markState, PIVOT_LABELS, plural, post, reportAction, RULE_TEMPLATE, S, setStatus, showControls } from './core.js';
 import { animateView } from './data.js';
 import { draw } from './draw.js';
-import { applyMark, button, claimDetails, decide, loadDetails, pageAction, pageRead, readOnlyHint, refreshTrail, reloadTimeline,
-         reportWrite, setPage, settleRedraw, shownAt, showingPage } from './event_page.js';
+import { applyMark, button, claimDetails, decide, loadDetails, pageAction, pageRead, readOnlyHint, refreshTrail, rejectTicked,
+         reloadTimeline, reportWrite, setPage, settleRedraw, shownAt, showingPage } from './event_page.js';
 import { filterParam } from './filters.js';
 import { rowQuery } from './pivots.js';
 import { startReview } from './review.js';
@@ -312,7 +312,7 @@ export async function showRules() {
   // line, and the page still redraws.
   const write = async (body) => {
     const done = pageAction('rules');
-    try { await post('/api/rule', body); } catch (err) { message.textContent = err.message; return; }
+    try { await post('/api/rule', body); } catch (err) { message.textContent = showControls(err.message); return; }
     const reloadError = await reloadTimeline();
     done();
     if (reloadError) reportWrite(RULE_WRITTEN[body.op], null, reloadError);
@@ -338,10 +338,13 @@ export async function showRules() {
   drew('rules', showRules);
 }
 
+// Add a note to an event; returns whether it was written
 export async function addNote(uid, text) {
-  if (!text.trim()) return;
+  if (!text.trim()) return false;
   const done = pageAction(`event:${uid}`);
-  try { await post('/api/note', { uid, text }); done(); } catch (err) { setStatus(`Note failed: ${err.message}`); }
+  try { await post('/api/note', { uid, text }); } catch (err) { setStatus(`Note failed: ${err.message}`); return false; }
+  done();
+  return true;
 }
 
 // A pivot draws only if it is the latest asked and the panel still shows its event's page: one that answers after the
@@ -522,6 +525,11 @@ export function renderRelated() {
 // keeps it.
 const listNotes = new WeakMap();
 
+// The events with a pending suggestion, as their rows last drew, by the list's set of ticked events. A tick can outlast its
+// row or belong to another list drawn with the same set, as a pivot's ticks last across pivots and a search's lists share
+// theirs, so one list's rows don't say it of every tick.
+const listPending = new WeakMap();
+
 // The list's column heading sticks under the list's own head, which can wrap and so change height: the head's height is
 // kept on the list as --list-head-h, which the heading's `top` reads (the CSP allows a script to set a size). One observer
 // at a time, since one list is on screen.
@@ -599,16 +607,20 @@ function markWords(cell, words) {
 // the find reads, and `highlight` those it marks. `covers` begins the foot's sentence about what the find leaves whole:
 // "The meter and the counts still cover". With `listed` under `total` the list is cut: the box says it reaches the listed
 // rows, and `searchAll(text)`, for a search, runs it again over every match. `onApply(shown)` gets the set of the shown
-// rows' data-uid, or null with no find, after each change. `shown()` gives that set at any time.
+// rows' data-uid, or null with no find, after each change. `shown()` gives that set at any time. `kept`, an object, keeps
+// the text in its `find` in place of `page` and `name`, for a list that outlives its page, as the Event page's selection
+// list does through the events its rows open. Rows that match `uncounted` show and hide with the find, and its counts and
+// sentences leave them out.
 export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-time, .rel-host, .rel-event, .rel-col',
                                  highlight = '.rel-host, .rel-text', covers = 'The counts still cover', listed = null,
-                                 total = null, more = 'matches', searchAll = null, onApply = null }) {
+                                 total = null, more = 'matches', searchAll = null, onApply = null, kept = null, uncounted = null }) {
+  const counted = (row) => !uncounted || !row.matches(uncounted);
   const cut = listed != null && total != null && total > listed;
   const label = cut ? `Find in the ${listed.toLocaleString()} listed` : 'Find in this list';
   const input = el('input', { type: 'search', 'aria-label': label, placeholder: label, autocomplete: 'off', spellcheck: 'false',
     title: cut ? `Shows only the listed rows holding every word. It reaches the ${listed.toLocaleString()} listed, not every match.`
       : `Shows only the rows holding every word, in any column. ${covers} every row.` });
-  input.value = findTextOf(page, name);
+  input.value = kept ? kept.find : findTextOf(page, name);
   const count = el('span', { class: 'find-words' });
   const clear = () => { input.value = ''; apply(); input.focus(); };
   const clearButton = button('Clear', clear, { class: 'linklike find-clear' });
@@ -621,7 +633,7 @@ export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-
     return (parts.length ? [...parts].map((c) => c.textContent) : [row.textContent]).join('\n');
   };
   const apply = () => {
-    S.finds.lists.set(name, input.value);
+    if (kept) kept.find = input.value; else S.finds.lists.set(name, input.value);
     const words = findWords(input.value);
     for (const m of list.querySelectorAll('mark.find-hit')) m.replaceWith(...m.childNodes);
     for (const cell of list.querySelectorAll(highlight)) cell.normalize();   // split text joins again, so a word is whole
@@ -632,12 +644,12 @@ export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-
       const hit = !words.length || words.every(({ test }) => test.test(textOf(row)));
       row.classList.toggle('find-out', !hit);
       if (!hit) continue;
-      shown++;
+      if (counted(row)) shown++;
       if (!words.length) continue;
       if (row.dataset.uid) shownNow.add(row.dataset.uid);
       for (const cell of row.querySelectorAll(highlight)) markWords(cell, words);
     }
-    const n = all.length, hidden = n - shown;
+    const n = all.filter(counted).length, hidden = n - shown;
     count.hidden = clearButton.hidden = !words.length;
     count.textContent = !words.length ? '' : cut ? `${shown.toLocaleString()} of the ${listed.toLocaleString()} listed match`
       : `${shown.toLocaleString()} of ${n.toLocaleString()} ${n === 1 ? 'row matches' : 'rows match'}`;
@@ -664,8 +676,10 @@ export function listFind(list, { page, name, rows = 'li.rel-row', cells = '.rel-
 // A list of events to tick and mark, for pivot results, search results, and the events a count opened. Each row is a
 // grid: tick, review-state badge, time, offset, host, and the event, then the `column`, as { head, value(e) }, at the
 // right with a heading row, such as which end an address was on. The
-// heading row is the list's first row and sticks under its head (see stickUnder). `rerender` redraws the list after a
-// tick; `afterMark` refreshes it after marks are written, given a function that redraws the page the list is on unless a
+// heading row is the list's first row and sticks under its head (see stickUnder). The head's buttons offer the Event page
+// header's four marks in its order and colors, and, while a ticked event has a pending suggestion, Reject N suggestions
+// with a line saying what that does. `rerender` redraws the list after a tick; `afterMark` refreshes it after marks or
+// rejections are written, given a function that redraws the page the list is on unless a
 // page has been asked for since (pageAction's), and `afterTag` after a tag from its Tag button, by the same rule (applyTags
 // in tags.js). `label(e)` gives the nodes of the event cell and `highlight(text)`
 // those of the host cell, which search uses to mark its terms. `offsets` false leaves out the offset column, as a search,
@@ -692,6 +706,22 @@ export function markableList(events, checked, rerender, afterMark, { label = nul
     listNotes.delete(checked);
     await afterMark(done);
   };
+  if (!listPending.has(checked)) listPending.set(checked, new Set());
+  const pending = listPending.get(checked);
+  for (const e of events) {
+    if (markState(e.mark).suggested) pending.add(e.uid); else pending.delete(e.uid);
+  }
+  // The request names the ticked events with a suggestion only, so the server's skipped are those decided meanwhile, and a
+  // ticked event with none keeps its tick for the marks
+  const tickedPending = () => [...checked].filter((uid) => pending.has(uid));
+  const rejectChecked = async (ev) => {
+    const uids = tickedPending();
+    const done = pageAction($('details').dataset.key);   // the page the list is on
+    if (!await rejectTicked(uids, note.value, ev.currentTarget)) return;   // the ticks and the note stay for another try
+    for (const uid of uids) { checked.delete(uid); pending.delete(uid); }
+    listNotes.delete(checked);
+    await afterMark(done);
+  };
   let shown = null;   // the uids the find shows, or null with no find
   const everyShownTicked = () => shown.size > 0 && [...shown].every((uid) => checked.has(uid));
   const selectLabel = () => {
@@ -707,16 +737,23 @@ export function markableList(events, checked, rerender, afterMark, { label = nul
     rerender();
   });
   selectAll.textContent = selectLabel();
+  const count = checked.size ? `${checked.size} ` : '';
+  const toReject = tickedPending().length;
   const buttons = [
     selectAll,
-    button(checked.size ? `Mark ${checked.size} Malicious` : 'Mark Malicious', () => markChecked('Malicious')),
-    button(checked.size ? `Mark ${checked.size} Suspicious` : 'Mark Suspicious', () => markChecked('Suspicious')),
+    ...MARKS.map((m) => button(m === 'Unreviewed' ? `Set ${count}to Unreviewed` : `Mark ${count}${m}`, () => markChecked(m),
+                               { class: `mark-${m.toLowerCase()}` })),
+    ...(toReject ? [button(`Reject ${plural(toReject, 'suggestion')}`, rejectChecked,
+                           { title: 'Reject the suggestions on the ticked events; the note, if any, is kept with the rejection' })] : []),
     note,
     button(checked.size ? `Tag ${checked.size} as...` : 'Tag as...', (e) => {
       if (!checked.size) { setStatus('Tick the events to tag first.'); return; }
       const r = e.currentTarget.getBoundingClientRect();
-      openTagPicker([...checked], r.left, r.bottom + 2, new Set(), { after: afterTag });
-    })];
+      // The picker's head counts the ticked events, since one ticked event may not be the page's event
+      const head = `Tag ${plural(checked.size, 'ticked event')}`;
+      openTagPicker([...checked], r.left, r.bottom + 2, new Set(), { after: afterTag, head });
+    }),
+    ...(toReject ? [el('span', { class: 'muted list-hint' }, rejectMeans('their sources'))] : [])];
   const withOffset = offsets ?? events.some((e) => e.gap_s != null);
   // The heading row has no tick box: "Mark" spans the tick's column and the badge's, so it lines up with both
   const cell = (cls, ...nodes) => el('span', { class: cls }, ...nodes);

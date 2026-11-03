@@ -1,0 +1,7 @@
+description: User LNK files from Recent and Desktop folders.
+type: include
+path_separator: '/'
+paths:
+- '/Users/.+/AppData/Roaming/Microsoft/Windows/Recent/.+\.lnk'
+- '/Users/.+/AppData/Roaming/Microsoft/Office/Recent/.+\.lnk'
+- '/Users/.+/Desktop/.+\.lnk'

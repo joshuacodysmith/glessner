@@ -310,6 +310,18 @@ def test_a_rules_checkout_s_label_ignores_git_s_own_files_and_what_git_status_wo
     assert rules_label(tool.spec, tool.executable) == original
 
 
+def test_a_rules_folder_that_cannot_be_read_is_named_unreadable_never_by_its_commit_alone(tmp_path, monkeypatch):
+    """A folder in the rules that can't be listed, as one whose ACL denies it, leaves the files part unknown. The label
+    says so, since the commit alone would read as a checkout whose files are as committed. A run's own hashes, which
+    hold the folder's, still name it."""
+    tool, unpacked = checkout(tmp_path), hayabusa(tmp_path / "zip")
+    shut(monkeypatch, "sigma")
+    assert rules_label(tool.spec, tool.executable) == "Hayabusa rules fffbdd1, files unreadable"
+    assert detect([tool.spec], tmp_path / "tools")["hayabusa"].rules == "Hayabusa rules fffbdd1, files unreadable"
+    assert rules_label(unpacked.spec, unpacked.executable) == "Hayabusa rules unreadable"
+    assert rules_label(tool.spec, tool.executable, {"rules/": "ab" * 32}) == "Hayabusa rules fffbdd1, files abababab"
+
+
 def test_the_eric_zimmerman_tools_are_named_by_their_maps_count_and_their_batch_file_s_version(tmp_path):
     evtx, sqle, recmd = (tmp_path / name for name in ("EvtxECmd", "SQLECmd", "RECmd"))
     write(evtx, {"EvtxECmd.exe": b"MZ", "Maps/a.map": b"a", "Maps/b.map": b"b", "Maps/c.MAP": b"c",
@@ -319,8 +331,8 @@ def test_the_eric_zimmerman_tools_are_named_by_their_maps_count_and_their_batch_
     write(recmd, {"RECmd.exe": b"MZ", "BatchExamples/DFIRBatch.reb":
                   b"Description: DFIR RECmd Batch File\nAuthor: someone\nVersion: 2.22\nId: 77ae78db\nKeys:\n"})
     assert rules_label(spec("evtxecmd"), evtx / "EvtxECmd.exe") == "Maps, 3 maps"
-    assert rules_label(spec("sqlecmd"), sqle / "SQLECmd.exe") == "Maps, 2 maps"
-    assert rules_label(spec("recmd"), recmd / "RECmd.exe") == "DFIRBatch.reb 2.22"
+    assert rules_label(spec("sqlecmd"), sqle / "SQLECmd.exe") == "Maps, 2 maps with 2 Glessner maps"
+    assert rules_label(spec("recmd"), recmd / "RECmd.exe") == "DFIRBatch.reb 2.22 with Glessner additions 1"
     (recmd / "BatchExamples" / "DFIRBatch.reb").write_bytes(b"Description: no version\nKeys:\n")
     assert rules_label(spec("recmd"), recmd / "RECmd.exe") == ""
     assert rules_label(spec("evtxecmd"), tmp_path / "Elsewhere" / "EvtxECmd.exe") == ""   # no Maps folder
@@ -402,8 +414,8 @@ def test_a_tool_s_listing_gives_the_hashes_tool_files_gives_and_the_files_of_eac
 
 def install(root: Path, tool_spec: tools.ToolSpec, rules: bool = True) -> DetectedTool:
     """The tool unpacked under `root` with every file its registry entry names: its executable and the .dll of the same
-    name, a file for each argument that names a path in its folder, one in each folder its tool_files lists, and, with
-    `rules`, the rules block's file and version file."""
+    name, a file for each argument that names a path in its folder, the batch file a compose entry reads, one file in
+    each other folder its tool_files lists, and, with `rules`, the rules block's file and version file."""
     folder = root / tool_spec.id
     exe = next((name for name in tool_spec.executables if not set("*?[") & set(name)), tool_spec.executables[0])
     files = {exe: b"MZ", f"{Path(exe).stem}.dll": b"MZ dll"}
@@ -412,7 +424,12 @@ def install(root: Path, tool_spec: tools.ToolSpec, rules: bool = True) -> Detect
             path = Path(text.replace("{tool_dir}", str(folder)))
             if path.is_absolute() and path.is_relative_to(folder):
                 files[path.relative_to(folder).as_posix()] = b"read\n"
-    files |= {f"{rel}/one.txt": b"in a folder\n" for rel in tool_spec.tool_files}
+    batches = {entry.tool for kind, entry in tool_spec.compose.items() if kind == "batch_file"}
+    for rel in tool_spec.tool_files:
+        if rel in batches:
+            files[Path(rel).as_posix()] = b"Version: 1\nKeys:\n"
+        else:
+            files[f"{Path(rel).as_posix()}/one.txt"] = b"in a folder\n"
     if tool_spec.rules and rules:
         files[tool_spec.rules["file"].replace("\\", "/")] = b"rules\n"
         files[tool_spec.rules["version_file"].replace("\\", "/")] = b"Rules 1\n"

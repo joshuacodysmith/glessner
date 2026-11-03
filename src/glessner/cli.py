@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import hashlib
 import json
 import re
 import sys
@@ -20,20 +19,24 @@ from . import heads
 from .case import CASE_FORMAT, FIRST_CHAINED, JOURNAL_FILE, Case, CaseError, copy_case, create_case, open_case
 from .events import connect, from_us
 from .intake import (
+    UNRECORDED_MANIFEST,
     ManifestCheck,
     add_new,
     check_files,
     current_entries,
     first_unvouched,
     intake,
+    line_ending_sha256,
     manifest_missing,
     manifest_state,
     manifest_text,
     matched_text,
+    none_listed_text,
     read_manifest,
     record_at_head,
     recorded_manifest,
     records_manifest,
+    sha256_file,
     unverified_text,
 )
 from .journal import REPLAY_ERRORS, Journal, JournalError, check, head_of, replay
@@ -41,12 +44,13 @@ from .journal import Check as JournalCheck
 from .line_logs import LAYOUTS
 from .overview import counted_actions, utc_minute
 from .parsers.common import evidence_relative
-from .rekey import upgraded, upgraded_copy
+from .rekey import left_references, left_warning, upgraded, upgraded_copy
 from .runner import LEFT_OUT, NOT_READ, RunError, RunPlan, check_options, plan_runs, read_runs, rebuild
 from .tools import detect, load_registry, recommend
 from .tools_manifest import (
     Pin,
     PinCache,
+    and_list,
     differences,
     manifest_file,
     pin_states,
@@ -437,15 +441,14 @@ def journal_verify(case: Case, expect: str | None, file: Path | None) -> Journal
 
 def _file_record(file: Path, found, against: str | None, named: str) -> tuple[str, bool]:
     """verify --file: the file's record counts only at or before a head kept outside the case,
-    since anyone who can write the case folder can append a chained record after it."""
+    since anyone who can write the case folder can append a chained record after it. The file is read in pieces, since
+    an export can be larger than memory, and read again only when no entry has its SHA-256, for its line endings."""
     from .audit import file_words
 
-    data = file.read_bytes()
-    sha = hashlib.sha256(data).hexdigest()
+    sha = sha256_file(file)
     match = next(((line, seq) for line, seq, h in found.files if h == sha), None)
     if match is None:
-        lf = data.replace(b"\r\n", b"\n")
-        turned = {hashlib.sha256(d).hexdigest() for d in (lf, lf.replace(b"\n", b"\r\n"))}
+        turned = line_ending_sha256(file)
         other = next((seq for _, seq, h in found.files if h in turned), None)
         return ("No entry in this journal has this file's SHA-256. The file changed after it was written (a change of "
                 "line endings counts), the app stopped before it recorded the file, or another case wrote it."
@@ -488,11 +491,6 @@ def cmd_tools(case: Case, args) -> int:
     return 0
 
 
-def _names(names: list[str]) -> str:
-    """Names in a sentence: "A", "A and B", or "A, B, and C"."""
-    return " and ".join(names) if len(names) < 3 else f"{', '.join(names[:-1])}, and {names[-1]}"
-
-
 def _pin(case: Case, specs: dict, detected: dict, named: list[str]) -> int:
     """glessner tools --pin: pin the named tools, or with none named each tool in the tools folder that has no pin, after
     saying which tools, which manifest, and for a tool whose files differ from its pin what changed, and asking. Only a
@@ -522,7 +520,7 @@ def _pin(case: Case, specs: dict, detected: dict, named: list[str]) -> int:
     if not pins:
         print("Nothing to pin: every tool found in the tools folder has a pin.")
         return 0
-    names = _names([specs[i].name for i in ids])
+    names = and_list([specs[i].name for i in ids])
     path = manifest_file(folder)
     print(f"Pin {names} as {'it is' if len(ids) == 1 else 'they are'} now, in {path}? Every case that uses this tools "
           "folder compares with its pins.")
@@ -868,6 +866,8 @@ def orphan_warning(n: int) -> str:
 
 def cmd_rebuild(case: Case, args) -> int:
     case = upgraded(case)
+    if left := left_references(case):
+        print(left_warning(left))
     loaded, left_out = _rebuild(case)
     con = connect(case.db_path, read_only=True)
     try:
@@ -1117,9 +1117,10 @@ def cmd_close(case: Case, args) -> int:
     database a later format's step needs, such as a server of an earlier build or one whose case stayed at format 3
     with a read-only journal. The entry takes its turn under the journal's lock. On a case whose journal records the
     manifest, manifest.jsonl is compared with its record before the re-hash, and a manifest that grew past or differs
-    from its record fails the close as an evidence problem does; the entry records the comparison. The record counts
-    at or before the head recorded outside the case as the open found it, since the open moves that head to the newest
-    line, past any record appended after it.
+    from its record fails the close as an evidence problem does: the entry's hash_check is a mismatch, as the re-hash's
+    line in verification.jsonl is, and the entry records the comparison. The record counts at or before the head
+    recorded outside the case as the open found it, since the open moves that head to the newest line, past any record
+    appended after it.
     """
     _require_intake(case, "No intake manifest; run intake before closing the case.")
     if case.settings.case_format < FIRST_CHAINED:
@@ -1134,12 +1135,11 @@ def cmd_close(case: Case, args) -> int:
     manifest = recorded_manifest(case, journal, at_open=True)
     found = check_files(case, reason="case close", manifest=manifest)
     problems, entries, unread = found.problems, found.checked, found.unverified
-    result = "ok" if not problems else "mismatch"
     # evidence_files counts the files checked. A file intake couldn't read is counted in unverified, not as matching,
     # and a folder walk couldn't list in unlisted_folders; verification.jsonl names each
     since = chain.chain.on_record[-1]["seq"] if chain.chain.on_record else None
     value = {"at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "evidence_files": entries,
-             "unverified": len(unread) - found.folders, "unlisted_folders": found.folders, "hash_check": result,
+             "unverified": len(unread) - found.folders, "unlisted_folders": found.folders, "hash_check": found.result,
              "problems": problems[:50], "chain": f"consistent since #{since}" if since else "consistent",
              "head_record": "matched" if record and chain.expected else "none",
              "journal_entries": chain.chain.nonblank + (chain.tail == "missing_lf")}
@@ -1149,6 +1149,7 @@ def cmd_close(case: Case, args) -> int:
     unread_text = unverified_text(unread, shown=len(unread))
     head = (f"Journal head after this close: {head_of(entry)} (entry #{entry['seq']}). Record it outside the case "
             "folder, such as in your case notes or ticket.")
+    against = UNRECORDED_MANIFEST if manifest and manifest.failed else "the intake manifest"
     if problems:
         print(f"Case closed with {plural(len(problems), 'evidence problem')}, recorded in the journal:")
         for problem in problems:
@@ -1156,16 +1157,16 @@ def cmd_close(case: Case, args) -> int:
         if unread_text:
             print(unread_text)
     elif unread_text:
-        print(f"Case closed. {matched_text(entries)} {unread_text} Recorded in the journal.")
+        print(f"Case closed. {matched_text(entries, against)} {unread_text} Recorded in the journal.")
     elif not entries:
-        print("Case closed. No evidence file was checked: the intake manifest lists none. Recorded in the journal.")
+        print(f"Case closed. {none_listed_text(against)} Recorded in the journal.")
     else:
         each = "The 1 evidence file matches" if entries == 1 else f"All {entries:,} evidence files match"
-        print(f"Case closed. {each} the intake manifest. Recorded in the journal.")
+        print(f"Case closed. {each} {against}. Recorded in the journal.")
     if manifest is not None:
         print(manifest_text(manifest))
     print(head)
-    return int(bool(problems) or bool(manifest and manifest.failed))
+    return int(found.result != "ok")
 
 
 def _parse_utc(text: str) -> int:

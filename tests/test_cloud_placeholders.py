@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from conftest import e01_digest, e01_segment
 from test_runner import fake_spec, with_spec
 
 from glessner import imports as imports_module
@@ -30,6 +31,8 @@ from glessner.intake import (
     walk_evidence,
 )
 from glessner.runner import UNREADABLE, RunError, _make_copies, check_host_folder, check_result, plan_runs, run
+from glessner.toolbox import overview as tools_overview
+from glessner.tools import load_registry
 
 CLOUD = "cloud.txt"
 NOT_ON_DISK = "a cloud placeholder whose content isn't on this disk"
@@ -208,6 +211,22 @@ def became_placeholder(monkeypatch, *names):
     monkeypatch.setattr(intake_module, "file_attributes",
                         lambda path: RECALL_ON_DATA_ACCESS if path.name in names else real(path))
     monkeypatch.setattr(intake_module, "is_placeholder", lambda entry: entry.name in names)
+
+
+def test_the_tools_page_reads_no_stored_hash_from_a_file_that_became_a_placeholder(tmp_path, monkeypatch):
+    """Reading an E01 that became a placeholder would download it, so its row keeps intake's SHA-256 and nothing else."""
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    md5, sha1 = bytes(range(16)), bytes(range(20))
+    (evidence / "disk.E01").write_bytes(e01_segment(e01_digest(md5, sha1), (b"done", b"")))
+    case = create_case(tmp_path / "case", "Cloud", evidence, "cody")
+    intake(case)
+    row = tools_overview(case, load_registry(), {})["disk_images_sample"][0]
+    assert (row["stored_md5"], row["stored_sha1"]) == (md5.hex(), sha1.hex())
+    became_placeholder(monkeypatch, "disk.E01")
+    row = tools_overview(case, load_registry(), {})["disk_images_sample"][0]
+    assert (row["stored_md5"], row["stored_sha1"]) == ("", "")
+    assert row["sha256"]
 
 
 def refuse_import_reads(monkeypatch):
@@ -427,6 +446,66 @@ def test_a_run_is_refused_when_a_file_it_reads_with_its_input_became_a_placehold
     became_placeholder(monkeypatch, "NTUSER.DAT.LOG1")
     with pytest.raises(RunError, match=rf"Fake wasn't run on HOST: .*{refusal('the tool', 'HOST/NTUSER.DAT.LOG1')}"):
         run(case, plan)
+    assert nothing_run(case)
+
+
+PROGRAMS = "HOST/Windows/AppCompat/Programs"
+
+
+def amcache_plan(tmp_path, *logs):
+    """A case whose HOST holds Amcache.hve with `logs` beside it, and the plan of the fake tool run once per file, which
+    declares the logs as AmcacheParser's registry entry does. AmcacheParser runs on its hive alone, so no walk of the
+    host's folder sees a log."""
+    folder = tmp_path / "evidence" / PROGRAMS
+    folder.mkdir(parents=True)
+    for name in ("Amcache.hve", *logs):
+        (folder / name).write_bytes(REGF_MAGIC + bytes(100))
+    case = create_case(tmp_path / "case", "Cloud", tmp_path / "evidence", "cody")
+    intake(case)
+    spec = load_registry()["amcacheparser"]
+    (plan,) = plan_runs(case, with_spec(each_file_tool(tmp_path), handles=spec.handles,
+                                        without_related=spec.without_related))
+    return case, plan
+
+
+def test_a_run_on_amcache_is_refused_when_a_log_beside_the_hive_became_a_placeholder(tmp_path, monkeypatch):
+    case, plan = amcache_plan(tmp_path, "Amcache.hve.LOG1")
+    became_placeholder(monkeypatch, "Amcache.hve.LOG1")
+    log = f"{PROGRAMS}/Amcache.hve.LOG1"
+    with pytest.raises(RunError, match=rf"Fake wasn't run on HOST: .*{refusal('the tool', log)}"):
+        run(case, plan)
+    assert nothing_run(case)
+
+
+def test_a_run_on_amcache_says_intake_never_hashed_a_log_it_recorded_as_a_placeholder(tmp_path, monkeypatch):
+    """The signed Amcache.hve.LOG1 is read as it was hashed; intake recorded Amcache.hve.LOG2 as a placeholder, so no hash
+    covers it, and making it available again won't do."""
+    mark_placeholder(monkeypatch, "Amcache.hve.LOG2")
+    case, plan = amcache_plan(tmp_path, "Amcache.hve.LOG1", "Amcache.hve.LOG2")
+    became_placeholder(monkeypatch, "Amcache.hve.LOG2")
+    with pytest.raises(RunError) as refused:
+        run(case, plan)
+    assert str(refused.value) == (
+        "Fake wasn't run on HOST: it reads files that intake never hashed. 1 cloud placeholder, whose content isn't on "
+        f"this disk, which the tool would download by reading it: {PROGRAMS}/Amcache.hve.LOG2. Make the folder "
+        "available on this disk and start a new case from it, or remove it.")
+    assert nothing_run(case)
+
+
+def test_a_run_refusal_names_each_kind_of_placeholder_it_would_read(tmp_path, monkeypatch):
+    """One that intake recorded as a placeholder, and one that became one after intake hashed the file."""
+    mark_placeholder(monkeypatch, "Amcache.hve.LOG2")
+    case, plan = amcache_plan(tmp_path, "Amcache.hve.LOG1", "Amcache.hve.LOG2")
+    became_placeholder(monkeypatch, "Amcache.hve.LOG1", "Amcache.hve.LOG2")
+    with pytest.raises(RunError) as refused:
+        run(case, plan)
+    assert str(refused.value) == (
+        "Fake wasn't run on HOST: it reads files that intake never hashed. 1 cloud placeholder, whose content isn't on "
+        f"this disk, which the tool would download by reading it: {PROGRAMS}/Amcache.hve.LOG2. Make the folder "
+        "available on this disk and start a new case from it, or remove it. It also reads files that intake hashed "
+        "before they became cloud placeholders. 1 cloud placeholder, whose content isn't on this disk, which the tool "
+        f"would download by reading it: {PROGRAMS}/Amcache.hve.LOG1. Make it available on this disk and try again; "
+        "intake's hash still covers it.")
     assert nothing_run(case)
 
 

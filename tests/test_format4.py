@@ -728,6 +728,70 @@ def test_the_format_4_step_names_the_runs_it_cannot_read_while_the_evidence_is_o
     assert suricata_rows(case) == before
 
 
+def left_run_warning(run_id: str, counts: str) -> str:
+    """The line a rebuild prints first when the format 4 step left run `run_id` and its events hold `counts`."""
+    return (f"Warning: the upgrade to case format 4 left the events of run {run_id} with the IDs an earlier build gave "
+            "them, as its journal entry says. This rebuild gives them new IDs, or leaves out a run whose output it can't "
+            f"load, so {counts} on those events will then refer to events that no longer exist. Mark those events again "
+            "once a rebuild has loaded them.")
+
+
+def test_a_rebuild_warns_of_the_references_on_the_events_of_a_run_the_format_4_step_left(tmp_path, monkeypatch, capsys):
+    """The evidence is offline at the first open with this build, so the step leaves the run's events with the IDs an
+    earlier build gave them and names the run. With the evidence back, a rebuild gives those events new IDs. Before it
+    loads, it names the run and counts the marks, tags, notes, and findings on them, which then refer to no event. The
+    next rebuild has nothing to warn of."""
+    case = linked_case_at_format_3(tmp_path, monkeypatch)
+    before, [run] = suricata_rows(case), read_runs(case)
+    first, second = sorted(before)[:2]
+    journal = Journal(case)
+    journal.append("mark", targets=[first, second], value="malicious", note="")
+    journal.append("tag", targets=[first], add=["tactic:TA0001"])
+    journal.append("note", target=first, text="first look")
+    journal.append("finding", op="add", title="Beacon", severity="High", techniques=[], targets=[second])
+    os.rmdir(tmp_path / "evidence")
+    upgraded(open_case(case.folder))
+    [step] = steps_to_4(case)
+    assert set(step["skipped_runs"]) == {run.run_id}
+    junction(tmp_path / "evidence", tmp_path / "moved")
+    capsys.readouterr()
+    assert main(["rebuild", str(case.folder)]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == left_run_warning(run.run_id, "2 marks, 1 tag, 1 note, and 1 finding")
+    assert not set(before) & set(suricata_rows(case))
+    assert main(["rebuild", str(case.folder)]) == 0
+    assert "Warning" not in capsys.readouterr().out
+
+
+def test_a_rebuild_while_the_evidence_is_still_offline_warns_and_leaves_the_run_out(tmp_path, monkeypatch, capsys):
+    """The evidence is offline at the first open with this build and still is at the rebuild after it. That rebuild
+    warns, then leaves the run out, so the run has no rows and the marks on its events refer to no event. The next
+    rebuild, with the evidence back, loads the run under new IDs and has nothing to warn of."""
+    case = linked_case_at_format_3(tmp_path, monkeypatch)
+    before, [run] = suricata_rows(case), read_runs(case)
+    marked = sorted(before)[:2]
+    journal = Journal(case)
+    journal.append("mark", targets=marked, value="malicious", note="")
+    journal.append("tag", targets=marked[:1], add=["tactic:TA0001"])
+    os.rmdir(tmp_path / "evidence")
+    case = upgraded(open_case(case.folder))
+    [step] = steps_to_4(case)
+    assert set(step["skipped_runs"]) == {run.run_id}
+    capsys.readouterr()
+    assert main(["rebuild", str(case.folder)]) == 1
+    assert capsys.readouterr().out.splitlines()[0] == left_run_warning(run.run_id, "2 marks and 1 tag")
+    assert not suricata_rows(case)
+    app = App(case)
+    try:
+        assert app.orphans == len(marked)
+    finally:
+        app.con.close()
+    junction(tmp_path / "evidence", tmp_path / "moved")
+    assert main(["rebuild", str(case.folder)]) == 0
+    assert "Warning" not in capsys.readouterr().out
+    after = suricata_rows(case)
+    assert len(after) == len(before) and not set(before) & set(after)
+
+
 def test_the_format_4_step_leaves_found_output_and_marks_alone_when_the_journal_has_a_break(tmp_path, monkeypatch):
     """The journal's checks come before the step touches the events database. A linked format 3 case whose journal has a
     break stays at 3 with its rows, run records, and journal exactly as they were."""
@@ -741,6 +805,57 @@ def test_the_format_4_step_leaves_found_output_and_marks_alone_when_the_journal_
     assert upgraded(open_case(case.folder)).settings.case_format == 3
     assert suricata_rows(case) == before and run_files(case) == runs
     assert journal_path(case).read_bytes() == broken and settings_of(case)["case_format"] == 3
+
+
+def suricata_ids(case) -> list[str]:
+    """Each Suricata row's event ID, so an event the table holds twice is here twice."""
+    con = connect(case.db_path, read_only=True)
+    try:
+        return [uid for (uid,) in con.execute("SELECT event_uid FROM events WHERE tool = 'suricata'").fetchall()]
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("route", ["rebuild", "load"])
+def test_found_output_loaded_again_in_a_case_kept_at_3_keeps_its_ids_for_the_format_4_step(tmp_path, monkeypatch, route):
+    """A linked format 3 case whose journal has a break stays at 3. An earlier build loaded both EVE files, and, for the
+    rebuild, then `a/eve.json` again. A rebuild, or a load of `a/eve.json`, then names each file against the evidence
+    path as case.yaml writes it, as the builds of format 3 did, so the events keep the IDs the marks name, and it
+    replaces the first load's rows of `a/eve.json` by that name, so no event is there twice. Once the break is on
+    record, the next open's step finds the extended-length rows and rekeys them, each event is there once, and every
+    mark finds its event."""
+    case = linked_case_at_format_3(tmp_path, monkeypatch, files=(EVE_A, EVE_B))
+    if route == "rebuild":
+        with loaded_under_the_written_root(monkeypatch):
+            assert load_found_output(case, "suricata", "suricata_eve", "SENSOR", [EVE_A]).status == "ok"
+    before = suricata_ids(case)
+    assert len(before) == len(set(before)) and len(read_runs(case)) == (2 if route == "rebuild" else 1)
+    marked = sorted(before)[:3]
+    journal = Journal(case)
+    for uid in marked:
+        journal.append("mark", targets=[uid], value="malicious", note="first look")
+    journal_path(case).write_bytes(tampered(journal_path(case).read_bytes(), "payload")[0])
+    if route == "rebuild":
+        assert main(["rebuild", str(case.folder)]) == 0
+    else:
+        kept = upgraded(open_case(case.folder))
+        assert load_found_output(kept, "suricata", "suricata_eve", "SENSOR", [EVE_A]).status == "ok"
+    after = suricata_ids(case)
+    assert settings_of(case)["case_format"] == 3
+    assert len(after) == len(set(after)) and set(after) == set(before)
+    app = opened(open_case(case.folder))
+    assert app.journal.read_only and app.journal.record_break("looked at it")["action"] == "chain_break"
+    case = upgraded(open_case(case.folder))
+    [step] = steps_to_4(case)
+    pairs = step["rekey"]["pairs"]
+    assert settings_of(case)["case_format"] == 4 and set(pairs) == set(marked)
+    rekeyed = suricata_ids(case)
+    assert len(rekeyed) == len(set(rekeyed)) == len(before)
+    app = App(case)
+    try:
+        assert app.orphans == 0 and set(app.journal.state.marks) == {pairs[uid] for uid in marked}
+    finally:
+        app.con.close()
 
 
 def test_the_format_4_step_moves_no_event_id_once_the_journal_holds_a_line_that_closes_its_place(tmp_path, monkeypatch):
@@ -806,6 +921,33 @@ def test_the_format_4_step_pairs_both_files_of_a_single_host_case_with_a_folder_
         assert app.orphans == 0
     finally:
         app.con.close()
+
+
+def test_the_format_4_step_names_a_run_whose_rows_fit_two_of_its_files_once_the_evidence_moved(tmp_path, monkeypatch):
+    """As above, but the rows hold only the top-level file's events, and the evidence moved to another folder before the
+    first open with this build. Their names, `.../moved/eve.json`, fit `eve.json` under the old evidence folder and
+    `moved/eve.json`, of the same records, under its parent, and the evidence's path no longer says which. The step
+    pairs nothing for the run: it names it with the reason, and its rows and the mark stay as they were."""
+    files = ("eve.json", "moved/eve.json")
+    case = linked_case_at_format_3(tmp_path, monkeypatch, files=files, loaded=False, single_host="SENSOR")
+    with loaded_under_the_written_root(monkeypatch):
+        assert load_found_output(case, "suricata", "suricata_eve", "SENSOR", list(files)).status == "ok"
+    con = connect(case.db_path)
+    try:
+        con.execute("DELETE FROM events WHERE source_file LIKE '%/moved/moved/eve.json'")
+    finally:
+        con.close()
+    before, [run] = suricata_rows(case), read_runs(case)
+    marked = min(before)
+    mark_one(case, marked)
+    os.rmdir(tmp_path / "evidence")
+    (tmp_path / "moved").rename(tmp_path / "elsewhere")
+    junction(tmp_path / "evidence", tmp_path / "elsewhere")
+    case = upgraded(open_case(case.folder))
+    [step] = steps_to_4(case)
+    assert "rekey" not in step and step["skipped_runs"] == {run.run_id: rekey_module.AMBIGUOUS_REASON}
+    assert suricata_rows(case) == before
+    assert set(Journal(case).state.marks) == {marked}
 
 
 def test_the_format_4_step_names_a_run_none_of_whose_events_its_rows_hold(tmp_path, monkeypatch):

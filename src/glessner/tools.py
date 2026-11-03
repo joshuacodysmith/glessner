@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -34,6 +34,21 @@ class ToolOption:
     id: str
     label: str
     args: tuple[str, ...]
+
+
+COMPOSE_KINDS = ("batch_file", "maps_dir")   # what a compose entry writes, by the placeholder that names it in args
+APP_LABEL_KINDS = ("count", "version_line")   # the kinds of a compose entry's label, which reads the app's own files
+
+
+@dataclass(frozen=True)
+class Composed:
+    """A file or folder that a run gives the tool in place of one of the tool's own: the tool's, with the app's added,
+    written into the run's output folder before the tool starts (runner.composed_files). `tool` is the tool's file or
+    folder, relative to its executable's folder; `app` is the app's, in the registry folder. `label`, when there is
+    one, names the app's part of the run's rule set as a rules_label does, with its path in the registry folder."""
+    tool: str
+    app: Path
+    label: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -91,16 +106,21 @@ class ToolSpec:
     selects: tuple[str, ...] = ()
     # Arguments a tool takes when a planned input has none of an artifact beside it, as `related` names files beside an
     # input: SBECmd takes --nl when a hive has no transaction log (registry_log) beside it, a file in its folder named
-    # for it with .log in its extension. The run notes it. Without the arguments the tool reads those files, and the
-    # run's evidence check covers them.
+    # for it with .log in its extension. The run notes it. Without the arguments the tool may read any file there named
+    # for the input with .log after its name, and the run's evidence check covers each, whatever intake identified it as.
     without_related: tuple[dict, ...] = ()
     # Files and folders in the tool's own folder that it reads though no argument names them, such as Hayabusa's rules
-    # and config folders. A run records their SHA-256 (tool_files).
+    # and config folders, or that a run composes from (compose), such as RECmd's DFIRBatch.reb. A run records their
+    # SHA-256 (tool_files).
     tool_files: tuple[str, ...] = ()
     # How the rule or map set the tool runs with is named (rules_label): "kind" is one of LABEL_KINDS, "path" the file or
     # folder it reads, relative to the executable's folder, and "text" the label, with {value} for what it read. Without
     # one, the set is named by the rules block's version file, as Suricata's is.
     rules_label: dict | None = None
+    # The files a run composes from the tool's and the app's before the tool starts, by kind (COMPOSE_KINDS), such as
+    # RECmd's batch file: DFIRBatch.reb's entries followed by the app's. args name each by its kind as a placeholder,
+    # such as {batch_file}, which the runner fills with the composed file's path in the run's output folder.
+    compose: dict[str, Composed] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -122,7 +142,7 @@ class Recommendation:
 def load_registry(folder: Path = REGISTRY_DIR) -> dict[str, ToolSpec]:
     specs = {}
     for path in sorted(folder.glob("*.yaml")):
-        spec = _parse_spec(yaml.safe_load(path.read_text(encoding="utf-8")), path.name)
+        spec = _parse_spec(yaml.safe_load(path.read_text(encoding="utf-8")), path.name, folder)
         specs[spec.id] = spec
     return specs
 
@@ -188,6 +208,7 @@ LABEL_KINDS = ("git", "count", "version_line")   # the kinds of ToolSpec.rules_l
 GIT = ".git"   # a git checkout's own folder
 COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")   # a commit's ID, by SHA-1 or SHA-256
 VERSION_LINE = re.compile(r"^Version:\s*(\S+)", re.MULTILINE)
+UNREADABLE = "unreadable"   # a git label's files part when the rules folder can't be read
 
 
 def rules_label(spec: ToolSpec, exe: Path, hashes: dict[str, str] | None = None) -> str:
@@ -198,24 +219,37 @@ def rules_label(spec: ToolSpec, exe: Path, hashes: dict[str, str] | None = None)
       folder's SHA-256 (folder_sha256), as in "fffbdd1, files 7c30c465", so a checkout whose files were edited since
       its commit reads differently from one whose files weren't. The hash is taken from `hashes`, a run's tool_files,
       when they hold it, and computed here otherwise. A rules folder without a readable checkout, such as one unpacked
-      from a release zip, gives the folder's 8 digits alone.
+      from a release zip, gives the folder's 8 digits alone. A folder that can't be read gives UNREADABLE in place of
+      the digits, as in "fffbdd1, files unreadable", or "unreadable" alone without a checkout, never the commit alone.
     - count: how many files in a folder fit a name pattern, such as Maps\\*.map.
     - version_line: the value of a file's first "Version:" line.
 
-    A tool without a rules_label, such as Suricata, is named by its rules block's version file (rules_version)."""
+    The label of each compose entry that has one follows, naming the app's part from the registry folder, as in
+    "DFIRBatch.reb 2.22 with Glessner additions 1". A tool without a rules_label, such as Suricata, is named by its
+    rules block's version file (rules_version)."""
     label = spec.rules_label
     if not label:
         return rules_version(spec, exe)
-    path = exe.parent / label["path"]
+    named = _label_text(label, exe.parent, hashes)
+    if not named:
+        return ""
+    added = (_label_text(entry.label, exe.parent) for entry in spec.compose.values() if entry.label)
+    return " ".join([named, *filter(None, added)])
+
+
+def _label_text(label: dict, folder: Path, hashes: dict[str, str] | None = None) -> str:
+    """A label's text with the value its kind reads at its path, relative to `folder` unless it is absolute, or ""
+    when there is none to read (rules_label)."""
+    path = folder / label["path"]
     if label["kind"] == "git":
-        commit, files = git_commit(path)[:7], _folder_hash(path, exe.parent, hashes)[:8]
+        commit, files = git_commit(path)[:7], _folder_hash(path, folder, hashes)
         value = f"{commit}, files {files}" if commit and files else commit or files
     elif label["kind"] == "count":
         value = f"{sum(p.is_file() for p in path.parent.glob(path.name)):,}" if path.parent.is_dir() else ""
     elif label["kind"] == "version_line":
         value = _version_line(path)
     else:
-        raise ValueError(f"{spec.id}'s rules_label has kind {label['kind']!r}, not one of {list(LABEL_KINDS)}")
+        raise ValueError(f"A label has kind {label['kind']!r}, not one of {list(LABEL_KINDS)}")
     return label["text"].replace("{value}", value) if value else ""
 
 
@@ -257,15 +291,15 @@ def _packed_commit(git: Path, ref: str) -> str:
 
 
 def _folder_hash(folder: Path, tool_folder: Path, hashes: dict[str, str] | None) -> str:
-    """A folder's SHA-256 as a run's tool_files hold it, when they do, or as hashed now; "" for no folder, or one that
-    can't be read."""
+    """The first 8 hex digits of a folder's SHA-256 as a run's tool_files hold it, when they do, or as hashed now; "" for
+    no folder, and UNREADABLE for one that can't be read."""
     key = in_folder(folder, tool_folder)
     if hashes is not None and f"{key}/" in hashes:
-        return hashes[f"{key}/"]
+        return hashes[f"{key}/"][:8]
     try:
-        return folder_sha256(folder) if folder.is_dir() else ""
+        return folder_sha256(folder)[:8] if folder.is_dir() else ""
     except OSError:
-        return ""
+        return UNREADABLE
 
 
 def _version_line(path: Path) -> str:
@@ -458,7 +492,7 @@ def check_version(spec: ToolSpec, exe: Path, env: dict[str, str] | None = None) 
     return VersionCheck("unknown", code in HOST_EXIT_CODES or bool(HOST_MESSAGE.search(text)))
 
 
-def _parse_spec(data: dict, source: str) -> ToolSpec:
+def _parse_spec(data: dict, source: str, folder: Path = REGISTRY_DIR) -> ToolSpec:
     try:
         builtin = bool(data.get("builtin", False))
         # A built-in tool has nothing to find or download.
@@ -495,17 +529,43 @@ def _parse_spec(data: dict, source: str) -> ToolSpec:
             without_related=tuple(data.get("without_related") or ()),
             tool_files=tuple(data.get("tool_files") or ()),
             rules_label=data.get("rules_label") or None,
+            compose=_compose(data.get("compose") or {}, source, folder),
         )
     except (KeyError, TypeError) as exc:
         raise ValueError(f"Registry file {source} is missing a field or is malformed: {exc}") from exc
     if spec.input not in INPUT_MODES:
         raise ValueError(f"Registry file {source}: input must be one of {sorted(INPUT_MODES)}")
-    label = spec.rules_label
-    if label is not None and not (isinstance(label, dict) and label.get("kind") in LABEL_KINDS and label.get("path")
-                                  and "{value}" in str(label.get("text", ""))):
+    if spec.rules_label is not None and not _is_label(spec.rules_label, LABEL_KINDS):
         raise ValueError(f"Registry file {source}: rules_label needs a kind, one of {list(LABEL_KINDS)}, a path, and "
                          "a text holding {value}")
     return spec
+
+
+def _is_label(label: object, kinds: tuple[str, ...]) -> bool:
+    return (isinstance(label, dict) and label.get("kind") in kinds and bool(label.get("path"))
+            and "{value}" in str(label.get("text", "")))
+
+
+def _compose(entries: object, source: str, folder: Path) -> dict[str, Composed]:
+    """A registry file's compose entries, by kind, with the app's paths in the registry folder `folder`. ValueError,
+    naming the file, for a kind not in COMPOSE_KINDS, an entry without a tool and an app path, and a label that isn't
+    one of APP_LABEL_KINDS with a path and a text holding {value}."""
+    if not isinstance(entries, dict):
+        raise ValueError(f"Registry file {source}: compose must map each of {list(COMPOSE_KINDS)} it uses to an entry")
+    composed = {}
+    for kind, entry in entries.items():
+        if kind not in COMPOSE_KINDS:
+            raise ValueError(f"Registry file {source}: compose has {kind!r}, not one of {list(COMPOSE_KINDS)}")
+        if not (isinstance(entry, dict) and isinstance(entry.get("tool"), str) and entry["tool"]
+                and isinstance(entry.get("app"), str) and entry["app"]):
+            raise ValueError(f"Registry file {source}: compose's {kind} needs a tool path and an app path")
+        label = entry.get("label")
+        if label is not None and not _is_label(label, APP_LABEL_KINDS):
+            raise ValueError(f"Registry file {source}: compose's {kind} label needs a kind, one of "
+                             f"{list(APP_LABEL_KINDS)}, a path, and a text holding {{value}}")
+        composed[kind] = Composed(entry["tool"], folder / entry["app"],
+                                  {**label, "path": str(folder / label["path"])} if label else None)
+    return composed
 
 
 def _outputs(entries: object, source: str) -> tuple[str | tuple[str, ...], ...]:

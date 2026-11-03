@@ -1,0 +1,11 @@
+description: Application databases that SQLECmd and WxTCmd read, with their write-ahead logs and journals.
+# Plaso splits each path on / before reading it as patterns, so a class such as [^/]+ breaks; .+ matches one folder.
+type: include
+path_separator: '/'
+paths:
+- '/Users/.+/AppData/Local/Google/Chrome/User Data/.+/(History|Shortcuts)(-journal|-wal)?'
+- '/Users/.+/AppData/Local/Microsoft/Edge/User Data/.+/(History|Shortcuts)(-journal|-wal)?'
+- '/Users/.+/AppData/Local/BraveSoftware/Brave-Browser/User Data/.+/(History|Shortcuts)(-journal|-wal)?'
+- '/Users/.+/AppData/Roaming/Mozilla/Firefox/Profiles/.+/(places|downloads)\.sqlite(-journal|-wal)?'
+- '/Users/.+/AppData/Local/Microsoft/Windows/Notifications/wpndatabase\.db(-wal|-shm)?'
+- '/Users/.+/AppData/Local/ConnectedDevicesPlatform/.+/ActivitiesCache\.db(-wal|-shm)?'

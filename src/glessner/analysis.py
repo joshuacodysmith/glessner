@@ -26,6 +26,7 @@ from .rules import RuleError, parse
 from .short_names import build_short_paths
 from .tags import HAYABUSA_SEPARATOR, TACTICS, tactic_order, tag_kind, tag_label
 from .timezones import host_timezones
+from .tools_manifest import and_list
 
 MARK_LABELS = {"authorized": "Authorized", "suspicious": "Suspicious", "malicious": "Malicious"}
 # Hayabusa's rule levels by rank, the one ordering the hits table, the Suggestions page's groups, and the to-investigate
@@ -160,9 +161,8 @@ def _named_note(ip: str, names: Counter) -> str:
     if len(ranked) > 3:
         rest = len(ranked) - 3
         shown.append(f"{rest} other{'s' if rest > 1 else ''}")
-    listed = " and ".join(shown) if len(shown) < 3 else f"{', '.join(shown[:-1])}, and {shown[-1]}"
     counted = f"1 logon from {ip} names" if total == 1 else f"{total:,} logons from {ip} name"
-    return f"{counted} {listed}, not this host"
+    return f"{counted} {and_list(shown)}, not this host"
 
 
 def role_evidence(con: duckdb.DuckDBPyConnection, systems: dict[str, dict] | None = None) -> dict[str, RoleEvidence]:

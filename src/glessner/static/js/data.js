@@ -29,7 +29,8 @@ function awaitWindow(view) {
 // One view request at a time. The browser can cancel a request, but the server still runs its query to the end, so
 // a burst of canceled requests while zooming delayed the one the analyst waited for: 8.5 s instead of under 1 s on
 // a 2-million-event case. A window asked for meanwhile is fetched when the current request
-// returns, and the windows passed over in between are skipped.
+// returns, and the windows passed over in between are skipped. The promise gives what loadView gives for the window
+// fetched last: the failed request's message, or ''.
 export let viewRequest = null, nextView = null;
 export function fetchView(view = targetView()) {
   awaitWindow(view);
@@ -43,9 +44,15 @@ export function fetchView(view = targetView()) {
   return nextView.done;
 }
 
+// A window's edges in microseconds, as the view asks for them: rounded outward, so the window asked for takes in the whole
+// of the window in milliseconds.
+export const windowUs = (view) => ({ start: Math.floor(view.start * 1000), end: Math.ceil(view.end * 1000) });
+
+// Load a window's data and draw it. A request that fails says so on the status line, and returns its message for a
+// caller whose own line would replace that one; otherwise it returns ''.
 export async function loadView(view) {
   const t0 = performance.now();
-  const start = Math.floor(view.start * 1000), end = Math.ceil(view.end * 1000);
+  const { start, end } = windowUs(view);
   const buckets = Math.max(50, Math.floor(S.width / 4));
   // The server resolves logon links only when they're shown.
   const url = `/api/view?start=${start}&end=${end}&buckets=${buckets}&groupby=${S.groupby.join(',')}` +
@@ -55,14 +62,16 @@ export async function loadView(view) {
     const data = await api(url);
     // Another window on its way makes this one out of date. The same window asked for again, as after a change to what
     // the view carries, is shown meanwhile: dropped, a motion to it would end on the data from before it.
-    if (nextView && !sameWindow(nextView.view, view)) return;
+    if (nextView && !sameWindow(nextView.view, view)) return '';
     const loaded = { data, fetchMs: performance.now() - t0, span_s: (end - start) / 1e6, view };
-    if (S.anim && S.anim.view === view) { S.anim.loaded = loaded; return; }   // shown when the motion ends
+    if (S.anim && S.anim.view === view) { S.anim.loaded = loaded; return ''; }   // shown when the motion ends
     showData(loaded);
+    return '';
   } catch (err) {
     S.windowPending = false;
     renderWindow();
     setStatus(`Error: ${err.message}`);
+    return err.message;
   }
 }
 

@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .export import _md, _tick, _time
-from .intake import matched_text, unlisted_text
+from .intake import FAILED_STATES, UNRECORDED_MANIFEST, matched_text, none_listed_text, unlisted_text
 from .journal import (
     DAMAGED,
     FINDING_FIELDS,
@@ -452,15 +452,20 @@ def _closed_evidence(value: dict) -> str:
                f"{'is' if unread == 1 else 'are'} unverified." if unread else "")
     if folders:
         skipped += f" {unlisted_text(folders)}."
-    if value.get("hash_check") == "ok":
+    # Evidence that matched a manifest.jsonl that grew past or differs from its record: hash_check is a mismatch with no
+    # problem, or "ok" in an entry whose hash_check counts the evidence files alone
+    manifest = value.get("manifest")
+    changed = isinstance(manifest, dict) and manifest.get("state") in FAILED_STATES
+    if value.get("hash_check") == "ok" or (changed and not problems):
+        against = UNRECORDED_MANIFEST if changed else "the intake manifest"
         if files is None:
-            return "Closed the case. The evidence matches the intake manifest."
+            return f"Closed the case. The evidence matches {against}."
         if skipped:
-            return f"Closed the case. {matched_text(files)}{skipped}"
+            return f"Closed the case. {matched_text(files, against)}{skipped}"
         if not files:
-            return "Closed the case. No evidence file was checked: the intake manifest lists none."
-        return ("Closed the case. Its 1 evidence file matches the intake manifest." if files == 1
-                else f"Closed the case. All {files:,} evidence files match the intake manifest.")
+            return f"Closed the case. {none_listed_text(against)}"
+        return (f"Closed the case. Its 1 evidence file matches {against}." if files == 1
+                else f"Closed the case. All {files:,} evidence files match {against}.")
     found = "; ".join(problems[:3]) + ("; and more" if len(problems) > 3 else "")
     return (f"Closed the case. The evidence doesn't match the intake manifest{f': {found}' if found else ''}. "
             f"The case folder's verification.jsonl lists every problem.{skipped}")

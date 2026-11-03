@@ -8,7 +8,7 @@
 // window apply the Sources and View on, which its card counts; the Apply tick is the report's alone. Evidence text
 // reaches the page through el() and textContent only.
 
-import { $, api, el, plural, post, reportAction, S, setStatus, windowText } from './core.js';
+import { $, api, el, plural, post, reportAction, S, setStatus, showControls, windowText } from './core.js';
 import { button, headAfter } from './event_page.js';
 import { filterCount } from './filters.js';
 import { refreshCaseState } from './frame.js';
@@ -92,7 +92,7 @@ export function exportsColumn({ summary = null } = {}) {
       reportAction(said(res).split(' to ')[0], res.server_ms);
       reload();
       return res;
-    } catch (err) { result.textContent = `Not written: ${err.message}`; return null; }
+    } catch (err) { result.textContent = showControls(`Not written: ${err.message}`); return null; }
   };
   col.append(...reportSection(count, fill, applied, filterBody, filtered, result, run),
              ...exportsSection(count, filtered, run),
@@ -131,9 +131,15 @@ function reportSection(count, fill, applied, filterBody, filtered, result, run) 
       previewButton.setAttribute('aria-expanded', 'true');
     } catch (err) { setStatus(`Preview failed: ${err.message}`); }
   }, { 'aria-expanded': 'false', title: 'Show the report as it would be written now. Nothing is written or journaled.' });
+  // The write re-hashes every evidence file, which takes seconds on a large case. The button is off from the click until
+  // the reply, and the line under it says the write is under way, so a second click doesn't write a second report.
   const write = button('Write report (Markdown)', async () => {
-    const res = await run('/api/report', filterBody(), (r) => `Wrote the report (${plural(r.events, 'marked event')}) to ${r.path}.${filtered(r)}`);
-    if (res) refreshCaseState();   // it re-hashes every evidence file, and the header's line says what that found
+    write.disabled = true;
+    result.textContent = 'Writing the report…';
+    try {
+      const res = await run('/api/report', filterBody(), (r) => `Wrote the report (${plural(r.events, 'marked event')}) to ${r.path}.${filtered(r)}`);
+      if (res) refreshCaseState();   // the header's line says what the re-hash found
+    } finally { write.disabled = false; }
   }, { class: 'primary', title: 'Write the report to the case\'s exports folder, hashed and journaled.' });
   return [
     sectionBand('Report'),
@@ -167,12 +173,12 @@ function exportsSection(count, filtered, run) {
   const timelineCells = ` · in CSV, ${csvCells}; JSONL keeps values as written`;
   return [
     sectionBand('Exports'),
-    card('Marked events', ['whole case'], [count('marked'), ' · CSV or JSONL with ECS fields, among them a network record\'s signature, community ID, URL, DNS and TLS names, and a DHCP client\'s MAC address · each event\'s mark, note, tags, tool, run, and evidence file', timelineCells],
+    card('Marked events', ['whole case'], [count('marked'), ' · CSV or JSONL with ECS fields, among them a network record\'s signature, community ID, Suricata flow ID, Zeek uid, URL, DNS and TLS names, and a DHCP client\'s MAC address · each event\'s mark, note, tags, tool, run, and evidence file', timelineCells],
          marks, button('CSV', whole('csv')), button('JSONL', whole('jsonl'))),
     card('Events in the window', [el('span', { id: 'exportWindow' }, windowText()), el('span', { id: 'exportWindowFilters' }, windowFilters())],
          ['in it now: ', el('span', { id: 'exportWindowCount' }, inWindow), ' · for Timesketch or Timeline Explorer · the window and the filters applied go in the file\'s journal entry', timelineCells],
          button('CSV', window('csv')), button('JSONL', window('jsonl'))),
-    card('Indicators', ['Malicious marks'], [count('values'), ' · read from parsed fields only · ', csvCells],
+    card('Indicators', ['Malicious marks'], [count('values'), ' · read from parsed fields only, with a note on a Windows system folder file · ', csvCells],
          button('CSV', () => run('/api/indicators', {}, (r) => `Wrote ${plural(r.values, 'indicator value')} from ${plural(r.events, 'Malicious event')} to ${r.path}.`))),
     card('Audit trail', ['whole journal'], [count('entries')],
          button('Markdown', () => run('/api/audit_export', {}, (r) => `Wrote ${plural(r.entries, 'entry', 'entries')} to ${r.path}.`))),

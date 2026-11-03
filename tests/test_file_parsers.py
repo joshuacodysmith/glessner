@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from sbecmd_log_fixtures import CONSOLE_LOG_NAME, MESSAGES_NAME, console_log_text, messages_text
 
+from glessner.events import event_uid
 from glessner.parsers import PARSERS, ParseContext
 from glessner.parsers.common import file_key
 
@@ -58,6 +59,90 @@ def test_mft_groups_timestamps_into_macb_and_flags_indicators(tmp_path):
     assert json.loads(si.extra)["ZoneIdContents"] == "[ZoneTransfer] ZoneId=3"   # pre-serialized once per record
 
 
+SI_TIMES = {"Created0x10": "2015-03-24 14:48:40.7343580", "LastModified0x10": "2015-03-24 14:59:30.6111710",
+            "LastRecordChange0x10": "2015-03-24 14:59:30.6111710", "LastAccess0x10": "2015-03-24 14:59:30.5955700"}
+FN_BLANK = {"Created0x30": "", "LastModified0x30": "", "LastRecordChange0x30": "", "LastAccess0x30": ""}
+FN_EARLIER = {"Created0x30": "2015-03-24 14:32:00.0000000", "LastModified0x30": "2015-03-24 14:32:00.0000000",
+              "LastRecordChange0x30": "2015-03-24 14:32:00.0000000", "LastAccess0x30": "2015-03-24 14:32:00.0000000"}
+
+
+def mft_row(**cells):
+    """An MFTECmd $MFT row for a Desktop document, with its $SI times and the $FN cells given."""
+    return {"EntryNumber": "23554", "SequenceNumber": "14", "ParentEntryNumber": "5", "ParentSequenceNumber": "5",
+            "InUse": "True", "ParentPath": r".\Users\informant\Desktop", "FileName": "Letter.docx",
+            "FileSize": "11893", "IsDirectory": "False", "HasAds": "False", "IsAds": "False", "SI<FN": "False",
+            "uSecZeros": "False", "Copied": "False", **SI_TIMES, **FN_BLANK, "SourceFile": r"D:\Evidence\case\PC\$MFT",
+            **cells}
+
+
+def mft_extra(tmp_path, row):
+    """The extra data of a row's events, which they share."""
+    write_csv(tmp_path / "mftecmd.csv", [row])
+    [extra] = {e.extra for e in PARSERS["mftecmd_csv"](ParseContext(tmp_path, EVIDENCE))}
+    return json.loads(extra)
+
+
+def test_row_names_the_letters_whose_fn_equals_si(tmp_path):
+    """MFTECmd leaves a $FN cell blank where that time equals the $SI time, and `--at` writes the same text in it. A
+    $FN cell with another time names no letter, and neither does a blank $FN cell beside a blank $SI cell."""
+    row = mft_row(LastAccess0x30=SI_TIMES["LastAccess0x10"], LastRecordChange0x30=FN_EARLIER["LastRecordChange0x30"],
+                  Created0x10="")
+    assert mft_extra(tmp_path, row)["FnEqualsSi"] == "MA"
+
+
+def test_si_cell_the_parser_does_not_load_names_no_letter(tmp_path):
+    """An $SI cell that makes no event names no letter, whether its $FN cell is blank or holds the same text. Here B's
+    $SI cell holds a placeholder time before 1971, and A's holds text that is no time."""
+    placeholder = "1601-01-01 00:00:00.0000000"
+    row = mft_row(Created0x10=placeholder, LastAccess0x10="not a time", LastAccess0x30="not a time")
+    write_csv(tmp_path / "mftecmd.csv", [row])
+    events = list(PARSERS["mftecmd_csv"](ParseContext(tmp_path, EVIDENCE)))
+    assert sorted(e.ts_desc for e in events) == ["$SI M.C."]
+    assert json.loads(events[0].extra)["FnEqualsSi"] == "MC"
+
+
+def test_row_with_no_fn_columns_names_all_four(tmp_path):
+    """A row whose $FN cells are all blank makes $SI events only, and the field names all four letters."""
+    write_csv(tmp_path / "mftecmd.csv", [mft_row()])
+    events = list(PARSERS["mftecmd_csv"](ParseContext(tmp_path, EVIDENCE)))
+    assert sorted(e.ts_desc for e in events) == ["$SI ...B", "$SI .A..", "$SI M.C."]
+    assert {json.loads(e.extra)["FnEqualsSi"] for e in events} == {"MACB"}
+
+
+def test_row_with_every_fn_filled_has_no_field(tmp_path):
+    assert "FnEqualsSi" not in mft_extra(tmp_path, mft_row(**FN_EARLIER))
+
+
+def test_ads_row_has_no_fn_field(tmp_path):
+    """An alternate data stream has no $FILE_NAME attribute of its own, so its row's blank $FN cells name nothing."""
+    extra = mft_extra(tmp_path, mft_row(FileName="Letter.docx:Zone.Identifier", IsAds="True"))
+    assert extra["IsAds"] == "True" and "FnEqualsSi" not in extra
+
+
+# The IDs of mft_row's events with every $FN cell blank, with only $FN B blank, and with none blank, as a load gives them
+# for the collection host PC. An ID hashes the host, artifact, source file, source record, and time description.
+MFT_SI_IDS = ["fb94a2cb0415c5ec9bc779254ea51482", "c88d3793d4b7a663be5f10d1bbda882b", "d82b3bd121015a50f43bda39d0f00cc0"]
+MFT_IDS = {
+    "every $FN blank": MFT_SI_IDS,
+    "$FN B blank": [*MFT_SI_IDS, "9f61ac2a48ca2a3f9629f48489ecf09e"],
+    "no $FN blank": [*MFT_SI_IDS, "44f423ca998b0cdde9a1a324a7061559"],
+}
+
+
+def test_mft_event_ids_unchanged_by_the_field(tmp_path):
+    """The field adds no event and changes none: each row's events keep their pinned IDs."""
+    rows = {"every $FN blank": mft_row(), "$FN B blank": mft_row(**{**FN_EARLIER, "Created0x30": ""}),
+            "no $FN blank": mft_row(**FN_EARLIER)}
+    ids = {}
+    for number, (name, row) in enumerate(rows.items()):
+        folder = tmp_path / str(number)
+        folder.mkdir()
+        write_csv(folder / "mftecmd.csv", [row])
+        ids[name] = [event_uid("PC", e.artifact, e.source_file, e.source_record, e.ts_desc)
+                     for e in PARSERS["mftecmd_csv"](ParseContext(folder, EVIDENCE))]
+    assert ids == MFT_IDS
+
+
 def test_prefetch_one_event_per_run_with_full_path(tmp_path):
     loaded = r"\VOLUME{01d6}\WINDOWS\SYSTEM32\NTDLL.DLL, \VOLUME{01d6}\WINDOWS\SYSTEM32\CMD.EXE"
     write_csv(tmp_path / "pecmd.csv", [{
@@ -71,6 +156,28 @@ def test_prefetch_one_event_per_run_with_full_path(tmp_path):
     assert events[0].message == r"Executed CMD.EXE (\VOLUME{01d6}\WINDOWS\SYSTEM32\CMD.EXE), run count 9"
     assert events[0].source_file == "DESKTOP/Windows/Prefetch/CMD.EXE-0BD30981.pf"
     assert events[0].extra["FilesLoadedCount"] == 2
+
+
+def test_prefetch_takes_pecmds_full_path_where_it_holds_one(tmp_path):
+    """PECmd's FullPath column names the program's path where no FilesLoaded entry ends with its name, and ahead of
+    an entry that does. An empty FullPath leaves the path to FilesLoaded."""
+    row = {"SourceFilename": r"D:\Evidence\case\DESKTOP\Windows\Prefetch\CMD.EXE-0BD30981.pf", "ExecutableName": "CMD.EXE",
+           "RunCount": "9", "LastRun": "2020-09-19 05:08:37.5328773",
+           "FilesLoaded": r"\VOLUME{01d6}\WINDOWS\SYSTEM32\NTDLL.DLL",
+           "FullPath": r"\VOLUME{01d6}\WINDOWS\SYSTEM32\CMD.EXE"}
+    elsewhere = {**row, "SourceFilename": r"D:\Evidence\case\DESKTOP\Windows\Prefetch\SVCHOST.EXE-5D3C9E1A.pf",
+                 "ExecutableName": "SVCHOST.EXE",
+                 "FilesLoaded": r"\VOLUME{01d6}\WINDOWS\SYSTEM32\SVCHOST.EXE, \VOLUME{01d6}\USERS\PUBLIC\SVCHOST.EXE",
+                 "FullPath": r"\VOLUME{01d6}\USERS\PUBLIC\SVCHOST.EXE"}
+    derived = {**row, "SourceFilename": r"D:\Evidence\case\DESKTOP\Windows\Prefetch\NOTEPAD.EXE-D8414F97.pf",
+               "ExecutableName": "NOTEPAD.EXE", "FilesLoaded": r"\VOLUME{01d6}\WINDOWS\SYSTEM32\NOTEPAD.EXE", "FullPath": ""}
+    write_csv(tmp_path / "pecmd.csv", [row, elsewhere, derived])
+    stated, preferred, found = PARSERS["pecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert (stated.file_path, stated.file_key) == (r"\VOLUME{01d6}\WINDOWS\SYSTEM32\CMD.EXE", r"\windows\system32\cmd.exe")
+    assert stated.message == r"Executed CMD.EXE (\VOLUME{01d6}\WINDOWS\SYSTEM32\CMD.EXE), run count 9"
+    assert (preferred.file_path, preferred.file_key) == (r"\VOLUME{01d6}\USERS\PUBLIC\SVCHOST.EXE",
+                                                         r"\users\public\svchost.exe")
+    assert (found.file_path, found.file_key) == (r"\VOLUME{01d6}\WINDOWS\SYSTEM32\NOTEPAD.EXE", r"\windows\system32\notepad.exe")
 
 
 def test_lnk_uses_embedded_times_not_the_copy_times(tmp_path):
@@ -108,6 +215,16 @@ def test_lnk_tracker_time_later_than_the_link_itself_stays_off_the_timeline(tmp_
     assert events[0].extra["TrackerCreatedOn"] == "3850-06-18 16:03:31"
     assert "not placed on the timeline" in events[0].extra["TrackerCreatedOnNote"]
     assert "TrackerCreatedOnNote" not in events[1].extra
+
+
+def test_lnk_keeps_its_droid_columns_in_the_details(tmp_path):
+    volume, file = "5c1e2f0a-3b4d-4e6f-8a9b-0c1d2e3f4a5b", "7d2f3a1b-4c5e-11ea-9a8b-000c29a1b2c3"
+    droids = {"VolumeDroid": volume, "FileDroid": file, "VolumeDroidBirth": volume, "FileDroidBirth": file}
+    write_csv(tmp_path / "lecmd.csv", [
+        {"SourceFile": r"D:\Evidence\case\SRV\Users\a\Desktop\x.lnk", "TargetCreated": "2024-02-05 23:00:00",
+         "LocalPath": r"C:\x.txt", "MachineID": "srv", **droids}])
+    [event] = PARSERS["lecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert {k: event.extra[k] for k in droids} == droids
 
 
 SBE_COLUMNS = ["BagPath", "Slot", "NodeSlot", "MRUPosition", "AbsolutePath", "ShellType", "Value", "ChildBags", "CreatedOn",

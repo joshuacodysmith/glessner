@@ -1,9 +1,10 @@
 """Parses PECmd prefetch CSV output into one execution event per recorded run time.
 
 A prefetch file records up to eight run times: LastRun and PreviousRun0 to PreviousRun6. The
-executable's full path comes from the FilesLoaded entry that ends with the executable's name. Prefetch keeps only 29
-characters of a name, so a name that long is matched by prefix instead, to the one entry that starts with it; with no entry or
-more than one, the program has no path and no key.
+executable's full path is PECmd's FullPath column where it holds a path; builds before 2026.10 don't write that column,
+and it is empty where PECmd finds no path. Otherwise the path comes from the FilesLoaded entry that ends with the
+executable's name. Prefetch keeps only 29 characters of a name, so a name that long is matched by prefix instead, to the
+one entry that starts with it; with no entry or more than one, the program has no path and no key.
 The prefetch file's own Source* times describe the collected copy and are not used.
 """
 
@@ -31,11 +32,20 @@ def _by_prefix(exe: str, loaded: list[str]) -> str:
     return next(iter(starts.values())) if len(starts) == 1 else exe
 
 
+def _full_path(row: dict[str, str], exe: str, loaded: list[str]) -> str:
+    """PECmd's FullPath where it holds a path, else the loaded file that ends with the program's name, else the prefix
+    match or the bare name (_by_prefix)."""
+    stated = row.get("FullPath", "")
+    if "\\" in stated:
+        return stated
+    return next((f for f in loaded if f.upper().endswith("\\" + exe.upper())), None) or _by_prefix(exe, loaded)
+
+
 def parse_pecmd(ctx: ParseContext) -> Iterator[Event]:
     for row in (row for path in output_paths(ctx, "pecmd", OUTPUT_FILE) for row in read_csv_rows(path)):
         exe = row.get("ExecutableName", "")
         loaded = [f for f in row.get("FilesLoaded", "").split(", ") if f]
-        full = next((f for f in loaded if f.upper().endswith("\\" + exe.upper())), None) or _by_prefix(exe, loaded)
+        full = _full_path(row, exe, loaded)
         extra = {k: row[k] for k in EXTRA_COLUMNS if row.get(k)}
         extra["FilesLoadedCount"] = len(loaded)
         extra["FilesLoaded"] = loaded

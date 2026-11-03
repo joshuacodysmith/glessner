@@ -252,6 +252,87 @@ def test_a_confirmed_action_whose_counted_events_were_all_decided_meanwhile_acts
         assert sorted(api_pending_uids(app, {"source": ["logons"]})["uids"]) == sorted(arrived), decision
 
 
+def test_a_pending_only_decision_acts_on_and_journals_only_the_events_still_pending(running):
+    """Hand-picked events that went out with no question. The answer says how many were skipped, the entry's targets are those
+    still pending, and it claims no consent. When every one was decided meanwhile, nothing else is decided and no entry is
+    written. A restore isn't narrowed, and a request that names no events is refused."""
+    from glessner.server import api_pending_uids
+
+    app, port, _ = running
+    session = login(port, app)
+    api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
+    marked, rejected, third, fourth, *_ = api_pending_uids(app, {"source": ["logons"]})["uids"]
+    api_mark(app, {"uids": [marked], "value": "authorized"})
+    api_suggestion(app, {"decision": "reject", "source": "logons", "uids": [rejected]})
+
+    def send(decision, uids):
+        body = {"decision": decision, "source": "logons", "uids": uids, "pending_only": True}
+        res, answer = request(port, "POST", "/api/suggestion", session=session, body=body)
+        assert res.status == 200
+        return json.loads(answer)
+
+    answer = send("accept", [marked, rejected, third])
+    assert (answer["changed"], answer["skipped"], answer["accepted"]) == (1, 2, {"suspicious": 1})
+    entry = last_entry(app)
+    assert entry["action"] == "mark" and entry["targets"] == [third] and "confirmed" not in entry
+    answer = send("reject", [marked, rejected, third, fourth])
+    assert (answer["changed"], answer["skipped"], answer["marked"]) == (1, 3, 0)
+    entry = last_entry(app)
+    assert entry["action"] == "suggestion_decision" and entry["targets"] == [fourth] and "confirmed" not in entry
+    before = len(app.journal.path.read_text(encoding="utf-8").splitlines())
+    left = api_pending_uids(app, {"source": ["logons"]})["uids"]
+    assert left
+    for decision in ("accept", "reject"):
+        answer = send(decision, [marked, rejected])
+        assert (answer["changed"], answer["skipped"]) == (0, 2), decision
+        assert len(app.journal.path.read_text(encoding="utf-8").splitlines()) == before, decision
+        assert api_pending_uids(app, {"source": ["logons"]})["uids"] == left, decision
+    assert send("restore", [rejected])["changed"] == 1
+    res, _ = request(port, "POST", "/api/suggestion", session=session,
+                     body={"decision": "reject", "source": "logons", "pending_only": True})
+    assert res.status == 400
+
+
+def test_a_decision_answers_the_marks_it_gave_and_the_marks_it_left(running, monkeypatch):
+    """An accept answers how many events it marked with each value, which can differ within a source. A reject answers
+    how many of its events already carry a mark, which it leaves."""
+    from glessner import server
+    from glessner.server import api_pending_uids
+
+    app, _, _ = running
+    api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
+    first, second, third, *_ = api_pending_uids(app, {"source": ["logons"]})["uids"]
+    answer = api_suggestion(app, {"decision": "reject", "source": "logons", "uids": [first]})
+    assert answer["marked"] == 0 and "accepted" not in answer
+    answer = api_suggestion(app, {"decision": "restore", "source": "logons", "uids": [first]})
+    assert "marked" not in answer and "accepted" not in answer
+    with monkeypatch.context() as patch:
+        patch.setattr(server, "pending_for_source", lambda *_: {"suspicious": [second, first], "malicious": [third]})
+        answer = api_suggestion(app, {"decision": "accept", "source": "logons", "uids": [first, second, third]})
+    assert answer["changed"] == 3 and answer["accepted"] == {"suspicious": 2, "malicious": 1}
+    answer = api_suggestion(app, {"decision": "reject", "source": "logons", "uids": [second]})
+    assert answer["marked"] == 1 and answer["changed"] == 1
+
+
+def test_a_suggestions_read_says_the_state_of_the_events_its_page_kept_as_decided(running):
+    """The page names the events it keeps as decided rows, and the read gives each one's current mark and whether this
+    source's suggestion on it is rejected. A rejection by another source doesn't count."""
+    from glessner.server import api_pending_uids
+
+    app, _, _ = running
+    api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
+    api_rule(app, {"op": "add", "text": "id: others\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
+    rejected, accepted, elsewhere, untouched, *_ = api_pending_uids(app, {"source": ["logons"]})["uids"]
+    api_suggestion(app, {"decision": "reject", "source": "logons", "uids": [rejected]})
+    api_suggestion(app, {"decision": "accept", "source": "logons", "uids": [accepted]})
+    api_suggestion(app, {"decision": "reject", "source": "others", "uids": [elsewhere]})
+    named = [rejected, accepted, elsewhere, untouched]
+    states = api_pending(app, {"source": ["logons"], "decided": named})["decided"]
+    assert states == {rejected: {"mark": None, "rejected": True}, accepted: {"mark": "Suspicious", "rejected": False},
+                      elsewhere: {"mark": None, "rejected": False}, untouched: {"mark": None, "rejected": False}}
+    assert api_pending(app, {"source": ["logons"]})["decided"] == {}
+
+
 def test_show_all_first_is_cut_at_the_servers_cap(running, monkeypatch):
     """The limit "Show all N first" passes is clamped to PENDING_LIMIT_MAX: a limit above it lists no more than it."""
     from glessner import server

@@ -811,6 +811,226 @@ def test_drag_pans_and_the_wheel_zooms(page):
                            arg=panned["end"] - panned["start"])
 
 
+# Whether a pan is under way: the drag record, or the closed hand it draws
+PANNING = "() => window.__app.S.drag !== null || document.getElementById('lanesBox').classList.contains('dragging')"
+# Whether the drawn data is the view's own window, with no fetch due
+FETCHED = "() => !window.__app.S.windowPending && window.__app.S.shownWindow?.start === window.__app.S.view.start"
+# A move with no button held, at a page point, as the page sees one after a release it missed
+MOVE_WITH_NO_BUTTON = "([x, y]) => window.dispatchEvent(new MouseEvent('mousemove', { clientX: x, clientY: y, buttons: 0 }))"
+
+
+def test_a_pan_whose_release_the_page_missed_ends_at_the_next_move_or_a_blur(page):
+    """A pan whose release the page never sees, as when the browser's own drag holds the mouse, doesn't leave the view
+    following the mouse: the first move with no button held ends the pan where it was, and so does the window losing the
+    focus. Either way the window the pan moved to is fetched, and no click is made: a press on an event that ends so
+    doesn't select it."""
+    box = page.locator("#lanes").bounding_box()
+    y = box["y"] + box["height"] - 5   # below the lanes, where nothing is drawn
+    for end in (lambda: page.evaluate(MOVE_WITH_NO_BUTTON, [box["x"] + 500, y]),
+                lambda: page.evaluate("() => window.dispatchEvent(new Event('blur'))")):
+        page.mouse.move(box["x"] + 400, y)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 300, y, steps=5)
+        panned = view(page)
+        end()
+        assert not page.evaluate(PANNING) and view(page) == panned
+        page.wait_for_function(FETCHED)
+        page.mouse.up()   # the missed release, which finds no pan to end
+    rdp = event_point(page, "4624", hit=True)
+    page.mouse.move(rdp["x"], rdp["y"])
+    page.mouse.down()
+    page.evaluate(MOVE_WITH_NO_BUTTON, [rdp["x"], rdp["y"]])
+    page.mouse.up()
+    assert page.evaluate("window.__app.S.selected.size") == 0
+
+
+def test_a_drag_on_the_lanes_pans_and_releases_with_the_page_s_text_selected(page):
+    """Text selected around the lanes, as Select all leaves it, doesn't turn a press and drag on them into the browser's
+    own drag of the selection, which keeps the release from the page: the drag pans, and its release ends the pan. A press
+    on the lanes still takes the focus out of a text box."""
+    box = page.locator("#lanes").bounding_box()
+    y = box["y"] + box["height"] - 5   # below the lanes, where nothing is drawn
+    page.locator("#search").focus()
+    page.mouse.click(box["x"] + 700, y)
+    assert page.evaluate("document.activeElement.id") != "search"
+    page.keyboard.press("Control+A")
+    assert page.evaluate("getSelection().toString()") != ""
+    before = view(page)
+    page.mouse.move(box["x"] + 400, y)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 300, y, steps=5)
+    page.mouse.up()
+    panned = view(page)
+    assert panned["start"] > before["start"] and not page.evaluate(PANNING)
+    page.mouse.move(box["x"] + 500, y, steps=5)
+    assert view(page) == panned
+
+
+# What each surface beside the lanes is on the page: the space under the last lane, the time axis, and a zone axis
+PAN_SURFACES = {"under": "#scroller", "axis": "#axis", "zone": ".zone-axis"}
+SPAN = "() => window.__app.S.view.end - window.__app.S.view.start"
+CURSOR_AT = "([x, y]) => getComputedStyle(document.elementFromPoint(x, y)).cursor"
+# Whether the page cancels the browser's own scroll for a wheel turned at the point
+WHEEL_CANCELED = """([x, y]) => !document.elementFromPoint(x, y).dispatchEvent(
+    new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: -1, clientX: x, clientY: y }))"""
+
+
+def pan_point(page, surface):
+    """The page coordinates of a point in a surface beside the lanes, 400 px along the lanes' scale, with a zone axis added
+    to the page and the point checked to fall on that surface."""
+    page.locator("#addZone").click()
+    page.locator("#quickMenu").get_by_role("menuitem", name="Pacific").first.click()
+    page.wait_for_selector(".zone-axis")
+    selector = PAN_SURFACES[surface]
+    x = page.locator("#lanes").bounding_box()["x"] + 400
+    box = page.locator(selector).bounding_box()
+    y = box["y"] + box["height"] - 5 if surface == "under" else box["y"] + box["height"] / 2
+    assert page.evaluate("([x, y, selector]) => document.elementFromPoint(x, y).matches(selector)", [x, y, selector])
+    return x, y
+
+
+def time_at(page, x):
+    """The UTC time at a page x on the lanes' scale, which the axes share."""
+    return page.evaluate("""(x) => {
+        const { S } = window.__app, left = document.getElementById('lanes').getBoundingClientRect().left;
+        return S.view.start + (x - left) / S.width * (S.view.end - S.view.start);
+    }""", x)
+
+
+def shrink_the_lanes(page):
+    """Open every group and give the Details panel most of the stage, so the lanes outgrow their scroller and it scrolls."""
+    open_all(page)
+    page.evaluate("() => { document.getElementById('details').style.flexBasis = '70%'; }")
+    page.wait_for_function("""() => {
+        const scroller = document.getElementById('scroller');
+        return scroller.scrollHeight > scroller.clientHeight + 20;
+    }""")
+
+
+@pytest.mark.parametrize("surface", PAN_SURFACES)
+def test_the_wheel_and_a_drag_work_beside_the_lanes(page, surface):
+    """The space under the last lane, the time axis, and a zone axis zoom and pan as the lanes do. The wheel keeps the time
+    under the pointer in place, closes the quick menu, and cancels the browser's own scroll. A drag pans with the
+    closed hand and selects no text across the labels, and its release ends the pan and fetches the window."""
+    x, y = pan_point(page, surface)
+    assert page.evaluate(CURSOR_AT, [x, y]) == "grab"
+
+    rdp = event_point(page, "4624", hit=True)
+    page.mouse.click(rdp["x"], rdp["y"], button="right")
+    page.locator("#quickMenu").wait_for(state="visible")
+    page.mouse.move(x, y)
+    span, at = page.evaluate(SPAN), time_at(page, x)
+    page.mouse.wheel(0, -200)
+    page.wait_for_function(f"(span) => ({SPAN})() < span", arg=span)
+    assert time_at(page, x) == pytest.approx(at, abs=1)
+    assert page.locator("#quickMenu").is_hidden()
+    assert page.evaluate(WHEEL_CANCELED, [x, y])
+    page.wait_for_function(FETCHED)
+
+    before = view(page)
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x - 100, y, steps=5)
+    assert page.evaluate(CURSOR_AT, [x - 100, y]) == "grabbing"
+    page.mouse.move(page.locator("#labels").bounding_box()["x"] + 40, y, steps=5)
+    assert page.evaluate("getSelection().isCollapsed")
+    page.mouse.move(x - 100, y, steps=5)
+    page.mouse.up()
+    panned = view(page)
+    assert panned["start"] > before["start"]
+    assert panned["end"] - panned["start"] == pytest.approx(before["end"] - before["start"])
+    assert not page.evaluate(PANNING)
+    assert page.evaluate(CURSOR_AT, [x, y]) == "grab"
+    page.wait_for_function(FETCHED)
+    page.mouse.move(x + 100, y, steps=5)
+    assert view(page) == panned
+
+
+@pytest.mark.parametrize("surface", PAN_SURFACES)
+def test_a_drag_beside_the_lanes_ends_as_one_on_the_lanes_does(page, surface):
+    """A drag from a surface beside the lanes ends where it is at a move with no button held and at a blur. With the page's
+    text selected, it still pans and releases, rather than starting the browser's own drag of the selection."""
+    x, y = pan_point(page, surface)
+    for end in (lambda: page.evaluate(MOVE_WITH_NO_BUTTON, [x + 100, y]),
+                lambda: page.evaluate("() => window.dispatchEvent(new Event('blur'))")):
+        before = view(page)
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x - 100, y, steps=5)
+        panned = view(page)
+        assert panned["start"] > before["start"] and page.evaluate(PANNING)
+        end()
+        assert not page.evaluate(PANNING) and view(page) == panned
+        page.wait_for_function(FETCHED)
+        page.mouse.up()
+    page.keyboard.press("Control+A")
+    assert page.evaluate("getSelection().toString()") != ""
+    before = view(page)
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x - 100, y, steps=5)
+    page.mouse.up()
+    assert view(page)["start"] > before["start"] and not page.evaluate(PANNING)
+
+
+@pytest.mark.parametrize("surface", PAN_SURFACES)
+def test_a_click_beside_the_lanes_selects_nothing(page, surface):
+    """A click on the space under the last lane or on an axis acts on no lane, so it selects nothing, opens no pile list,
+    and leaves the window still. Ticks at every x of every row of the hit index would catch a release that read its own
+    point as one on the lanes, as the click on the lanes that ends the test does."""
+    x, y = pan_point(page, surface)
+    page.wait_for_function(FETCHED)
+    page.evaluate("""() => { const { S } = window.__app, e = S.data.events[0];
+        const ticks = Array.from({ length: 3000 }, (_, x) => ({ kind: 'event', x, e }));
+        S.index = Array.from({ length: 100 }, () => ticks); }""")
+    before = view(page)
+    page.mouse.click(x, y)
+    assert page.evaluate("window.__app.S.selected.size") == 0
+    assert page.locator("#details").get_attribute("data-page") != "pile"
+    assert view(page) == before
+    page.mouse.click(x, page.locator("#lanes").bounding_box()["y"] + 5)
+    page.wait_for_selector("#details[data-page='pile']")
+
+
+def test_the_wheel_over_the_lane_labels_scrolls_the_lanes(page):
+    """Over the lane labels column the wheel scrolls the lanes up and down and doesn't zoom, and a drag doesn't pan. Over
+    the lanes, once they can scroll, the wheel zooms and leaves the scroller where it is."""
+    shrink_the_lanes(page)
+    span = page.evaluate(SPAN)
+    labels = page.locator("#labels").bounding_box()
+    x, y = labels["x"] + 40, page.locator("#scroller").bounding_box()["y"] + 15
+    page.mouse.move(x, y)
+    assert page.evaluate(CURSOR_AT, [x, y]) != "grab"
+    page.mouse.wheel(0, 60)
+    page.wait_for_function("() => document.getElementById('scroller').scrollTop > 0")
+    assert page.evaluate(SPAN) == span
+    before = view(page)
+    page.mouse.down()
+    page.mouse.move(x + 100, y, steps=5)
+    assert not page.evaluate(PANNING) and view(page) == before
+    page.mouse.up()
+
+    lanes_x = page.locator("#lanes").bounding_box()["x"] + 400
+    page.mouse.move(lanes_x, y)
+    page.mouse.wheel(0, -200)
+    page.wait_for_function(f"(span) => ({SPAN})() < span", arg=span)
+    assert page.evaluate(WHEEL_CANCELED, [lanes_x, y])
+
+
+def test_the_scrollbar_keeps_its_own_press_and_wheel(page):
+    """A scrollbar reports the scroller as its target, so a press or a wheel past the scroller's client area is left to
+    it. A headless browser hides scrollbars, so the events are dispatched at the point a scrollbar would hold."""
+    shrink_the_lanes(page)
+    outcome = page.evaluate("""() => {
+        const scroller = document.getElementById('scroller'), rect = scroller.getBoundingClientRect();
+        const at = { clientX: rect.left + scroller.clientWidth + 2, clientY: rect.top + 10, bubbles: true, cancelable: true };
+        const zoomed = !scroller.dispatchEvent(new WheelEvent('wheel', { ...at, deltaY: 100 }));
+        scroller.dispatchEvent(new MouseEvent('mousedown', { ...at, button: 0 }));
+        return { zoomed, drag: window.__app.S.drag };
+    }""")
+    assert outcome == {"zoomed": False, "drag": None}
+
+
 def test_right_click_menu_marks_the_event(page):
     rdp = event_point(page, "4624", hit=True)
     page.mouse.click(rdp["x"], rdp["y"], button="right")
@@ -939,7 +1159,7 @@ STATUS_TEXTS = """() => {
     window.__statusTexts = [];
     new MutationObserver((records) => {
         for (const record of records) for (const node of record.addedNodes) window.__statusTexts.push(node.textContent);
-    }).observe(document.getElementById('status'), { childList: true });
+    }).observe(document.getElementById('status'), { childList: true, subtree: true });
 }"""
 
 
@@ -2226,7 +2446,8 @@ def test_an_offset_typed_by_hand_aligns_nothing(clock_page):
     assert [p.locator(f"#{b}").get_attribute("aria-pressed") for b in ("clockRecorded", "clockAligned")] == ["false", "false"]
     assert p.locator("#clockPartly").is_hidden()
     p.evaluate("""() => { window.__statuses = []; new MutationObserver(() => window.__statuses.push(
-        document.getElementById('status').textContent)).observe(document.getElementById('status'), { childList: true }); }""")
+        document.getElementById('status').textContent)).observe(document.getElementById('status'),
+                                                                { childList: true, subtree: true }); }""")
     p.locator("#clockRecorded").click()
     p.wait_for_function("(m) => window.__statuses.includes(m)", arg="There are no offsets from this switch to set back. "
                                                                    "Offsets typed in the Hosts panel stay: DC01.")
@@ -2712,8 +2933,9 @@ def test_local_time_on_the_host_stays_its_own_clock_after_an_offset(page, synthe
 
 
 def test_tools_page_says_what_it_is_doing_while_the_tools_report(browser, synthetic_case):
-    """The Tools page's first open after the server starts runs every tool's version check, about 4 s, and the page
-    says what it is doing meanwhile, so a new case doesn't look hung. The answer is held here as a slow one would be."""
+    """A case's first Tools page runs every found tool's version check, about 4 s, and hashes the tools' files for the pin
+    check, as Scan again does, and the first after a job hashes again what the job may have changed. The page says what
+    it is doing meanwhile, so a new case doesn't look hung. The answer is held here as a slow one would be."""
     from glessner.tools import load_registry
 
     for page in served_page(browser, synthetic_case, setup=lambda app: setattr(app, "tool_cache", (load_registry(), {}))):
@@ -2722,12 +2944,41 @@ def test_tools_page_says_what_it_is_doing_while_the_tools_report(browser, synthe
         case_menu(page, "toolsButton")
         checking = page.locator("#details[data-page='tools'] .tools-checking")
         checking.wait_for(timeout=5_000)
-        assert checking.inner_text().startswith("Checking the tools folder: each tool reports its version")
+        assert checking.inner_text() == (
+            "Checking the tools folder: on the first Tools page after a case opens, and after Scan again, each tool found "
+            "there reports its version and its files are hashed for the pin check. After a job, the files it may have changed "
+            "are hashed again. This takes a few seconds.")
         while not held:
             page.wait_for_timeout(20)
         held[0].continue_()
         page.wait_for_selector("#details[data-page='tools'] .tools-table")
         assert checking.count() == 0
+
+
+def test_the_tools_page_s_job_box_follows_the_job_as_the_page_polls_it(browser, synthetic_case):
+    """The job box shows the step a running job is on, and each result as it comes, as the page polls the job, not the
+    step the job had when the page drew. When the job finishes, the box says so."""
+    from glessner.toolbox import ToolJob
+    from glessner.tools import load_registry
+
+    job = ToolJob("Fake", 2, current="DC01")
+
+    def setup(app):
+        app.tool_cache = (load_registry(), {})
+        app.job = job
+
+    box_text = "() => document.querySelector('#details[data-page=\"tools\"] .tools-job')?.innerText ?? ''"
+    for page in served_page(browser, synthetic_case, setup=setup):
+        case_menu(page, "toolsButton")
+        page.wait_for_selector("#details[data-page='tools'] .tools-table")
+        assert page.evaluate(box_text) == "Running Fake on DC01 (1 of 2)..."
+        job.results.append({"host": "DC01", "status": "ok", "rows": 0, "evidence": "unchanged"})
+        job.done, job.current = 1, "DESKTOP"
+        page.wait_for_function(f"() => ({box_text})().startsWith('Running Fake on DESKTOP (2 of 2)...')")
+        assert page.evaluate(box_text) == "Running Fake on DESKTOP (2 of 2)...\nDC01: ok, 0 events, evidence unchanged"
+        job.results.append({"host": "DESKTOP", "status": "ok", "rows": 0, "evidence": "unchanged"})
+        job.done, job.finished = 2, True
+        page.wait_for_function(f"() => ({box_text})().startsWith('Fake finished 2 of 2 runs.')")
 
 
 def test_right_click_menu_offers_same_ip_at_either_end_for_each_address(page):
@@ -2758,7 +3009,7 @@ def test_the_wheel_zooms_by_how_far_it_moved(page):
             const before = span();
             for (const deltaY of deltas) {
                 canvas.dispatchEvent(new WheelEvent('wheel', { deltaY, deltaMode: mode, clientX: rect.left + 300,
-                                                               clientY: rect.top + 10, cancelable: true }));
+                                                               clientY: rect.top + 10, bubbles: true, cancelable: true }));
             }
             return span() / before;
         }""", [deltas, mode])
@@ -2936,6 +3187,41 @@ def test_sources_panel_counts_a_file_read_by_two_tools_under_each(browser, synth
         assert [files.nth(i).locator(".n").inner_text() for i in range(2)] == ["2", "0 of 3"]
 
 
+def test_the_sources_panel_s_arrows_say_whether_their_rows_are_open_and_where_they_are(page):
+    """Each arrow in the Sources panel tells a screen reader whether its rows are open, and names the list they are
+    drawn in: the evidence types' list for a type, and the hosts' tree for a host. A file find opens every host, and a
+    type's arrow still opens and folds its runs, as it says."""
+    def arrow(name):
+        return page.get_by_role("button", name=f"Show or hide what is in {name}", exact=True)
+
+    kind = page.locator("#fpTypes button.tw").first
+
+    def first_type():
+        """What the first evidence type's arrow says, and whether its runs are listed."""
+        return kind.get_attribute("aria-expanded"), page.locator("#fpTypes .frow.d1").count() > 0
+
+    page.locator("#filtersButton").click()
+    page.wait_for_selector("#fpTree .frow")
+    host = arrow("DC01")
+    assert (host.get_attribute("aria-expanded"), host.get_attribute("aria-controls")) == ("false", "fpTree")
+    host.click()
+    assert arrow("DC01").get_attribute("aria-expanded") == "true"
+    assert kind.get_attribute("aria-controls") == "fpTypes"
+    assert first_type() == ("false", False)
+    kind.click()
+    assert first_type() == ("true", True)
+    kind.click()
+    assert first_type() == ("false", False)
+    assert arrow("DESKTOP").get_attribute("aria-expanded") == "false"
+    page.locator("#fpFind").fill("Security")
+    assert arrow("DESKTOP").get_attribute("aria-expanded") == "true"
+    assert first_type() == ("false", False)
+    kind.click()
+    assert first_type() == ("true", True)
+    kind.click()
+    assert first_type() == ("false", False)
+
+
 def test_import_page_counts_a_json_array_by_its_records(page, synthetic_case):
     """A JSON array of three records on one line counts its records, not its lines: "JSON array, 3 records", and the
     button "Import 3 records"."""
@@ -3041,7 +3327,7 @@ def test_a_mark_whose_event_is_gone_is_counted_in_the_singular(browser, syntheti
     record ="""document.addEventListener('DOMContentLoaded', () => {
         window.__statuses = [];
         const keep = (changes) => changes.forEach((c) => c.addedNodes.forEach((n) => window.__statuses.push(n.textContent)));
-        new MutationObserver(keep).observe(document.getElementById('status'), { childList: true });
+        new MutationObserver(keep).observe(document.getElementById('status'), { childList: true, subtree: true });
     })"""
     for page in served_page(browser, synthetic_case):
         page.add_init_script(record)
@@ -3100,7 +3386,7 @@ def test_what_a_decision_and_a_tag_say_stays_on_the_status_line_until_the_view_c
         page.locator("#details").get_by_role("button", name="Dismiss the tag Credential Access").click()
         said("Dismissed: Credential Access · ")
         page.locator("#details").get_by_role("button", name="Accept as Suspicious").click()
-        said("accept: 1 event (hayabusa) · ")
+        said("Accepted 1 hayabusa suggestion as Suspicious · ")
         # The next redraw is the view's own: a pan replaces the line
         page.evaluate("() => { const v = window.__app.S.view; return window.__app.setView(v.start + 1000, v.end + 1000); }")
         page.wait_for_function(f"() => {status}.startsWith('Window moved · ')")

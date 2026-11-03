@@ -11,6 +11,9 @@ const START = { info: null, form: { name: '', analyst: null, evidence: '', case_
                 checks: {}, browsing: null, copying: null, forgetting: false };
 const POLL_MS = 700;
 const FORGET_TITLE = 'Changes only this list. No case folder is touched.';   // the hover on the Remove buttons
+// The warnings under the evidence check, which leave the case free to be created: several copies of one collection
+// in the folder, and disk images, which Glessner doesn't read. Each is the element's data-check name and the check's key.
+const EVIDENCE_WARNINGS = [['evidence-copies', 'warning'], ['evidence-images', 'images']];
 let checkTimer = null;
 let polling = null;
 
@@ -112,20 +115,21 @@ function field(label, key, { browse = true, placeholder = '' } = {}) {
   note.dataset.check = key;
   const notes = [note];
   if (key === 'evidence') {
-    const copies = el('div', { class: 'warn' });
-    copies.dataset.check = 'evidence-copies';
-    showCopies(copies, check);
-    notes.push(copies);
+    for (const [name, part] of EVIDENCE_WARNINGS) {
+      const warning = el('div', { class: 'warn' });
+      warning.dataset.check = name;
+      showWarning(warning, check, part);
+      notes.push(warning);
+    }
   }
   return el('div', { class: 'start-field' }, el('span', { class: 'muted' }, label),
     el('div', {}, el('div', { class: 'actions' }, input, ...(browse ? [browseButton(input, key)] : [])),
       ...(START.browsing && START.browsing.field === key ? [browser()] : []), ...notes));
 }
 
-// Several copies of one collection in the evidence folder: a warning under the check, which leaves the
-// case free to be created.
-function showCopies(node, c) {
-  node.textContent = showControls((c && c.warning) || '');
+// One of EVIDENCE_WARNINGS: the check's text for it, hidden when the check gives none.
+function showWarning(node, c, part) {
+  node.textContent = showControls((c && c[part]) || '');
   node.hidden = !node.textContent;
 }
 
@@ -227,8 +231,10 @@ function scheduleCheck() {
       note.className = c ? (c.ok ? 'ok' : 'warn') : '';
       note.textContent = c ? showControls(checkNote(key, c)) : '';
     }
-    const copies = $('start').querySelector('[data-check="evidence-copies"]');
-    if (copies) showCopies(copies, START.checks.evidence);
+    for (const [name, part] of EVIDENCE_WARNINGS) {
+      const warning = $('start').querySelector(`[data-check="${name}"]`);
+      if (warning) showWarning(warning, START.checks.evidence, part);
+    }
   }, 400);
 }
 

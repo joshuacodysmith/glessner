@@ -200,8 +200,9 @@ def copy_case(source: Case, folder: Path, name: str, analyst: str, client: str =
     A copy of a source whose format has the chain starts its journal with case_created naming the source and its head;
     an older source's copy keeps the source's format, so its journal stays empty until its upgrade seals it and
     case_created follows. In both, the entries of the upgrade steps from a format with the chain follow case_created
-    (rekey.upgraded_copy). As create_case does, it removes the journal head record that an earlier case in the same
-    folder path left outside the folder as it makes the folder, and a record that can't be removed is a CaseError.
+    (rekey.upgraded_copy), which then takes manifest.jsonl again with the record the copy carries, from one read of the
+    source. As create_case does, it removes the journal head record that an earlier case in the same folder path left
+    outside the folder as it makes the folder, and a record that can't be removed is a CaseError.
     """
     folder = folder.resolve()
     if _overlaps(folder, source.evidence) or _overlaps(folder, source.folder):
@@ -275,6 +276,11 @@ def ends_open(path: Path) -> bool:
             return False
         f.seek(-1, os.SEEK_END)
         return f.read(1) != b"\n"
+
+
+def utc_now() -> str:
+    """The time now in UTC to the second, as run records and the tools manifest write it: YYYY-MM-DDTHH:MM:SSZ."""
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _write_settings(folder: Path, settings: CaseSettings) -> None:
@@ -413,6 +419,16 @@ def check_journal() -> bool:
     return bool(check and check())
 
 
+# Whether upgrade() is running its steps in this thread (upgrading)
+_upgrading: ContextVar[bool] = ContextVar("upgrading", default=False)
+
+
+def upgrading() -> bool:
+    """Whether an upgrade's steps are running in this thread. A step reads and loads a case below CASE_FORMAT as this
+    build does, so what a load gates on the case's format holds only outside the steps."""
+    return _upgrading.get()
+
+
 def upgrade(case: Case, record: Callable[[int, int, dict | None], object],
             report: Callable[[str, int, int], None] | None = None, until: int | None = None) -> Case:
     """The case brought up to `until`, CASE_FORMAT unless given, one UPGRADES step at a time; record(from, to, fields)
@@ -423,9 +439,11 @@ def upgrade(case: Case, record: Callable[[int, int, dict | None], object],
     (report_stage), for the start page's open. A record with a `check` attribute (journal.upgrade_recorder's) lets a step
     run the journal's checks ahead of its changes (check_journal)."""
     token, checking = _stage_report.set(report), _journal_check.set(getattr(record, "check", None))
+    running = _upgrading.set(True)
     try:
         return _upgrade(case, record, CASE_FORMAT if until is None else until)
     finally:
+        _upgrading.reset(running)
         _journal_check.reset(checking)
         _stage_report.reset(token)
 

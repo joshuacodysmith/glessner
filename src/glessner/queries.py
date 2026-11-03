@@ -381,6 +381,20 @@ def pending_for_source(con: duckdb.DuckDBPyConnection, source: str) -> dict[str,
     return out
 
 
+def pending_sources(con: duckdb.DuckDBPyConnection, uids: list[str]) -> dict[str, list[str]]:
+    """The sources with a pending suggestion for any of these events, in name order, each with the events it suggests,
+    in ID order. An event two sources suggest is under both, and an event with no pending suggestion is under none."""
+    wanted = id_table(con, "ticked_events", uids)
+    out: dict[str, list[str]] = {}
+    for source, uid in con.execute(
+            "SELECT DISTINCT s.source, s.event_uid FROM suggestions s LEFT JOIN marks m ON m.event_uid = s.event_uid "
+            "LEFT JOIN rejected r ON r.event_uid = s.event_uid AND r.source = s.source "
+            f"WHERE s.event_uid IN (SELECT v FROM {wanted}) AND m.event_uid IS NULL AND r.event_uid IS NULL "
+            "ORDER BY s.source, s.event_uid").fetchall():
+        out.setdefault(source, []).append(uid)
+    return out
+
+
 # Pending suggestions of one source, grouped for review on the Suggestions page.
 # "rule" is the event's most severe Hayabusa hit, or a Suricata or imported fast alert's signature, so the built-in
 # sources' suggestions split by the rule behind them.
@@ -466,6 +480,17 @@ def pending_group_uids(con: duckdb.DuckDBPyConnection, source: str, group_by: st
         raise ValueError(f"group_by must be one of {sorted(PENDING_GROUPS)}")
     return [u for (u,) in con.execute(
         f"SELECT event_uid FROM ({_PENDING.format(group=PENDING_GROUPS[group_by])}) WHERE g = ?", [source, key]).fetchall()]
+
+
+def decided_states(con: duckdb.DuckDBPyConnection, source: str, uids: list[str]) -> dict[str, dict]:
+    """The state of each event in `uids`: its mark, or None, and whether `source`'s suggestion on it is rejected."""
+    if not uids:
+        return {}
+    wanted = id_table(con, "decided_events", uids)
+    rows = con.execute(f"SELECT w.v, m.label, r.event_uid IS NOT NULL FROM {wanted} w "
+                       "LEFT JOIN marks m ON m.event_uid = w.v "
+                       "LEFT JOIN rejected r ON r.event_uid = w.v AND r.source = ?", [source]).fetchall()
+    return {uid: {"mark": mark, "rejected": rejected} for uid, mark, rejected in rows}
 
 
 # The flagged events: a mark whose event is no longer loaded (analysis.orphan_marks) lists no row, so it isn't counted

@@ -1,9 +1,9 @@
 """Caveats: what a kind of record does not prove.
 
-The texts live in caveats.json, one per artifact or event type, each with its sources, so the same record always shows
-the same text and the app writes none of it. The Event page shows the record's caveat beside the record, and a finding
-shows the caveats of its linked events' types. A kind the table doesn't name has none until a row for it is added to
-caveats.json."""
+The texts live in caveats.json, one per artifact or event type, or for a registry entry's own times, per what the time
+means, each with its sources, so the same record always shows the same text and the app writes none of it. The Event
+page shows the record's caveat beside the record, and a finding shows the caveats of its linked events' types. A kind
+the table doesn't name has none until a row for it is added to caveats.json."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 
 TABLE_FILE = Path(__file__).with_name("caveats.json")
 # The event columns a match reads, which the Findings page's endpoint selects for a finding's events
-CAVEAT_COLUMNS = ("artifact", "event_code", "log_channel", "registry_path")
+CAVEAT_COLUMNS = ("artifact", "event_code", "log_channel", "registry_path", "ts_desc")
 
 
 @cache
@@ -23,9 +23,11 @@ def table() -> list[dict]:
 
 
 def fits(match: dict, ev: dict) -> bool:
-    """Whether a record fits a row's match: its artifact, and where the row gives them, its event code, its channel, or
-    a word in its registry path, compared without case."""
+    """Whether a record fits a row's match: its artifact, and where the row gives them, its event code, its channel,
+    its time's meaning (ts_desc), or a word in its registry path, compared without case."""
     if str(ev.get("artifact") or "") not in match["artifact"]:
+        return False
+    if "ts_desc" in match and str(ev.get("ts_desc") or "") not in match["ts_desc"]:
         return False
     if "event_code" in match and str(ev.get("event_code") or "") not in match["event_code"]:
         return False

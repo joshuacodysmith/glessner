@@ -21,6 +21,7 @@ from test_server import login, request
 
 from glessner import case as case_module
 from glessner import heads
+from glessner import intake as intake_module
 from glessner.audit import AuditError, describe, plan_undo, read_entries
 from glessner.cli import main
 from glessner.imports import save_mapping
@@ -488,6 +489,35 @@ def test_verify_file_that_does_not_exist_is_an_error_not_a_traceback(synthetic_c
     journal doesn't cover."""
     assert main(["verify", str(synthetic_case.folder), "--journal", "--file", str(tmp_path / "nowhere.md")]) == 2
     assert "nowhere.md is not a file this command can read" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"])
+def test_verify_file_reads_the_file_in_pieces_and_turns_a_line_end_two_pieces_split(synthetic_case, monkeypatch,
+                                                                                   capsys, ending):
+    """verify --file hashes the file in pieces and never holds it whole, since an export can be larger than memory. A
+    copy with its line endings converted the other way is named as one, also where a piece ends inside a CR LF."""
+    exports, piece = synthetic_case.folder / "exports", 5
+    data = b"".join(b"row %d,value%s" % (i, ending) for i in range(40))
+    other = data.replace(b"\r\n", b"\n") if ending == b"\r\n" else data.replace(b"\n", b"\r\n")
+    crlf = max(data, other, key=len)
+    assert any(crlf[i] == ord("\r") for i in range(piece - 1, len(crlf), piece))   # a piece ends inside a CR LF
+    (exports / "timeline.csv").write_bytes(data)
+    (exports / "converted.csv").write_bytes(other)
+    entry = Journal(synthetic_case).append("file_written", path="exports/timeline.csv", kind="timeline", format="csv",
+                                           rows=40, bytes=len(data), sha256=sha(data))
+    whole = Path.read_bytes
+
+    def refused(path):
+        if path.parent == exports:
+            raise MemoryError
+        return whole(path)
+
+    monkeypatch.setattr(Path, "read_bytes", refused)
+    monkeypatch.setattr(intake_module, "CHUNK", piece)
+    code, said = verify(capsys, synthetic_case, "--journal", "--file", str(exports / "timeline.csv"))
+    assert code == 0 and f"Entry #{entry['seq']} records this file, at or before the head this computer recorded" in said
+    code, said = verify(capsys, synthetic_case, "--journal", "--file", str(exports / "converted.csv"))
+    assert code == 1 and f"With its line endings converted back, it matches entry #{entry['seq']}." in said, said
 
 
 def test_a_file_stays_when_its_entry_was_written_even_though_the_append_failed_after(synthetic_case, monkeypatch):

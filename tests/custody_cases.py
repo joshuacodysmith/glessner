@@ -109,11 +109,12 @@ def make_evidence(root: Path) -> Path:
 
 def stand_in_sqlecmd(root: Path) -> DetectedTool:
     """SQLECmd as the registry describes it, running the stand-in script (written under `root`, outside the evidence) with
-    this Python. It keeps the registry's work_on_copies, so the run reads copies of the databases in its run folder."""
+    this Python. It keeps the registry's work_on_copies, so the run reads copies of the databases in its run folder. The
+    script reads no maps, so the run composes no maps folder."""
     script = root / "stand_in_sqlecmd.py"
     script.write_text(STAND_IN_SQLECMD, encoding="utf-8")
     spec = replace(load_registry()["sqlecmd"], args=(str(script), "{host_dir}", "{output_dir}"), executables=("python.exe",),
-                   dotnet=0)
+                   dotnet=0, compose={})
     return DetectedTool(spec, Path(sys.executable), "1.0")
 
 

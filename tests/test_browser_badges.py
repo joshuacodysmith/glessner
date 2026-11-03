@@ -248,8 +248,8 @@ def test_a_search_row_has_no_offset_and_keeps_its_highlight(browser, synthetic_c
 
 
 def test_the_selection_list_has_badges(browser, synthetic_case):  # noqa: F811
-    """The selection list leads each row with the badge, M and U here, the marked one with the analyst and the time; the
-    end pill that said the mark in words is gone."""
+    """The selection list leads each row with its tick and the badge, M and U here, the marked one with the analyst and
+    the time; the end pill that said the mark in words is gone."""
     for p in served_page(browser, synthetic_case):
         rdp = event_point(p, "4624", hit=True)
         p.evaluate("(uid) => window.__app.select(uid, false)", rdp["uid"])
@@ -262,7 +262,8 @@ def test_the_selection_list_has_badges(browser, synthetic_case):  # noqa: F811
         first, second = titles(p, "#details .selection-list")
         assert HOVER.match(first) and first.startswith("Malicious, marked by ") and second == "Unreviewed"
         assert p.locator("#details .selection-list .status").count() == 0
-        assert p.locator("#details .selection-list li").first.evaluate("(n) => n.children[0].matches('span.badge')")
+        assert p.locator("#details .selection-list li").first.evaluate(
+            "(n) => n.children[0].matches('input[type=checkbox]') && n.children[1].matches('span.badge')")
 
 
 def test_a_suggestions_page_row_has_a_badge_that_names_the_suggestion(browser, synthetic_case):  # noqa: F811

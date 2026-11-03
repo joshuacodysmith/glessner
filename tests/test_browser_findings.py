@@ -286,6 +286,89 @@ def test_a_second_click_on_save_changes_while_its_write_is_out_edits_once(browse
         assert [(e["finding"], e["narrative"]) for e in edits] == [(found["fid"], "Administrator logged on over RDP.")]
 
 
+def finding_of_two(action, found):
+    """A setup that adds a finding of the case's first two events, retired for `action` restore, and keeps its ID in
+    found["fid"] and the case's third event's ID, which no finding holds, in found["third"]."""
+    def setup(app):
+        uids = [uid_at(app, T0), uid_at(app, T0 + 60 * SEC)]
+        found["fid"] = api_finding(app, {"op": "add", "title": "A logon", "severity": "Low", "targets": uids})["finding"]
+        found["third"] = uid_at(app, T0 + 62 * SEC)
+        if action == "restore":
+            api_finding(app, {"op": "retire", "finding": found["fid"], "reason": ""})
+    return setup
+
+
+def finding_button(p, action, found):
+    """Open the button that makes the finding change `action`: Add on the third event's page, with the finding picked,
+    Unlink on the finding's last event in its edit form, Retire the finding, or Restore. Returns the button and a
+    check of the page drawn again after the change."""
+    details = p.locator("#details")
+    if action == "link":
+        select(p, [found["third"]])
+        details.get_by_role("button", name="+ Finding").click()
+        p.wait_for_function("() => document.querySelector('#details .finding-add select option[value=\"new\"]') !== null")
+        details.locator(".finding-add").get_by_label("Finding to add to").select_option(str(found["fid"]))
+        return details.locator(".finding-add").get_by_role("button", name="Add the 4624 on DC01"), IN_FINDING
+    open_findings(p)
+    if action == "restore":
+        fold = details.locator(".retired-fold")
+        fold.locator("summary").click()
+        return (fold.get_by_role("button", name="Restore"),
+                "() => document.querySelectorAll('#details .findings-col > .finding').length === 1")
+    one = card(p, 1)
+    if action == "unlink":
+        one.get_by_role("button", name="Edit").click()
+        return (one.locator(".ev-chip-edit").get_by_role("button", name="Unlink").last,
+                "() => document.querySelectorAll('#details .finding .ev-chip').length === 1")
+    one.get_by_role("button", name="Retire").click()
+    return one.get_by_role("button", name="Retire the finding"), "() => document.querySelector('#details .retired-fold') !== null"
+
+
+def finding_ops(case):
+    return [e["op"] for e in entries(case) if e["action"] == "finding"]
+
+
+@pytest.mark.parametrize("action", ["link", "unlink", "retire", "restore"])
+def test_a_second_click_on_a_finding_button_while_its_write_is_out_sends_nothing(browser, synthetic_case, action):  # noqa: F811
+    """Add on the Event page's finding picker, Unlink, Retire the finding, and Restore are each disabled from the click
+    while /api/finding is held, and a click on the disabled button sends no second request. Once the write answers, the
+    page draws again and the journal holds the one change."""
+    found = {}
+    for p in served_page(browser, synthetic_case, setup=finding_of_two(action, found)):
+        button, redrawn = finding_button(p, action, found)
+        p.evaluate(RECORD_REQUESTS)
+        held = []
+        p.route(finding_write, lambda route: held.append(route))   # noqa: B023
+        button.click()
+        wait_held(p, held)
+        assert button.is_disabled()
+        button.click(force=True)
+        assert finding_posts(p) == 1
+        held[0].continue_()
+        p.wait_for_function(redrawn)
+        p.unroute(finding_write)
+        expected = ["add", "retire", "restore"] if action == "restore" else ["add", action]
+        assert finding_ops(synthetic_case) == expected
+
+
+def test_a_refused_link_enables_add_again_for_another_try(browser, synthetic_case):  # noqa: F811
+    """When /api/finding refuses the link from the Event page's picker, the status line says so, and Add is enabled again
+    with the focus. The next click links the event once."""
+    found = {}
+    for p in served_page(browser, synthetic_case, setup=finding_of_two("link", found)):
+        add, redrawn = finding_button(p, "link", found)
+        p.route(finding_write, refused_with("The journal is busy."))
+        add.click()
+        p.wait_for_function("() => { const s = document.getElementById('status'); "
+                            "return (s.title || s.textContent) === 'Finding change failed: The journal is busy.'; }")
+        assert add.is_enabled() and add.evaluate("(b) => document.activeElement === b")
+        p.unroute(finding_write)
+        p.errors[:] = [e for e in p.errors if "/api/finding" not in e]   # that refusal was the point
+        add.click()
+        p.wait_for_function(redrawn)
+        assert finding_ops(synthetic_case) == ["add", "link"]
+
+
 def test_the_chips_open_their_events_and_the_caveat_shows_beside_the_record_and_on_the_card(browser, synthetic_case):  # noqa: F811
     """On the Event page, a 4624 shows "What this does not prove" beside its record, with the caveat text and its
     sources as links, and Show less folds it to its title, remembered in this browser; a registry value with no row in the

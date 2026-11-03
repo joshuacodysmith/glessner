@@ -124,9 +124,12 @@ def test_the_command_line_close_reads_as_what_the_re_hash_found(synthetic_case):
     assert describe(many) == ("Closed the case. The evidence doesn't match the intake manifest: f0: missing; f1: missing; "
                               "f2: missing; and more. The case folder's verification.jsonl lists every problem.")
     assert describe({**one, "value": {"hash_check": "ok"}}) == "Closed the case. The evidence matches the intake manifest."
-    grown = {**one, "value": {"hash_check": "ok", "evidence_files": 1, "manifest": {"state": "grew", "seq": 4}}}
-    assert describe(grown) == ("Closed the case. Its 1 evidence file matches the intake manifest. manifest.jsonl had grown "
-                               "past its record in the journal, entry #4.")
+    # Evidence that matched a manifest.jsonl that grew past its record matched no intake manifest, in an entry whose
+    # hash_check counts the manifest too and in one whose hash_check counts the evidence files alone
+    grown = {**one, "value": {"hash_check": "mismatch", "evidence_files": 1, "manifest": {"state": "grew", "seq": 4}}}
+    words = ("Closed the case. Its 1 evidence file matches manifest.jsonl, which doesn't match its record in the journal. "
+             "manifest.jsonl had grown past its record in the journal, entry #4.")
+    assert describe(grown) == describe({**grown, "value": {**grown["value"], "hash_check": "ok"}}) == words
 
 
 def test_an_undo_of_one_event_reads_in_the_singular(synthetic_case):

@@ -8,16 +8,30 @@ detect:
   version: {args: ["--version"], regex: '^(\d+\.\d+\.\d+)'}
 handles: [registry, registry_log]
 input: host_dir
+# RECmd reads only the files in the folder it is given whose names hold a hive name it knows, without regard to case:
+# USRCLASS, NTUSER, SYSTEM, SAM, SOFTWARE, AMCACHE, SYSCACHE, SECURITY, DRIVERS, COMPONENTS, DEFAULT, USER, USERCLASSES,
+# SETTINGS, or REGISTRY. *USER* covers NTUSER and USERCLASSES. Intake identifies a hive by its signature, so one named
+# otherwise is an input the tool never opens. The runner notes the files a run leaves out. RECmd also passes over a name
+# that ends in .log, .log1, .log2, .txt, .csv, .ini, .exe, .dll, .blf, or .regtrans-ms. Intake takes the first three for
+# transaction logs, which RECmd reads with their hive, and a hive whose name ends in one of the others isn't noted.
+selects: ["*USRCLASS*", "*SYSTEM*", "*SAM*", "*SOFTWARE*", "*AMCACHE*", "*SYSCACHE*", "*SECURITY*", "*DRIVERS*",
+          "*COMPONENTS*", "*DEFAULT*", "*USER*", "*SETTINGS*", "*REGISTRY*"]
 run:
   # --nl lets RECmd process dirty hives whose transaction logs were not collected.
-  args: ["-d", "{host_dir}", "--bn", '{tool_dir}\BatchExamples\DFIRBatch.reb', "--nl",
-         "--csv", "{output_dir}", "--csvf", "recmd.csv"]
+  args: ["-d", "{host_dir}", "--bn", "{batch_file}", "--nl", "--csv", "{output_dir}", "--csvf", "recmd.csv"]
   timeout_minutes: 60
 options: []
 outputs: [recmd.csv]
-# The plugins it loads from its Plugins folder: a run records their SHA-256, with the batch file its arguments name, and
-# names the set by the batch file's version.
-tool_files: [Plugins]
+# The batch file a run gives RECmd, written into its output folder: DFIRBatch.reb's entries in their order, then the
+# entries of the app's recmd_additions.reb, which read values DFIRBatch.reb doesn't.
+compose:
+  batch_file:
+    tool: 'BatchExamples\DFIRBatch.reb'
+    app: recmd_additions.reb
+    label: {kind: version_line, path: recmd_additions.reb, text: "with Glessner additions {value}"}
+# The plugins it loads from its Plugins folder, and the batch file it composes from: a run records their SHA-256, and
+# names the set by the versions of the batch file and the additions.
+tool_files: [Plugins, 'BatchExamples\DFIRBatch.reb']
 rules_label: {kind: version_line, path: 'BatchExamples\DFIRBatch.reb', text: "DFIRBatch.reb {value}"}
 parser: recmd_csv
 notes: ""

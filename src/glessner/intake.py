@@ -27,7 +27,7 @@ from pathlib import Path
 from . import heads
 from .case import JOURNAL_FILE, Case, CaseError, ends_open, write_atomically
 from .events import well_formed
-from .identify import IMPORTABLE, NEWER_SIGNATURE_NAMES, Identification, identify_file
+from .identify import IMPORTABLE, NEWER_SIGNATURE_NAMES, Identification, identify_file, image_name
 from .journal import Check as JournalCheck
 from .journal import Journal, JournalError, check, unvouched_sentences, unvouched_warns
 from .long_paths import long_path
@@ -85,6 +85,24 @@ def sha256_file(path: Path) -> str:
         while chunk := f.read(CHUNK):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def line_ending_sha256(path: Path) -> set[str]:
+    """The SHA-256 of a file with its line endings converted each way, read in pieces as sha256_file reads it: with each
+    CR LF turned to LF, and with each LF of that turned to CR LF. A CR that ends a piece waits for the next, so a CR LF
+    split between two pieces is turned too."""
+    lf, crlf = hashlib.sha256(), hashlib.sha256()
+    held = b""
+    with path.open("rb") as f:
+        while chunk := f.read(CHUNK):
+            data = held + chunk
+            data, held = (data[:-1], b"\r") if data.endswith(b"\r") else (data, b"")
+            piece = data.replace(b"\r\n", b"\n")
+            lf.update(piece)
+            crlf.update(piece.replace(b"\n", b"\r\n"))
+    lf.update(held)
+    crlf.update(held)
+    return {lf.hexdigest(), crlf.hexdigest()}
 
 
 def walk(root: Path, links: list[str] | None = None, unreadable: list[tuple[str, str]] | None = None,
@@ -154,7 +172,7 @@ def is_placeholder(entry: os.DirEntry) -> bool:
     the folder listing carries, so nothing is opened. False where files have no such attributes, and for an entry that
     can't be statted."""
     try:
-        return _has_placeholder_attributes(entry.stat(follow_symlinks=False))
+        return has_placeholder_attributes(entry.stat(follow_symlinks=False))
     except OSError:
         return False
 
@@ -168,7 +186,8 @@ def file_attributes(path: Path) -> int:
         return 0
 
 
-def _has_placeholder_attributes(result: os.stat_result) -> bool:
+def has_placeholder_attributes(result: os.stat_result) -> bool:
+    """Whether a stat result's attributes are a cloud placeholder's; False where files have no such attributes."""
     return bool(getattr(result, "st_file_attributes", 0) & PLACEHOLDER_ATTRIBUTES)
 
 
@@ -617,14 +636,15 @@ def _current_entries(case: Case, size: int, mtime_ns: int) -> tuple[ManifestEntr
 def _read_again(e: ManifestEntry) -> bool:
     """Whether an entry's identification may predate a rule added since: a file left unidentified whose name fits a
     newer signature, such as a jump list, a $I file, or SRUDB.dat, so a case taken in by a build that didn't identify them
-    still plans runs for them, or whose name a text log may have; and a text log, which may be a tool's output, such as
-    Zeek's, or a format added since, such as syslog that intake took for key=value lines."""
+    still plans runs for them, or whose name a text log or a disk image may have; and a text log, which may be a tool's
+    output, such as Zeek's, or a format added since, such as syslog that intake took for key=value lines."""
     if e.error:
         return False
     if e.artifact is not None:
         return e.artifact in IMPORTABLE
     name = e.path.rsplit("/", 1)[-1].lower()
-    return name.endswith(NEWER_SIGNATURE_NAMES) or name.startswith("$i") or Path(name).suffix in TEXT_SUFFIXES
+    return (name.endswith(NEWER_SIGNATURE_NAMES) or name.startswith("$i") or Path(name).suffix in TEXT_SUFFIXES
+            or image_name(name))
 
 
 def file_stamp(path: Path) -> tuple[int, int]:
@@ -684,6 +704,12 @@ class Check:
         """How many of the unverified are folders walk couldn't list, not files."""
         return sum(p.endswith("/") for p in self.unverified)
 
+    @property
+    def result(self) -> str:
+        """"ok", or "mismatch" when an evidence file has a problem or manifest.jsonl grew past or differs from its
+        record, as verification.jsonl and the close's entry record it."""
+        return "ok" if not self.problems and not (self.manifest and self.manifest.failed) else "mismatch"
+
 
 def verify(case: Case, paths: Iterable[str] | None = None, reason: str = "") -> list[str]:
     """Re-hash manifest files (all of them, or the given relative paths) and record the result.
@@ -737,11 +763,12 @@ def check_files(case: Case, paths: Iterable[str] | None = None, reason: str = ""
             # strerror alone: str(exc) ends in ": <path>", and evidence_checks takes the file's name from before the
             # last ": "
             problems.append(f"{rel}: unreadable ({exc.strerror or type(exc).__name__})")
+    found = Check(problems, len(wanted) - len(unverified), unverified, manifest)
     record = {
         "at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "reason": reason,
-        "files_checked": len(wanted) - len(unverified),
-        "result": "ok" if not problems and not (manifest and manifest.failed) else "mismatch",
+        "files_checked": found.checked,
+        "result": found.result,
         "problems": problems,
         "unverified": unverified,
     }
@@ -752,16 +779,28 @@ def check_files(case: Case, paths: Iterable[str] | None = None, reason: str = ""
     lead = "\n" if case.verification_path.exists() and ends_open(case.verification_path) else ""
     with case.verification_path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(lead + json.dumps(record) + "\n")
-    return Check(problems, len(wanted) - len(unverified), unverified, manifest)
+    return found
 
 
-def matched_text(checked: int) -> str:
+# What close and the audit trail say the evidence matched when manifest.jsonl grew past or differs from its record, in
+# place of "the intake manifest": the file the re-hash read, which its record doesn't vouch for
+UNRECORDED_MANIFEST = "manifest.jsonl, which doesn't match its record in the journal"
+
+
+def matched_text(checked: int, against: str = "the intake manifest") -> str:
     """What a full check that found no problem says of the files it checked, when intake couldn't read others: never
-    "all"."""
+    "all". `against` names what they match, UNRECORDED_MANIFEST for a manifest its record doesn't vouch for."""
     if not checked:
         return "No evidence file has an intake hash to check."
-    return ("The 1 evidence file intake hashed matches the intake manifest." if checked == 1
-            else f"The {checked:,} evidence files intake hashed match the intake manifest.")
+    return (f"The 1 evidence file intake hashed matches {against}." if checked == 1
+            else f"The {checked:,} evidence files intake hashed match {against}.")
+
+
+def none_listed_text(against: str) -> str:
+    """What close and the audit trail say when the manifest the close read lists no evidence file. `against` names that
+    manifest, as in matched_text; UNRECORDED_MANIFEST ends in a clause, which a comma closes before "lists"."""
+    subject = f"{against}," if against == UNRECORDED_MANIFEST else against
+    return f"No evidence file was checked: {subject} lists none."
 
 
 def unverified_text(paths: list[str], escape: Callable[[str], str] = str, shown: int = 10) -> str:

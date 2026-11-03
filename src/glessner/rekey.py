@@ -26,8 +26,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 
@@ -37,15 +38,18 @@ from . import case as cases
 from . import heads
 from .accounts import AFFECTS_SQL, key_sql, name_sids
 from .case import JOURNAL_FILE, Case, CaseError, report_stage, upgrade, write_atomically
-from .events import EventIds, connect, id_table, names_by_root, transaction
+from .events import AmbiguousRoot, EventIds, connect, id_table, names_by_root, transaction
 from .hashes import HASHES_SQL
 from .intake import counted_record, record_at_head, records_manifest
 from .journal import (
+    LOCK_RETRY,
+    LOCK_WAIT,
     REPLAY_ERRORS,
     SYSTEM,
     UNVOUCHED_WORDS,
     Journal,
     JournalError,
+    _writing,
     check,
     copied_from,
     has_chain,
@@ -819,6 +823,10 @@ def _linked(case: Case) -> bool:
 
 
 LONG_FORM = "//?/"   # how a source file names a file outside the evidence root it was read under (evidence_relative)
+# Why the step leaves a run whose rows fit two roots equally well once the evidence has moved (events.AmbiguousRoot)
+AMBIGUOUS_REASON = ("its rows fit two of the files it read equally well, since the path of one ends in the other's, as "
+                    "logs/eve.json ends in eve.json, and the evidence has moved since the load, so which file each row "
+                    "names can't be told")
 
 
 def _stored_sources(con: duckdb.DuckDBPyConnection, runs: list[RunRecord]) -> dict[str, set[str]]:
@@ -842,7 +850,8 @@ def _old_names(case: Case, record: RunRecord, stored: set[str] | None) -> dict[s
     """Each input of a run of found output, by the name its events carry now, with the name a load under a link gave
     them: the file's whole path. The stored names (`stored`, the events table's extended-length ones) are matched to the
     inputs by the run's root (events.names_by_root, which a later load of found output replaces rows by), so the old name
-    is the one the rows carry, whatever has happened to the evidence since. With none, it is where the file is now."""
+    is the one the rows carry, whatever has happened to the evidence since; events.AmbiguousRoot when the rows fit two
+    roots equally well and the evidence is at neither. With none, it is where the file is now."""
     inputs = _inputs_by_name(case, record)
     if stored is None:
         root = long_path(case.evidence)
@@ -875,13 +884,16 @@ def _read_run(case: Case, record: RunRecord, names: dict[str, str] | None, store
               con: duckdb.DuckDBPyConnection | None) -> tuple[Parsed | None, dict[str, str], str]:
     """A run of found output checked against its record and read once (_renamed_ids): the pairs, the names the events
     carried (`names`, or _old_names of the run's `stored` rows when none are given), and why not, "" when it was read. A
-    run that fails either check, or that this build can't read, has no pairs and says why."""
+    run that fails either check, that this build can't read, or whose rows can't say which of its files they name, has no
+    pairs and says why."""
     try:
         problems, _ = run_problems(case, record, f"case format upgrade reads {record.run_id}")
         if problems:
             return None, {}, f"its output doesn't match its record: {'; '.join(problems)}"
         names = names or _old_names(case, record, stored)
         return _renamed_ids(case, record, names, con if stored else None), names, ""
+    except AmbiguousRoot:
+        return None, {}, AMBIGUOUS_REASON
     except Exception as exc:   # noqa: BLE001  (a parser refusing the output, or any failure reading it, is named, never fatal)
         return None, {}, f"its output can't be read by this build ({type(exc).__name__}: {exc})"
 
@@ -1090,13 +1102,89 @@ def _found_output_sentence(changed: int, pairs: dict, unplaced: dict, named: set
             + _references_sentence(pairs, unplaced, named, unreached))
 
 
+@dataclass(frozen=True)
+class LeftReferences:
+    """The analyst's references to events that the 3 to 4 step left with the IDs an earlier build gave them
+    (left_references), and the runs whose rows hold such events."""
+    runs: list[str]
+    marks: int
+    tags: int
+    notes: int
+    findings: int
+
+
+def _left_runs(case: Case) -> set[str]:
+    """The runs the 3 to 4 step names in its entry's skipped_runs, the entry's own or its rekey's."""
+    path = case.folder / JOURNAL_FILE
+    if not path.exists():
+        return set()
+    runs: set[str] = set()
+    with path.open("rb") as f:
+        for line in f:
+            if b'"case_upgrade"' not in line:
+                continue
+            entry = parse_line(line.rstrip(b"\n"))
+            if (entry is None or "prev" not in entry
+                    or (entry.get("action"), entry.get("from_format"), entry.get("to_format")) != ("case_upgrade", 3, 4)):
+                continue
+            rekey = entry.get("rekey")
+            for skipped in (entry.get("skipped_runs"), rekey.get("skipped_runs") if isinstance(rekey, dict) else None):
+                if isinstance(skipped, dict):
+                    runs.update(skipped)
+    return runs
+
+
+def left_references(case: Case) -> LeftReferences | None:
+    """The marks, tags, notes, and findings on events of the runs the 3 to 4 step left (_left_runs) whose rows still name
+    a file by its extended-length path, as a load under a link named it. A rebuild names the file by its path under the
+    evidence folder, so those events take new IDs that no reference follows, and nothing rekeys them now. None when no
+    reference is on such an event, or when the events database can't be read, as when another program holds it, which
+    a rebuild refuses."""
+    runs = _left_runs(case)
+    if not runs or not case.db_path.exists():
+        return None
+    try:
+        with closing(connect(case.db_path, read_only=True)) as con:
+            rows = con.execute("SELECT DISTINCT run_id, event_uid FROM events WHERE source_file LIKE '//?/%' "
+                               "AND run_id IN (SELECT unnest(?::VARCHAR[]))", [sorted(runs)]).fetchall()
+    except duckdb.Error:
+        return None
+    if not rows:
+        return None
+    state = replay(case.folder / JOURNAL_FILE)
+    ids = {uid for _, uid in rows}
+    marks = len(ids & state.marks.keys())
+    tags = sum(len(state.tags[uid]) for uid in ids & state.tags.keys())
+    notes = sum(len(state.notes[uid]) for uid in ids & state.notes.keys())
+    findings = sum(1 for finding in state.findings.values() if ids.intersection(finding["targets"]))
+    if not (marks or tags or notes or findings):
+        return None
+    return LeftReferences(sorted({run_id for run_id, _ in rows}), marks, tags, notes, findings)
+
+
+def left_warning(left: LeftReferences) -> str:
+    """What a rebuild says before it loads when the 3 to 4 step left events with an earlier build's IDs: the runs, and
+    how many marks, tags, notes, and findings on those events will name no event after this rebuild, which gives the
+    events new IDs or leaves out a run whose output it can't load."""
+    counts = [f"{n:,} {word if n == 1 else word + 's'}"
+              for n, word in ((left.marks, "mark"), (left.tags, "tag"), (left.notes, "note"), (left.findings, "finding"))
+              if n]
+    runs = f"{'run' if len(left.runs) == 1 else 'runs'} {_listed(left.runs)}"
+    return (f"Warning: the upgrade to case format 4 left the events of {runs} with the IDs an earlier build gave them, as "
+            "its journal entry says. This rebuild gives them new IDs, or leaves out a run whose output it can't load, so "
+            f"{_listed(counts)} on those events will then refer to events that no longer exist. Mark those events again "
+            "once a rebuild has loaded them.")
+
+
 def upgraded(case: Case, client: str = "cli") -> Case:
     """The case at CASE_FORMAT, upgraded first if it is older, for a command that writes to it: a load into a format 1
     case would add new IDs to a journal that has no map from the old ones, and a journal from before format 3 takes
     no ordinary entry until its chain has started. A case whose journal is read-only stays at the format it reached,
-    from format 3 on (KeptAtFormat), and the command's first write then fails on the read-only reason. The command line
-    calls it right before the first load or write, after the command checks its arguments, so a command that stops
-    before then leaves the format as it is. `client` is the kind of process, which the chained entries name."""
+    from format 3 on (KeptAtFormat), and the command's first journal entry then fails on the read-only reason. Runs,
+    imports, rebuilds, and loads of found output, which journal nothing, still load there, under that format's rules
+    (runner.records_format_4, runner.names_found_output_as_format_4). The command line calls it right before the first
+    load or write, after the command checks its arguments, so a command that stops before then leaves the format as it
+    is. `client` is the kind of process, which the chained entries name."""
     if case.settings.case_format >= cases.CASE_FORMAT:   # read at the call, as case.upgrade reads it
         return case
     return upgrade(case, upgrade_recorder(Journal(case, client)))
@@ -1108,19 +1196,51 @@ def upgraded_copy(case: Case, source: Case, client: str = "cli") -> Case:
     1 source and then the seal, and case_created follows the seal, naming the source and its journal's bytes. A copy of
     a source with the chain has its case_created already. The steps from a format with the chain then follow
     case_created, so every copy's journal reads the same way after it, whatever its source's format. Last, for a source
-    whose journal holds a record of the manifest, a manifest_recorded entry by the app carries the values of the record
-    source_record gives: the copy holds the source's manifest.jsonl byte for byte, so verify gives the copy its source's
-    answer, whatever it is. When the source's check can't vouch for that record, the entry names the reasons in
-    `unvouched`, so every output keeps the warning."""
+    whose journal holds a record of the manifest, the copy takes the source's manifest.jsonl again with the record
+    source_record gives, from one read of the source (source_manifest), and a manifest_recorded entry by the app carries
+    that record's values: the copy holds the bytes the record was taken with, byte for byte, also when Add new evidence
+    changed the source while the copy copied its runs, so verify gives the copy its source's answer, whatever it is.
+    When the source's check can't vouch for that record, the entry names the reasons in `unvouched`, so every output
+    keeps the warning."""
     if case.settings.case_format < cases.FIRST_CHAINED:
         case = upgrade(case, upgrade_recorder(Journal(case, client)), until=cases.FIRST_CHAINED)
         start_chain(case, client, copied_from=copied_from(source))
     case = upgraded(case, client)
-    if records_manifest(case) and (carried := source_record(source)):
-        record, reasons = carried
+    if records_manifest(case) and (taken := source_manifest(source)):
+        data, (record, reasons) = taken
+        if data is None:   # the source's journal records a manifest.jsonl the source no longer holds
+            case.manifest_path.unlink(missing_ok=True)
+        else:
+            write_atomically(case.manifest_path, data)
         Journal(case, client).append("manifest_recorded", SYSTEM, **{k: record[k] for k in ("sha256", "bytes", "lines")},
                                      via="copy", **({"unvouched": reasons} if reasons else {}))
     return case
+
+
+def source_manifest(source: Case) -> tuple[bytes | None, tuple[dict, list[str]]] | None:
+    """The source's manifest.jsonl, None when it is missing, with the record a copy of it carries and the reasons
+    (source_record), from one read of the source; None for no record. Intake and Add new evidence replace the file and
+    record it under one hold of the journal, so the bytes count only when no writer holds the journal once they are
+    read, and the file still holds them after the record is read: the record then never describes bytes newer than
+    those taken with it. The source's journal isn't held, so the copy writes nothing to the source, and the full check
+    reads a last line a crash cut short as a break, not as a write in progress. CaseError when a writer holds the
+    journal, or the file changes, at every try for LOCK_WAIT seconds."""
+    path, journal = source.manifest_path, source.folder / JOURNAL_FILE
+    read = lambda: path.read_bytes() if path.exists() else None
+    deadline = time.monotonic() + LOCK_WAIT
+    while True:
+        data = read()
+        if not _writing(journal):
+            carried = source_record(source)
+            if carried is None:
+                return None
+            if read() == data:
+                return data, carried
+        if time.monotonic() >= deadline:
+            raise CaseError("A Glessner program kept writing the source case's journal or manifest.jsonl while the copy "
+                            "read them, so the copy has no record of manifest.jsonl. Remove the copy's folder, then make "
+                            "the copy again.")
+        time.sleep(LOCK_RETRY)
 
 
 def source_record(source: Case) -> tuple[dict, list[str]] | None:

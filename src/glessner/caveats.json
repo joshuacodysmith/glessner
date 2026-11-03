@@ -1,5 +1,5 @@
 {
-  "about": "Caveats: what a kind of record does not prove, one text per artifact or event type, each with its sources. A record matches the first row whose match fits it: its artifact, and where given its event code, its channel, or a word in its registry path. The same record always shows the same text, and the app writes none of it. A source has a title and either a url, for a public page, or a path, which names a file of this app.",
+  "about": "Caveats: what a kind of record does not prove, one text per artifact or event type, each with its sources. A record matches the first row whose match fits it: its artifact, and where given its event code, its channel, its time's meaning (ts_desc, for a registry entry's own times), or a word in its registry path. The same record always shows the same text, and the app writes none of it. A source has a title and either a url, for a public page, or a path, which names a file of this app.",
   "caveats": [
     {
       "id": "prefetch",
@@ -25,6 +25,18 @@
       ]
     },
     {
+      "id": "appcompatcache_modified",
+      "name": "AppCompatCache entry's file modified time",
+      "match": {"artifact": ["registry"], "ts_desc": ["AppCompatCache file modified"]},
+      "text": "This time is the file's last modified time as the AppCompatCache entry recorded it, not when Windows saw the file or when the program ran. Compare it with the file's own modified time: if they differ, the file at that path, or its time, changed after the entry was written. On Vista and later the entry does not by itself show that the program ran.",
+      "sources": [
+        {"title": "Mandiant, Shimcache (Parisi, 2015)", "url": "https://cloud.google.com/blog/topics/threat-intelligence/caching-out-the-val/"},
+        {"title": "Cyber Triage, Shimcache and Amcache (Ray, 2026)", "url": "https://www.cybertriage.com/blog/shimcache-and-amcache-forensic-analysis-2026/"},
+        {"title": "Valhuntir, Shimcache", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/shimcache.yaml"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
       "id": "appcompatcache",
       "name": "AppCompatCache (Shimcache)",
       "match": {"artifact": ["registry"], "registry_path_has": "appcompatcache"},
@@ -35,6 +47,162 @@
         {"title": "Valhuntir, Shimcache", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/shimcache.yaml"},
         {"title": "parsers/recmd.py, the row time", "path": "src/glessner/parsers/recmd.py"},
         {"title": "The Stolen Szechuan Sauce case (DFIR Madness): in a Glessner case built from DC01 and DESKTOP, each host's AppCompatCache rows share one time", "url": "https://dfirmadness.com/the-stolen-szechuan-sauce/"}
+      ]
+    },
+    {
+      "id": "program_last_run",
+      "name": "UserAssist and BAM last run time",
+      "match": {"artifact": ["registry"], "ts_desc": ["UserAssist last executed", "BAM last executed"]},
+      "text": "This is the last run time the entry records for the program, under the account its key belongs to. Earlier runs leave no time here. On Windows 10 and later, UserAssist can set its last run time when the program did not run. UserAssist records programs started from the Windows GUI. BAM may not record every program that ran. This time does not show that a run succeeded or what the program did.",
+      "sources": [
+        {"title": "Valhuntir, UserAssist", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/userassist.yaml"},
+        {"title": "Cyber Triage, UserAssist (Ray, 2026)", "url": "https://www.cybertriage.com/blog/userassist-forensics-2026/"},
+        {"title": "Valhuntir, BAM", "url": "https://raw.githubusercontent.com/AppliedIR/sift-mcp/main/packages/forensic-knowledge/data/artifacts/windows/bam.yaml"},
+        {"title": "13Cubed, Windows Registry Cheat Sheet (version 2.0): UserAssist", "url": "https://training.13cubed.com/downloads"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "sam_account",
+      "name": "SAM account times",
+      "match": {"artifact": ["registry"], "ts_desc": ["SAM account name key last write", "SAM account last logon", "SAM account password last changed", "SAM account last incorrect password"]},
+      "text": "These times come from this host's SAM hive, which holds the host's local accounts only, not domain accounts. The name key last write is when the account's key under SAM\\Domains\\Account\\Users\\Names last changed. A later write moves it, so it can come after the account was made. A last logon time is the latest logon the record holds. These times do not show who used the account, or from where. Look for a logon event to show where a logon came from.",
+      "sources": [
+        {"title": "Microsoft, Credentials processes in Windows authentication: Security Accounts Manager database", "url": "https://learn.microsoft.com/en-us/windows-server/security/windows-authentication/credentials-processes-in-windows-authentication"},
+        {"title": "Windows Incident Response, User Account Analysis (Carvey, 2009)", "url": "https://windowsir.blogspot.com/2009/07/user-account-analysis.html"},
+        {"title": "Microsoft, KEY_BASIC_INFORMATION structure: LastWriteTime", "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_key_basic_information"},
+        {"title": "RegistryPlugins, SAM UserAccounts plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.SAM/UserAccounts.cs"},
+        {"title": "Windows Registry knowledge base, SAM Domains key: Users RID sub key F value", "url": "https://winreg-kb.readthedocs.io/en/latest/sources/security-accounts-manager-keys/Domains.html"},
+        {"title": "Microsoft, event 4624", "url": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4624"},
+        {"title": "The Data Leakage Case (NIST CFReDS): in a Glessner case built from it, the Administrator account's name key last write is 2015-03-25, after its last logon in 2010", "url": "https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "device_times",
+      "name": "USB and SCSI device times",
+      "match": {"artifact": ["registry"], "ts_desc": ["USB device installed", "USB device first installed", "USB device last connected", "USB device last removed", "SCSI device installed", "SCSI device first installed", "SCSI device last connected", "SCSI device last removed"]},
+      "text": "These times come from the device's entry in the SYSTEM hive. The first installed time is when Windows first installed the device. The installed time is when Windows last installed the device's driver, so a driver update moves it. The last connected and last removed times are the latest connection and removal the entry holds. These times do not show what was copied to or from the device, who connected it, or its connections between the first install and the last connection. Windows 7 records no last connection or removal time. A major Windows update can remove a USB device's entry and its times.",
+      "sources": [
+        {"title": "Yogesh Khatri's forensic blog, Windows 8 device timestamps (Khatri, 2013)", "url": "https://www.swiftforensics.com/2013/11/windows-8-new-registry-artifacts-part-1.html"},
+        {"title": "Microsoft, DEVPKEY_Device_InstallDate", "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/install/devpkey-device-installdate"},
+        {"title": "RegistryPlugins, USB plugin (Yi)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.USB/USB.cs"},
+        {"title": "RegistryPlugins, SCSI plugin (Yi)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.SCSI/SCSI.cs"},
+        {"title": "IT-Connect, USB device history (Dakhama, 2026)", "url": "https://www.it-connect.tech/forensic-windows-part-15-tracing-usb-device-history/"},
+        {"title": "0x55aa, Windows feature updates and USB devices (Kobzar, 2021)", "url": "https://ilyakobzar.com/p/windows-updates-and-anti-forensics/"},
+        {"title": "13Cubed, Windows Registry Cheat Sheet (version 2.0): USBSTOR's Properties times", "url": "https://training.13cubed.com/downloads"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "entry_key_write",
+      "name": "Entry key last write",
+      "match": {"artifact": ["registry"], "ts_desc": ["Device class key last write", "Uninstall key last write", "Installer product key last write", "Profile key last write", "Volume info cache key last write", "Network adapter key last write", "Service key last write", "Service Parameters key last write", "WordWheelQuery key last write", "App Paths key last write", "Portable device key last write"]},
+      "text": "This time is when the entry's own registry key last changed. It does not show what changed, or when the entry was first made: a later update, or a setting written again, moves it.",
+      "sources": [
+        {"title": "The Data Leakage Case (NIST CFReDS): in a Glessner case built from it, a USB drive's Device Classes keys were last written when it was connected again on 2015-03-24, not at its first connection the day before", "url": "https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "profile_logon_times",
+      "name": "ProfileList logon and logoff times",
+      "match": {"artifact": ["registry"], "ts_desc": ["Profile last logon", "Profile last logoff"]},
+      "text": "These times come from the account's key under ProfileList in the SOFTWARE hive. The last logon time is when the profile service last loaded the account's profile. The last logoff time is when it last unloaded the profile. Windows 10 version 1809, Windows Server 2019, and later versions record them. Earlier loads and unloads leave no time here. These times do not show where a logon came from. Look for a logon event to show that. RECmd writes about 1 in 16 of these times with a year before 1829, since it drops the leading zeros of the time's low half. The app rebuilds those times, so the event's time can differ from the LastLogonTime or LastLogoffTime in its details.",
+      "sources": [
+        {"title": "Microsoft, Scripts to retrieve profile age: LocalProfileLoadTime and LocalProfileUnloadTime", "url": "https://learn.microsoft.com/en-us/troubleshoot/windows-server/support-tools/scripts-to-retrieve-profile-age"},
+        {"title": "RegistryPlugins, ProfileList plugin (Yi)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.ProfileList/ProfileList.cs"},
+        {"title": "Microsoft, event 4624", "url": "https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4624"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "office_file_times",
+      "name": "Office file opened and closed times",
+      "match": {"artifact": ["registry"], "ts_desc": ["Office file last opened", "Office file last closed"]},
+      "text": "The last opened time comes from the file's entry in the Office program's MRU list, in the account's NTUSER hive. Office updates that time each time the file is opened. Earlier opens leave no time here. The last closed time is the last write of the file's entry under the program's Reading Locations key. Word writes that entry when a document is closed. An MRU entry stays after its file is deleted, so it does not show that the file still exists.",
+      "sources": [
+        {"title": "RegistryPlugins, Office MRU plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.OfficeMRU/OfficeMRU.cs"},
+        {"title": "Cyber Triage, What is a Most Recently Used artifact (video)", "url": "https://www.cybertriage.com/video/what-is-a-most-recently-used-artifact-video/"},
+        {"title": "ThinkDFIR, Microsoft Office Reading Locations, part 1 (Moore, 2019)", "url": "https://thinkdfir.com/2019/02/11/microsoft-office-reading-locations-part-1/"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "typed_url",
+      "name": "Typed URL time",
+      "match": {"artifact": ["registry"], "ts_desc": ["URL last typed"]},
+      "text": "This time comes from the URL's value in the TypedURLsTime key, beside TypedURLs in the account's NTUSER hive. It is when the URL was entered in Internet Explorer's address bar. In tests of Internet Explorer 6 and 8, a URL typed in full, completed by AutoComplete, or picked from the address bar's list got an entry. A pasted URL got one once Enter was pressed. So the time does not show that the user typed the whole URL. A link followed from a page added no entry. The list kept 25 URLs and dropped older ones. Clearing the browsing history cleared it.",
+      "sources": [
+        {"title": "RegistryPlugins, TypedURLs plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.TypedURLs/TypedURLs.cs"},
+        {"title": "Champlain College Leahy Center, Windows 8 Forensics Part 2 (Fleisher, 2012)", "url": "https://leahycenterblog.champlain.edu/2012/04/11/windows-8-forensics-part-2/"},
+        {"title": "Crucial Security Forensics Blog, TypedURLs part 1 (Nichols, 2011)", "url": "https://crucialsecurity.wordpress.com/2011/03/14/typedurls-part-1/"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "mru_list_time",
+      "name": "MRU list times",
+      "match": {"artifact": ["registry"], "ts_desc": ["LastVisitedPidlMRU entry opened", "CIDSizeMRU entry opened", "FirstFolder entry opened", "RunMRU entry opened", "OpenSavePidlMRU entry opened", "RecentDocs entry opened", "RecentDocs extension last opened"]},
+      "text": "This time is the last write of the MRU list's registry key. RECmd gives it to the list's newest entry, the first in the list's order. The list's other entries get no time. A key's last write is the last time the key or any of its values changed. Deleting another entry also moves it, so the time may not be when this entry was used. The RecentDocs extension time is the last write of the extension's own key, given to that extension's newest entry. Creating a file adds a RecentDocs entry even if the file is never opened.",
+      "sources": [
+        {"title": "RegistryPlugins, LastVisitedPidlMRU plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.LastVisitedPidlMRU/LastVisitedPidlMRU.cs"},
+        {"title": "RegistryPlugins, CIDSizeMRU plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.CIDSizeMRU/CIDSizeMRU.cs"},
+        {"title": "RegistryPlugins, FirstFolder plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.FirstFolder/FirstFolder.cs"},
+        {"title": "RegistryPlugins, RunMRU plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.RunMRU/RunMRU.cs"},
+        {"title": "RegistryPlugins, OpenSavePidlMRU plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.OpenSavePidlMRU/OpenSavePidlMRU.cs"},
+        {"title": "RegistryPlugins, RecentDocs plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.RecentDocs/RecentDocs.cs"},
+        {"title": "Magnet Forensics, What is MRU (Most Recently Used)? (2022)", "url": "https://www.magnetforensics.com/blog/what-is-mru-most-recently-used/"},
+        {"title": "Microsoft, KEY_BASIC_INFORMATION structure: LastWriteTime", "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_key_basic_information"},
+        {"title": "Forensic 4:cast, Updates to the RecentDocs key in Windows 10 (Whitfield, 2019)", "url": "https://forensic4cast.com/2019/03/the-recentdocs-key-in-windows-10/"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "scheduled_task_times",
+      "name": "Scheduled task times",
+      "match": {"artifact": ["registry"], "ts_desc": ["Scheduled task created", "Scheduled task last started", "Scheduled task last stopped"]},
+      "text": "These times come from the DynamicInfo value of the task's key under TaskCache\\Tasks in the SOFTWARE hive. The created time is when the task was created. One format reference marks it as possibly the last registration or update, so it may come after the task was first made. The last started time is the task's last run. Earlier runs leave no time here. The last stopped time is when a run last finished. It does not show that the run succeeded. In a published test, a run of a task whose program did not exist still set it. The last run's result code is in the details as LastActionResult. Windows 7 records no last stopped time.",
+      "sources": [
+        {"title": "RegistryPlugins, TaskCache plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.TaskCache/TaskCache.cs"},
+        {"title": "RegistryPlugins, TaskCache plugin's output columns (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.TaskCache/ValuesOut.cs"},
+        {"title": "cyber.wtf, Windows registry analysis: tasks (Ebach, 2022)", "url": "https://cyber.wtf/2022/06/01/windows-registry-analysis-todays-episode-tasks/"},
+        {"title": "Windows Registry knowledge base, Task scheduler keys: DynamicInfo", "url": "https://winreg-kb.readthedocs.io/en/latest/sources/system-keys/Task-scheduler.html"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "jumplistdata_time",
+      "name": "JumplistData time",
+      "match": {"artifact": ["registry"], "ts_desc": ["JumplistData last executed"]},
+      "text": "This time is the data of the program's value under Search\\JumplistData in the account's NTUSER hive. RECmd's plugin and batch file describe it as the program's last execution time. No other public page found explains what writes it. The key keeps one time per program.",
+      "sources": [
+        {"title": "RegistryPlugins, JumplistData plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.JumplistData/JumplistData.cs"},
+        {"title": "RECmd, Kroll batch file: JumplistData", "url": "https://raw.githubusercontent.com/EricZimmerman/RECmd/master/BatchExamples/Kroll_Batch.reb"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "remote_desktop_server",
+      "name": "Remote Desktop server key last write",
+      "match": {"artifact": ["registry"], "ts_desc": ["Remote Desktop server entry last modified"]},
+      "text": "This time is the last write of the server's key under Terminal Server Client\\Servers in the account's NTUSER hive. Connecting to the server with the Remote Desktop Connection client (mstsc) creates the key and sets its UsernameHint value. A key's last write is the last time the key or any of its values changed. The key keeps no time for each connection, so this time does not show the first connection or how many there were.",
+      "sources": [
+        {"title": "RegistryPlugins, TerminalServerClient plugin (Zimmerman)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.TerminalServerClient/TerminalServerClient.cs"},
+        {"title": "JPCERT/CC, Tool Analysis Result Sheet: mstsc (RDP)", "url": "https://jpcertcc.github.io/ToolAnalysisResultSheet/details/mstsc.htm"},
+        {"title": "Microsoft, KEY_BASIC_INFORMATION structure: LastWriteTime", "url": "https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_key_basic_information"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
+      ]
+    },
+    {
+      "id": "radar_detection",
+      "name": "RADAR last detection time",
+      "match": {"artifact": ["registry"], "ts_desc": ["RADAR last detected"]},
+      "text": "This time is the LastDetectionTime value of the program's key under RADAR\\HeapLeakDetection\\DiagnosedApplications in the SOFTWARE hive. Windows' memory leak diagnoser sets it when it picks a running process that has committed at least a set share of the host's physical memory. So the program was running at this time, but the time is not when it started. Only programs that commit that much memory get an entry. So a missing entry does not show that a program never ran.",
+      "sources": [
+        {"title": "RegistryPlugins, RADAR plugin (Yi)", "url": "https://raw.githubusercontent.com/EricZimmerman/RegistryPlugins/master/RegistryPlugin.RADAR/RADAR.cs"},
+        {"title": "Harel Segev, The mystery of the HeapLeakDetection registry key (2022)", "url": "https://harelsegev.github.io/posts/the-mystery-of-the-heapleakdetection-registry-key/"},
+        {"title": "parsers/recmd.py, the entry times", "path": "src/glessner/parsers/recmd.py"}
       ]
     },
     {

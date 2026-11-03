@@ -1,6 +1,7 @@
 """How runs are reported: a group load refused before it read anything shows as not checked, one that failed while it
-read shows as not read, a run.json that lacks a key, or has a format 4 key not of its shape, is refused by name, the
-import command marks the runs an earlier command left running, and a rebuild says why it read a file unchecked."""
+read shows as not read, a run.json that doesn't parse, lacks a key, or has a format 4 key not of its shape, is refused by
+name, the import command marks the runs an earlier command left running, and a rebuild says why it read a file
+unchecked."""
 
 import json
 import time
@@ -22,6 +23,7 @@ from glessner.runner import (
     RunRecord,
     finish_run,
     load_found_output,
+    read_run,
     read_runs,
     rebuild,
 )
@@ -125,6 +127,22 @@ def test_a_run_record_that_is_not_an_object_is_refused_naming_the_run(synthetic_
     with pytest.raises(CaseError, match="isn't a JSON object") as refused:
         read_runs(synthetic_case)
     assert path.parent.name in str(refused.value)
+
+
+@pytest.mark.parametrize("data", [b"{not json", b'{"run_id": "r1", "status": ', '{"host": "Café"}'.encode("cp1252"),
+                                  b"[" * 1_000_000], ids=["not JSON", "cut short", "code page", "too deep"])
+def test_a_run_record_that_does_not_parse_is_refused_naming_its_file_and_the_run(synthetic_case, capsys, data):
+    """Text that isn't JSON, a record cut short, one saved in a Windows code page rather than UTF-8, and nesting deeper
+    than the decoder reads are refused by read_runs, read_run, and the runs command with the file's path and the run, as
+    a record that isn't an object is."""
+    _, path = started(synthetic_case, "HOST1")
+    path.write_bytes(data)
+    for read in (lambda: read_runs(synthetic_case), lambda: read_run(synthetic_case, path.parent.name)):
+        with pytest.raises(CaseError, match="doesn't parse as JSON in UTF-8") as refused:
+            read()
+        assert str(path) in str(refused.value) and f"so run {path.parent.name} can't be read" in str(refused.value)
+    assert main(["runs", str(synthetic_case.folder)]) == 2
+    assert str(path) in capsys.readouterr().err
 
 
 def test_a_tool_check_object_is_read_as_it_was_written(synthetic_case):

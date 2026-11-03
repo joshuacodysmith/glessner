@@ -25,17 +25,20 @@ from pathlib import Path
 
 from .case import Case, CaseError, copy_case, create_case, open_case, tools_folder_problem, write_atomically
 from .events import connect
-from .intake import entry_kind, intake, walk
+from .identify import DISK_IMAGE, IMAGE_NAMES, VMDK_EXTENT_NAME, identify_file, image_note
+from .intake import entry_kind, has_placeholder_attributes, intake, walk
 from .journal import Journal
 from .long_paths import long_path
 from .queries import timeline_count
 from .rekey import upgraded_copy
 from .runner import LEFT_OUT, rebuild
 from .tools import _executables_under, _match, load_registry
+from .tools_manifest import and_list
 
 MAX_RECENT = 20
 CHECK_SECONDS = 5      # an evidence folder check stops counting after this long and says so
 MAX_FOLDERS = 500      # folders listed at once by the folder browser
+IMAGES_SHOWN = 3       # disk images the evidence check names; it counts the rest
 # GetDriveTypeW's answers for a drive letter with no root folder and for a mapped network drive
 DRIVE_NO_ROOT_DIR = 1
 DRIVE_REMOTE = 4
@@ -296,7 +299,7 @@ def check(evidence: str = "", case_folder: str = "", tools: str = "") -> dict:
             # The copies warning first, with a time limit of its own, so the count's CHECK_SECONDS covers both.
             t0 = time.monotonic()
             warning = copies_warning(ev, hosts, t0 + COPIES_SECONDS)
-            files, size, partial, links = 0, 0, False, []
+            files, size, partial, links, images = 0, 0, False, [], []
             base, deadline = long_path(ev), t0 + CHECK_SECONDS
             # The time is checked before each file and after each folder, so a run of folders with no files stops too
             for dirpath, filenames in walk(ev, links):   # as intake walks it, links skipped and listed
@@ -306,7 +309,11 @@ def check(evidence: str = "", case_folder: str = "", tools: str = "") -> dict:
                         break
                     files += 1
                     with contextlib.suppress(OSError):
-                        size += long_path(base, (folder / name).as_posix()).stat().st_size
+                        path = long_path(base, (folder / name).as_posix())
+                        st = path.stat()
+                        size += st.st_size
+                        if image := _image_format(path, st):
+                            images.append(((folder / name).as_posix(), image))
                 if time.monotonic() > deadline:
                     partial = True
                     break
@@ -317,7 +324,8 @@ def check(evidence: str = "", case_folder: str = "", tools: str = "") -> dict:
             else:
                 message = "The folder holds no files."
             out["evidence"] = {"ok": files > 0, "files": files, "bytes": size, "partial": partial, "hosts": hosts,
-                               "root_files": root_files, "message": message, "warning": warning, "links": links}
+                               "root_files": root_files, "message": message, "warning": warning, "links": links,
+                               "images": images_text(images, partial)}
     if case_folder:
         cf = Path(case_folder).expanduser()
         problem = ""
@@ -348,10 +356,43 @@ def check(evidence: str = "", case_folder: str = "", tools: str = "") -> dict:
     return out
 
 
+def _image_format(path: Path, st: os.stat_result) -> str:
+    """The format of the disk image at `path`, identified as intake identifies it, for a file with the name of an image's
+    first file (IMAGE_NAMES), which a split VMDK's extent (VMDK_EXTENT_NAME) is not; '' for any other file, and for a
+    cloud placeholder, which reading would download."""
+    name = path.name.lower()
+    if not name.endswith(IMAGE_NAMES) or VMDK_EXTENT_NAME.search(name) or has_placeholder_attributes(st):
+        return ""
+    ident = identify_file(path)
+    return ident.detail if ident.artifact == DISK_IMAGE else ""
+
+
+def images_text(images: list[tuple[str, str]], partial: bool = False) -> str:
+    """What the evidence check says of the disk images it found, each given as (path, format): that Glessner reads
+    none, the first IMAGES_SHOWN of them by path, the step that comes first, and each note on their formats once
+    (identify.image_note); '' for none. A `partial` count, one that stopped at its time limit, gives the number found as
+    at least that many."""
+    if not images:
+        return ""
+    images = sorted(images)
+    named = [f"{path} ({image})" for path, image in images[:IMAGES_SHOWN]]
+    if len(images) > IMAGES_SHOWN:
+        named.append(f"{len(images) - IMAGES_SHOWN} more")
+    notes = dict.fromkeys(note for _, image in images if (note := image_note(image)))
+    if len(images) == 1 and not partial:
+        found = f"{named[0]} is a disk image, which Glessner doesn't read. Mount or extract it first"
+    else:
+        count = f"{len(images)} disk image{'' if len(images) == 1 else 's'}"
+        if partial:
+            count = f"At least {count}"
+        found = f"{count}, which Glessner doesn't read: {and_list(named)}. Mount or extract each one first"
+    return " ".join([f"{found}, and choose the extracted folder.", *notes])
+
+
 def copies_warning(ev: Path, tops: list[str], deadline: float = float("inf")) -> str:
     """A warning, shown under the evidence check but not blocking the case, when top-level folders hold copies of one
     host's folder; '' otherwise, or when time.monotonic() passes `deadline` first. Folder names only: no
-    file is opened."""
+    file is opened, and no link is followed."""
     if _holds_volume(ev, tops):
         return ""   # the evidence folder is one host's own, such as a mounted image: its folders aren't hosts
     holders: dict[str, list[tuple[str, str]]] = {}   # a subfolder's name in lower case: (top-level folder, name)
@@ -387,8 +428,11 @@ def copies_warning(ev: Path, tops: list[str], deadline: float = float("inf")) ->
 
 
 def _folders(path: Path) -> list[str]:
+    """The names of the folders in a folder, as intake reads them (entry_kind), so a link, which can lead to a share,
+    is left out; [] for a folder that can't be listed."""
     try:
-        return [e.name for e in os.scandir(path) if e.is_dir(follow_symlinks=False)]
+        with os.scandir(path) as it:
+            return [e.name for e in it if entry_kind(e) == "folder"]
     except OSError:
         return []
 
@@ -396,10 +440,15 @@ def _folders(path: Path) -> list[str]:
 def _holds_volume(path: Path, names: list[str]) -> bool:
     """Whether a folder, given its subfolders' names, holds a volume's Windows or Users folder, or a drive letter that
     does, as KAPE's target output does (HOST\\C\\Windows). Counting the drive letter, not only a host's own
-    Windows and Users, lets two copies of a KAPE collection draw the warning."""
-    if any(n.lower() in VOLUME_NAMES for n in names):
+    Windows and Users, lets two copies of a KAPE collection draw the warning. A drive letter's folder is listed
+    (_folders), not tested by path, so a Windows or Users that is a link counts for nothing and isn't opened."""
+    if _names_volume_folder(names):
         return True
-    return any(DRIVE_LETTER.match(n) and os.path.isdir(path / n / v) for n in names for v in VOLUME_FOLDERS)
+    return any(DRIVE_LETTER.match(n) and _names_volume_folder(_folders(path / n)) for n in names)
+
+
+def _names_volume_folder(names: list[str]) -> bool:
+    return any(n.lower() in VOLUME_NAMES for n in names)
 
 
 @dataclass

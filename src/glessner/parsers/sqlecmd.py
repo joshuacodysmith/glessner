@@ -3,7 +3,9 @@
 SQLECmd runs maps against the SQLite databases it finds and writes one CSV per map query and database, named
 <time>_<CSVPrefix>_<BaseFileName>_<map Id>.csv, with the database's path in SourceFile. This parser reads only the maps
 below, which convert every time to UTC in their SQL. Maps that convert to 'localtime', the zone of whatever machine ran
-SQLECmd, such as the Windows Timeline map, are left out: WxTCmd reads that database in UTC.
+SQLECmd, such as the Windows Timeline map, are left out: WxTCmd reads that database in UTC. The app's own maps, in
+registry/sqlecmd_maps, are among them: one reads the downloads of a Chromium History without a downloads.guid column,
+which SQLECmd's map can't, and one reads its visit_source table, which this parser joins onto the visits.
 
 The account is the profile folder the database sits in; the browser comes from its folder too (Chrome, Edge, Brave,
 Firefox). A database read from the run's working copies is named by its evidence path, wherever the case folder is
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path, PureWindowsPath
 
 from ..events import Event, to_us
@@ -23,11 +26,20 @@ from .common import ParseContext, evidence_relative, file_key, output_paths, pro
 BROWSERS = (("google\\chrome", "Chrome"), ("microsoft\\edge", "Edge"), ("bravesoftware", "Brave"),
             ("mozilla\\firefox", "Firefox"))
 TOAST_TEXT = re.compile(r"<text[^>]*>([^<]*)</text>")
+# Maps by (BaseFileName, Id), as their CSVs are named
+VISITS = ("HistoryVisits", "1f37cc07-2b10-4c80-b845-84708e4f7429")
+VISIT_SOURCES = ("VisitSources", "1877b601-e124-43d7-8b0a-830b4a3bb186")
+# Where a visit came from, by the value Chromium writes in its visit_source table, which holds a row only for a visit
+# the browser didn't make itself
+VISIT_SOURCE_NAMES = {"0": "synced from another device", "1": "browsed", "2": "added by an extension",
+                      "3": "imported from Firefox", "4": "imported from Internet Explorer", "5": "imported from Safari"}
 
 
 def parse_sqlecmd(ctx: ParseContext) -> Iterator[Event]:
-    for path in output_paths(ctx, "sqlecmd", "*.csv"):
-        handler = _handler(path.name)
+    paths = output_paths(ctx, "sqlecmd", "*.csv")
+    maps = {**MAPS, VISITS: partial(chromium_visits, visit_sources=_visit_sources(paths, ctx))}
+    for path in paths:
+        handler = maps.get(_map_key(path.name))
         if handler is None:
             continue   # a map this parser doesn't read
         seen: set = set()   # rows already read from this file, for maps that repeat a record
@@ -40,12 +52,17 @@ def parse_sqlecmd(ctx: ParseContext) -> Iterator[Event]:
                 yield ev
 
 
-def _handler(name: str) -> Callable | None:
-    stem = Path(name).stem
-    parts = stem.rsplit("_", 2)
-    if len(parts) != 3:
-        return None
-    return MAPS.get((parts[1], parts[2].lower()))
+def _map_key(name: str) -> tuple[str, str] | None:
+    """A CSV's map as (BaseFileName, Id), from its name; None for a name that doesn't hold one."""
+    parts = Path(name).stem.rsplit("_", 2)
+    return (parts[1], parts[2].lower()) if len(parts) == 3 else None
+
+
+def _visit_sources(paths: list[Path], ctx: ParseContext) -> dict[tuple[str, str], str]:
+    """The visit_source value of each visit the VisitSources map read, by its History's evidence path and the visit's
+    ID."""
+    return {(_source(row.get("SourceFile", ""), ctx), row.get("VisitID", "")): row.get("Source", "")
+            for path in paths if _map_key(path.name) == VISIT_SOURCES for row in read_csv_rows(path)}
 
 
 def _source(path_text: str, ctx: ParseContext, as_before: bool = False) -> str:
@@ -80,16 +97,24 @@ def _event(row, source, user, ts_text, desc, record, message, *, code, path="", 
                  file_path=path, file_key=file_key(path) if path else "", extra=extra or None)
 
 
-def _visit(row, source, user, browser, time_col, record):
+def _visit(row, source, user, browser, time_col, record, how=""):
     title = f" ({row['URLTitle']})" if row.get("URLTitle") else f" ({row['Title']})" if row.get("Title") else ""
     if not to_us(row.get(time_col)):
         return
+    visit = f"{browser} visit, {how}" if how else f"{browser} visit"
     yield _event(row, source, user, row.get(time_col), "URL visited", record,
-                 f"{browser} visit: {row.get('URL', '')}{title}", code="visit")
+                 f"{visit}: {row.get('URL', '')}{title}", code="visit")
 
 
-def chromium_visits(row, source, user, browser, seen):
-    yield from _visit(row, source, user, browser, "VisitTime (UTC)", f"visit|{row.get('VisitID') or row.get('ID', '')}")
+def chromium_visits(row, source, user, browser, seen, visit_sources=None):
+    """A visit's event. A visit that `visit_sources` (_visit_sources) holds, one the browser didn't make itself, names
+    where it came from in its message and in `extra`'s visit_source, such as "imported from Internet Explorer"."""
+    how = ""
+    if (value := (visit_sources or {}).get((source, row.get("VisitID", "")))) is not None:
+        how = VISIT_SOURCE_NAMES.get(value, f"from visit source {value}")
+        row = {**row, "visit_source": f"{value} ({how})" if value in VISIT_SOURCE_NAMES else value}
+    yield from _visit(row, source, user, browser, "VisitTime (UTC)", f"visit|{row.get('VisitID') or row.get('ID', '')}",
+                      how)
 
 
 def edge_navigation(row, source, user, browser, seen):
@@ -155,8 +180,9 @@ def notifications(row, source, user, browser, seen):
 
 
 MAPS: dict[tuple[str, str], Callable] = {
-    ("HistoryVisits", "1f37cc07-2b10-4c80-b845-84708e4f7429"): chromium_visits,
+    VISITS: chromium_visits,
     ("Downloads", "0b575bcf-ade3-44e5-8162-eb52a96c2b06"): chromium_downloads,
+    ("DownloadsWithoutGUID", "bf893a12-5337-48de-bb8b-8bf87eb24cda"): chromium_downloads,
     ("KeywordSearches", "d968ece4-d24a-4baf-8f07-78da07727712"): keyword_searches,
     ("OmniboxShortcuts", "0e137968-371b-4078-9440-a94b3dcf0d2f"): omnibox_shortcuts,
     ("NavigationHistory", "4231f387-d112-458d-8a19-704e91125ea78"): edge_navigation,

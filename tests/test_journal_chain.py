@@ -44,6 +44,7 @@ from glessner.journal import (
     Journal,
     JournalError,
     check,
+    last_action,
     line_bytes,
     mend_unchained,
     replay,
@@ -905,19 +906,17 @@ def test_translation_comes_after_strict_parsing(case):
 
 
 def test_the_last_action_reads_the_shared_way(case):
-    """overview._last_action on a chained journal: the newest analyst entry read through the rekeys after it, past a
+    """The last-action reader on a chained journal: the newest analyst entry read through the rekeys after it, past a
     chained line strict parsing refuses and a last line holding 0x00, and past the app's own entries."""
-    from glessner.overview import _last_action
-
     path = journal_of(case)
     data = _rekey_line(chained([MARKS[0]]))
     data = add(data, "note", who=SYSTEM, target=UID, text="the app's")
     refused = line_bytes(envelope(5, head(data), "note", target=UID, text="a"))[:-2] + b', "text": "b"}\n'
     path.write_bytes(data + refused + b'{"seq": 6, "who": "cody", "action": "note"\0\0\n')
-    last = _last_action(path)
+    last = last_action(path)
     assert (last["action"], last["targets"], last["ids_changed_at"]) == ("mark", [NEW], [3])
     path.write_bytes(chained())
-    assert _last_action(path) is None
+    assert last_action(path) is None
 
 
 # Head
@@ -1252,12 +1251,10 @@ def test_a_rekey_the_pre_scan_misses_restarts_a_read_once_then_is_a_break(case, 
 
 
 def test_the_last_action_reads_through_only_the_rekeys_the_shared_reader_applies(tmp_path):
-    """overview._last_action reads back from the end and translates the entry it finds
+    """The last-action reader reads back from the end and translates the entry it finds
     through the rekeys after it. A rekey the shared reader drops (_rekey_ok: an unchained one after the chain started, or
     a chained one no build of this format writes) must not re-point it either; format 2's rekey before the seal, and a
     later format's chained one, still do."""
-    from glessner.overview import _last_action
-
     pairs = {"pairs": {UID: NEW}}
     unchained_rekey = {"seq": 9, "at": AT, "who": SYSTEM, "action": "case_upgrade", "from_format": 1, "to_format": 2,
                        "text": "x", "rekey": pairs}
@@ -1275,22 +1272,20 @@ def test_the_last_action_reads_through_only_the_rekeys_the_shared_reader_applies
     for name, (data, target) in cases.items():
         path = tmp_path / f"{len(name)}.jsonl"
         path.write_bytes(data)
-        assert _last_action(path)["target"] == target, name
+        assert last_action(path)["target"] == target, name
         assert replay(path).notes.get(target), name   # the shared reader puts the note under the same ID
 
 
 def test_the_last_action_reads_past_a_rekey_the_state_leaves_out(tmp_path):
     """A format 2 rekey line that _apply can't take, such as one whose seq is no number, re-points no event ID for the
     shared reader, so the last action read back past it names the ID that entries() gives."""
-    from glessner.overview import _last_action
-
     damaged_rekey = {"at": AT, "who": SYSTEM, "action": "case_upgrade", "from_format": 1, "to_format": 2, "text": "x",
                      "rekey": {"pairs": {UID: OTHER}}}
     path = tmp_path / "journal.jsonl"
     for seq in ("x", float("inf")):   # json writes the second as Infinity, which int() can't take
         path.write_bytes(chained(before=unchained(note(1), {"seq": seq, **damaged_rekey})))
         given = [e for e in jm.entries(path) if e["who"] not in jm.APP_NAMES]
-        assert given[-1]["target"] == UID and _last_action(path) == given[-1], seq
+        assert given[-1]["target"] == UID and last_action(path) == given[-1], seq
 
 
 def test_the_last_action_is_an_entry_the_shared_reader_gives(tmp_path):
@@ -1298,8 +1293,6 @@ def test_the_last_action_is_an_entry_the_shared_reader_gives(tmp_path):
     last line holding 0x00, which format 2's parse can read as UTF-16. After the chain starts, a line that names no prev
     is chained too, so it is given only with a seq, and as a rekey it re-points nothing, also when the entry before it
     names no prev either."""
-    from glessner.overview import _last_action
-
     base = chained([MARKS[1]])   # the note "first look" on UID
     rekey = {"seq": 4, "at": AT, "who": SYSTEM, "action": "case_upgrade", "from_format": 1, "to_format": 2, "text": "x",
              "rekey": {"pairs": {UID: NEW}}}
@@ -1314,7 +1307,7 @@ def test_the_last_action_is_an_entry_the_shared_reader_gives(tmp_path):
         path = tmp_path / f"{n}.jsonl"
         path.write_bytes(data)
         given = [e for e in jm.entries(path) if e["who"] not in jm.APP_NAMES]
-        assert _last_action(path) == given[-1], name
+        assert last_action(path) == given[-1], name
 
 
 def test_a_case_upgrade_goes_up():
@@ -1496,13 +1489,11 @@ def test_a_side_file_format_2_s_step_named_before_the_chain_is_checked_too(chain
 def test_the_last_action_skips_a_chained_line_with_an_incomplete_envelope(case):
     """Every other reader leaves out a chained line whose envelope is incomplete, so the overview's last action must
     not show it."""
-    from glessner.overview import _last_action
-
     data = chained([MARKS[1]])
     entry = envelope(3, head(data), "note", target=OTHER, text="forged")
     del entry["build"]
     journal_of(case).write_bytes(data + line_bytes(entry))
-    assert _last_action(journal_of(case))["text"] == "first look"
+    assert last_action(journal_of(case))["text"] == "first look"
 
 
 def test_the_overview_loads_on_a_broken_chain_whose_changed_line_is_the_close_entry(chained_case):

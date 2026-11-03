@@ -137,11 +137,16 @@ export async function askGroupDecision({ decision, source, value, group = null, 
   return ok ? uids : null;
 }
 
-// The question before a mark or a tag of a hand-picked selection above CONFIRM_ABOVE events (the timeline's selection,
-// a pivot or search list's ticks). `action` is "Mark 30 events Suspicious" or "Tag 30 events: Lateral Movement".
+// What a Reject does to the events, with `who` as the source or sources that suggest them
+export const rejectMeans = (who) => `Reject leaves them unreviewed and stops ${who} suggesting them; the Event page can restore a rejected suggestion.`;
+
+// The question before a mark, a tag, or a rejection of a hand-picked selection above CONFIRM_ABOVE events (the timeline's
+// selection, a pivot or search list's ticks). `action` is "Mark 30 events Suspicious" or "Tag 30 events: Lateral Movement".
 // `events` lists the first few when the caller has them; otherwise they are read. `effect` words what happens to the
-// events when it is not a change to them: a link to a finding changes no mark and no tag.
-export async function askSelection({ action, uids, events = null, cls = '', host = null, effect = '' }) {
+// events when it is not a change to them: a link to a finding changes no mark and no tag. `record` words what the journal
+// holds when that is not one entry.
+export async function askSelection({ action, uids, events = null, cls = '', host = null, effect = '',
+                                     record = 'The journal records this as one entry listing every event, with your name and the time.' }) {
   const n = uids.length;
   let first = events;
   if (!first) {
@@ -151,7 +156,7 @@ export async function askSelection({ action, uids, events = null, cls = '', host
   return askConfirm({
     title: `${action}?`,
     lines: [`A selection of ${plural(n, 'event')} you picked by hand.`],
-    points: [effect || `All ${n.toLocaleString()} change.`, 'The journal records this as one entry listing every event, with your name and the time.'],
+    points: [effect || `All ${n.toLocaleString()} change.`, record],
     warn: '', events: first, count: n, confirm: `${action.split(' ')[0]} ${n.toLocaleString()}`, cls,
   }, host);
 }

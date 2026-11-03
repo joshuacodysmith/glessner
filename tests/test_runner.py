@@ -2,19 +2,21 @@
 
 import hashlib
 import json
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 from chain_fixtures import format3_case
 from conftest import junction
 
 from glessner.case import create_case
 from glessner.intake import add_new, intake
 from glessner.long_paths import long_path
-from glessner.runner import RunError, plan_runs, read_runs, run
-from glessner.tools import DetectedTool, ToolOption, ToolSpec, detect, folder_sha256
+from glessner.runner import RunError, compose_batch, plan_runs, read_runs, run
+from glessner.tools import Composed, DetectedTool, ToolOption, ToolSpec, detect, folder_sha256
 
 FAKE_TOOL = """
 import json, os, pathlib, sys, time
@@ -252,6 +254,7 @@ def test_the_recorded_command_line_is_the_one_the_tool_received(case, tmp_path):
     assert " " in received[1] and " " in received[2]
 
 
+@pytest.mark.usefixtures("tmp_path_removed")
 def test_working_copies_are_copied_from_the_files_the_manifest_names(tmp_path):
     """A working copy is read from the evidence, and written, by its manifest name in extended-length form. A plain
     path drops a trailing dot from a name, so Security.evtx. would be copied from Security.evtx beside it and fail its
@@ -294,6 +297,7 @@ def test_a_tool_that_lists_the_host_folder_is_refused_a_file_intake_did_not_hash
     assert record.status == "ok" and record.inputs == [f"DC01/{LOGS}/Security.evtx", f"DC01/{LOGS}/System.evtx"]
 
 
+@pytest.mark.usefixtures("tmp_path_removed")
 def test_a_tool_that_lists_the_host_folder_is_refused_a_link_in_it(case, tmp_path):
     """A junction or symbolic link in a host's folder, which intake skips, would take a tool that lists the folder to
     files outside the evidence, which it would load as the host's. The run is refused, naming the link and its
@@ -731,6 +735,7 @@ def eve_lines(ports) -> str:
                    for port in ports)
 
 
+@pytest.mark.usefixtures("tmp_path_removed")
 def test_found_output_is_read_by_the_names_intake_hashed(tmp_path):
     """A load of output found in the evidence opens each file by its extended-length path, as intake hashed it. A file
     in a folder whose name ends in a dot gives its own rows, not those of the sibling its plain path opens, and a file
@@ -1144,3 +1149,300 @@ def test_a_run_record_whose_tool_check_has_a_result_word_this_build_does_not_kno
     assert read.tool_check == check
     (pecmd,) = [t for t in overview(case, load_registry(), {})["tools"] if t["id"] == "pecmd"]
     assert pecmd["last_run"]["latest"]["check"] == check   # shown as written
+
+
+# A batch file written as DFIRBatch.reb is: comments around its entries, which are indented four spaces, and hive types
+# in mixed case
+BATCH = r"""Description: DFIR RECmd Batch File
+Author: someone
+Version: 2.22
+Id: 77ae78db
+Keys:
+#
+# TABLE OF CONTENTS
+#
+    -
+        Description: WinLogon
+        HiveType: SOFTWARE
+        Category: System Info
+        KeyPath: Microsoft\Windows NT\CurrentVersion\WinLogon
+        ValueName: LastUsedUsername
+        Recursive: false
+        Comment: "The last user to log on"
+
+# https://example.invalid/winlogon
+
+    -
+        Description: Desktop IconLayouts
+        HiveType: NtUser
+        Category: User Activity
+        KeyPath: Software\Microsoft\Windows\Shell\Bags\1\Desktop
+        ValueName: IconLayout
+        Recursive: false
+        Comment: "Icons on the desktop"
+
+    -
+        Description: Run (NTUSER)
+        HiveType: NTUSER
+        Category: Autoruns
+        KeyPath: Software\Microsoft\Windows\CurrentVersion\Run
+        Recursive: false
+        Comment: "Programs that run at logon"
+"""
+
+# The app's additions, indented two spaces, which the composed batch indents as the tool's entries are
+ADDITIONS = r"""Description: Additions
+Author: Glessner
+Version: 1
+Id: 1
+Keys:
+  # The app's entries
+  -
+      Description: Windows Version
+      HiveType: SOFTWARE
+      Category: System Info
+      KeyPath: Microsoft\Windows NT\CurrentVersion
+      ValueName: CurrentVersion
+      Recursive: false
+      Comment: "Windows version number"
+  -
+      Description: CD Burning
+      HiveType: NTUSER
+      Category: User Activity
+      KeyPath: Software\Microsoft\Windows\CurrentVersion\Explorer\CD Burning
+      ValueName: DefaultToMastered
+      Recursive: false
+      Comment: "The disc format burned by default"
+"""
+
+
+def batch_keys(text: str) -> list[dict]:
+    return yaml.safe_load(text)["Keys"]
+
+
+def test_composed_batch_keeps_every_dfirbatch_entry_in_order():
+    """The tool's text is kept as it is, comments and all, and the app's comments and entries follow, moved to the tool's
+    entries' indentation, so the batch reads back as the tool's entries and then the app's."""
+    composed = compose_batch(BATCH, ADDITIONS)
+    assert composed.startswith(BATCH)
+    assert batch_keys(composed) == batch_keys(BATCH) + batch_keys(ADDITIONS)
+    tail = composed.removeprefix(BATCH).splitlines()
+    assert tail[:3] == ["    # The app's entries", "    -", "        Description: Windows Version"]
+
+
+def test_dfirbatch_entry_duplicating_an_addition_is_dropped():
+    """An addition's description is part of its rows' event IDs, so a later DFIRBatch.reb that reads the same value
+    loses its entry, with the comments after it, and the addition stays."""
+    duplicate = BATCH + r"""
+    -
+        Description: System Info (Current)
+        HiveType: SOFTWARE
+        Category: System Info
+        KeyPath: Microsoft\Windows NT\CurrentVersion
+        ValueName: CurrentVersion
+        Recursive: false
+        Comment: "A later version's entry"
+# its note
+"""
+    composed = compose_batch(duplicate, ADDITIONS)
+    assert batch_keys(composed) == batch_keys(BATCH) + batch_keys(ADDITIONS)
+    assert "System Info (Current)" not in composed and "its note" not in composed
+    assert composed.startswith(BATCH)
+
+
+def test_hive_type_compares_without_case():
+    """DFIRBatch.reb writes both NTUSER and NtUser, and Windows compares key and value names without case. An entry
+    for another value of the same key is kept."""
+    later = BATCH + r"""
+    -
+        Description: CD Burning (later)
+        HiveType: NtUser
+        Category: User Activity
+        KeyPath: SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\CD BURNING
+        ValueName: defaulttomastered
+        Recursive: false
+        Comment: "A later version's entry"
+    -
+        Description: CD Recorder
+        HiveType: NtUser
+        Category: User Activity
+        KeyPath: Software\Microsoft\Windows\CurrentVersion\Explorer\CD Burning
+        ValueName: CD Recorder Drive
+        Recursive: false
+        Comment: "Kept: another value"
+"""
+    descriptions = [entry["Description"] for entry in batch_keys(compose_batch(later, ADDITIONS))]
+    assert descriptions == ["WinLogon", "Desktop IconLayouts", "Run (NTUSER)", "CD Recorder", "Windows Version",
+                            "CD Burning"]
+
+
+@pytest.mark.parametrize("text, problem", [
+    ("Description: x\nVersion: 1\n", "has no Keys list"),
+    ("Keys: [\n", "can't be read as YAML"),
+    ("Description: x\nKeys: [{Description: a, HiveType: SOFTWARE, KeyPath: A, Recursive: false}]\n",
+     "has no top-level Keys: line"),
+    ("Description: x\nKeys:\n  [{Description: a, HiveType: SOFTWARE, KeyPath: A, Recursive: false}]\n",
+     "has 1 entries under Keys, but 0 lines start one"),
+    ("Description: x\nKeys: []\n", "has no top-level Keys: line with its entries on the lines below it"),
+])
+def test_a_batch_whose_entries_cannot_be_told_apart_is_not_composed(text, problem):
+    with pytest.raises(ValueError, match=problem):
+        compose_batch(text, ADDITIONS)
+
+
+def test_an_empty_keys_list_on_either_side_is_composed():
+    """A Keys: line with no entries below it adds none and keeps none: the additions follow an empty batch at their own
+    indentation, and an empty set of additions adds only its comments to the batch."""
+    empty = "Description: x\nVersion: 1\nKeys:\n# none yet\n"
+    composed = compose_batch(empty, ADDITIONS)
+    assert composed.startswith(empty) and batch_keys(composed) == batch_keys(ADDITIONS)
+    assert compose_batch(BATCH, empty) == f"{BATCH}# none yet\n"
+    assert compose_batch(empty, empty) == f"{empty}# none yet\n"
+
+
+READS_COMPOSED = """
+import pathlib, sys
+source, out_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+if source.is_dir():
+    text = '\\n'.join(sorted(p.relative_to(source).as_posix() for p in source.rglob('*') if p.is_file()))
+else:
+    text = source.read_text(encoding='utf-8')
+(out_dir / 'out.txt').write_text(text, encoding='utf-8')
+"""
+
+
+def composing(tmp_path, kind: str, tool: str = "", app: str = "") -> DetectedTool:
+    """A stand-in tool whose registry entry composes a `kind` (tools.COMPOSE_KINDS) from the tool's file or folder and
+    the app's, and which copies the composed batch, or the list of the composed folder's files, to out.txt. The tool
+    that runs is the Python executable, so the tool's file or folder is given by its full path. A batch_file composes
+    BATCH and ADDITIONS by default, and a maps_dir a Maps folder of two maps and an app folder of one."""
+    script = tmp_path / "reads_composed.py"
+    script.write_text(READS_COMPOSED, encoding="utf-8")
+    if kind == "batch_file":
+        tool, app = tool or str(tmp_path / "tool" / "DFIRBatch.reb"), app or str(tmp_path / "app" / "additions.reb")
+        for path, text in ((tool, BATCH), (app, ADDITIONS)):
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            Path(path).write_text(text, encoding="utf-8")
+    else:
+        tool, app = tool or str(tmp_path / "tool" / "Maps"), app or str(tmp_path / "app" / "maps")
+        for path in (Path(tool) / "a.smap", Path(tool) / "sub" / "b.smap", Path(app) / "app.smap"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(path.name, encoding="utf-8")
+    base = fake_spec(tmp_path)
+    return with_spec(base, args=(str(script), f"{{{kind}}}", "{output_dir}"),
+                     compose={kind: Composed(tool, Path(app))})
+
+
+def test_compose_writes_after_the_output_folder_is_made(case, tmp_path):
+    """A run refused for its arguments makes nothing, composed files included; a run writes the composed batch into
+    its output folder before the tool starts, and the tool reads it there."""
+    tool = composing(tmp_path, "batch_file")
+    (plan,) = plan_runs(case, tool, ["DC01"])
+    with pytest.raises(RunError, match="has no option"):
+        run(case, plan, {"nope": "1"})
+    assert list(case.runs_folder.iterdir()) == []
+    record = run(case, plan)
+    output = case.runs_folder / record.run_id / "output"
+    assert record.status == "ok" and record.argv[2] == str(output / "composed_batch.reb")
+    assert (output / "out.txt").read_text(encoding="utf-8") == compose_batch(BATCH, ADDITIONS)
+
+
+def test_composed_batch_is_hashed_in_outputs(case, tmp_path):
+    record = run(case, plan_runs(case, composing(tmp_path, "batch_file"), ["DC01"])[0])
+    composed = case.runs_folder / record.run_id / "output" / "composed_batch.reb"
+    hashes = {o["path"]: o["sha256"] for o in saved_record(case, record)["outputs"]}
+    assert hashes["composed_batch.reb"] == hashlib.sha256(composed.read_bytes()).hexdigest()
+    assert set(hashes) == {"composed_batch.reb", "out.txt"}
+
+
+@pytest.mark.parametrize("side, damage, problem", [
+    ("tool", "missing", "can't be read, so its batch file can't be composed: "),
+    ("app", "missing", "can't be read, so its batch file can't be composed: "),
+    ("app", "a folder", "can't be read, so its batch file can't be composed: "),
+    ("app", "not UTF-8", "isn't UTF-8 text, so its batch file can't be composed"),
+])
+def test_an_unreadable_batch_file_refuses_the_run_with_its_path(case, tmp_path, side, damage, problem):
+    """The tool's batch file and the app's additions are read before the run's folder is made, so one that is missing,
+    a folder, or not UTF-8 text refuses the run, naming it, and nothing is made."""
+    tool = composing(tmp_path, "batch_file")
+    entry = tool.spec.compose["batch_file"]
+    path = Path(entry.tool) if side == "tool" else entry.app
+    path.unlink()
+    if damage == "a folder":
+        path.mkdir()
+    elif damage == "not UTF-8":
+        path.write_bytes(b"Keys:\n# caf\xe9\n")   # Windows-1252
+    with pytest.raises(RunError) as refused:
+        run(case, plan_runs(case, tool, ["DC01"])[0])
+    assert str(refused.value).startswith(f"Fake wasn't run on DC01: {path} {problem}")
+    assert list(case.runs_folder.iterdir()) == []
+
+
+@pytest.mark.parametrize("side", ["tool", "app"])
+def test_a_missing_maps_folder_refuses_the_run_with_its_path(case, tmp_path, side):
+    """The tool's folder and the app's are listed before the run's folder is made, so a missing one refuses the run,
+    naming it, and nothing is made."""
+    tool = composing(tmp_path, "maps_dir")
+    entry = tool.spec.compose["maps_dir"]
+    folder = Path(entry.tool) if side == "tool" else entry.app
+    shutil.rmtree(folder)
+    with pytest.raises(RunError) as refused:
+        run(case, plan_runs(case, tool, ["DC01"])[0])
+    assert str(refused.value) == f"Fake wasn't run on DC01: {folder} can't be listed, so its maps folder can't be composed"
+    assert list(case.runs_folder.iterdir()) == []
+
+
+def test_composed_files_that_cannot_be_written_fail_the_run_before_the_tool_starts(case, tmp_path, monkeypatch):
+    """An app map removed after the run lists it can't be copied into the output folder, so the run is recorded as
+    failed with the error, and the tool doesn't start."""
+    from glessner import runner
+
+    tool = composing(tmp_path, "maps_dir")
+    listed = runner.composed_files
+
+    def removed_after_listing(spec, exe):
+        files = listed(spec, exe)
+        (tmp_path / "app" / "maps" / "app.smap").unlink()
+        return files
+
+    monkeypatch.setattr(runner, "composed_files", removed_after_listing)
+    record = run(case, plan_runs(case, tool, ["DC01"])[0])
+    assert record.status == "failed" and record.reason.startswith("could not write the composed files: ")
+    assert record.exit_code is None and not (case.runs_folder / record.run_id / "output" / "out.txt").exists()
+    assert saved_record(case, record)["reason"] == record.reason
+
+
+def test_new_placeholders_without_a_value_are_refused(case, tmp_path):
+    """{batch_file} and {maps_dir} have a value only where the registry entry composes that kind."""
+    for kind in ("batch_file", "maps_dir"):
+        tool = with_spec(composing(tmp_path, kind), compose={})
+        (plan,) = plan_runs(case, tool, ["DC01"])
+        with pytest.raises(RunError, match=rf"fake: placeholder \{{{kind}\}} has no value in this run"):
+            run(case, plan)
+    assert list(case.runs_folder.iterdir()) == []
+
+
+def test_recmd_argv_names_the_composed_batch(case, tmp_path):
+    """RECmd reads the batch composed in its run's output folder, and its arguments name no file of its own folder."""
+    from glessner.runner import RunPlan, build_argv
+    from glessner.tools import load_registry
+
+    tool = DetectedTool(load_registry()["recmd"], tmp_path / "tools" / "RECmd" / "RECmd.exe", "2026.10.2")
+    argv = build_argv(case, RunPlan(tool, "DC01", ("DC01/NTUSER.DAT",)), tmp_path / "out", {})
+    assert argv[argv.index("--bn") + 1] == str(tmp_path / "out" / "composed_batch.reb")
+    assert not any(str(tool.executable.parent) in arg for arg in argv[1:])
+
+
+def test_composed_folder_holds_the_tools_files_and_the_apps(case, tmp_path):
+    """The tool's folder's files keep their paths, the app's are added beside them, and an app file named as one of the
+    tool's, without regard to case, refuses the run rather than replace the tool's."""
+    tool = composing(tmp_path, "maps_dir")
+    record = run(case, plan_runs(case, tool, ["DC01"])[0])
+    output = case.runs_folder / record.run_id / "output"
+    assert record.status == "ok" and record.argv[2] == str(output / "composed_maps")
+    assert (output / "out.txt").read_text(encoding="utf-8").splitlines() == ["a.smap", "app.smap", "sub/b.smap"]
+    assert {"composed_maps/a.smap", "composed_maps/app.smap", "composed_maps/sub/b.smap"} <= {
+        o["path"] for o in record.outputs}
+    (tmp_path / "app" / "maps" / "A.SMAP").write_text("a clash", encoding="utf-8")
+    with pytest.raises(RunError, match=r"A\.SMAP has the name of one of the files in .*Maps, so its maps folder"):
+        run(case, plan_runs(case, tool, ["DC01"])[0])

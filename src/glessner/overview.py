@@ -25,12 +25,12 @@ from .journal import (
     State,
     analyst,
     lacks,
+    last_action,
     parse_line,
     unplaced_count,
     unvouched_warns,
     unvouched_words,
 )
-from .journal import last_action as _last_action
 from .queries import FIT_SETS_WINDOW, TS
 from .runner import RULES_NOT_RECORDED, RunRecord, rows_skipped_by_host, rule_sets
 from .tools import ToolSpec
@@ -116,13 +116,14 @@ NEARBY = f"""
 
 def case_overview(con: duckdb.DuckDBPyConnection, *, identity: Identity, state: State, report: dict[str, dict],
                   journal_path: Path, runs: list[RunRecord], specs: dict[str, ToolSpec], run_gaps: list[dict], manifest: list,
-                  unidentified: int, orphans: int, checks: dict, tool_names: dict[str, str], artifact_names: dict[str, str],
-                  build: str, alignment: str, journal: dict | None = None) -> dict:
+                  unidentified: int, disk_images: int, orphans: int, checks: dict, tool_names: dict[str, str],
+                  artifact_names: dict[str, str], build: str, alignment: str, journal: dict | None = None) -> dict:
     """The overview's sections. `con` is a cursor of its own: the temp tables it makes are its connection's. `runs` are
     the case's run records and `specs` the registry's tools, which name each tool's rule set and count the rows it skipped.
+    `unidentified` and `disk_images` count the evidence files intake identified as neither and as a disk image.
     `checks` is intake.evidence_checks's reading of verification.jsonl; `journal` is Integrity's Journal row
     (journal_row)."""
-    last = _last_action(journal_path)
+    last = last_action(journal_path)
     events = _events_of_interest(con, last)
     leads = _alert_leads(con, runs, specs, tool_names) + _rule_leads(con, state, report) + _clock_leads(identity)
     leads.sort(key=lambda lead: (TIER_ORDER[lead["level"]], lead["first"] is None, lead["first"] or 0, lead["id"]))
@@ -133,7 +134,8 @@ def case_overview(con: duckdb.DuckDBPyConnection, *, identity: Identity, state: 
     files = manifest_facts(manifest)
     return {"leads": leads, "ranking": RANKING, "progress": _progress(con, state, leads, last, orphans),
             "by_host": _by_host(con, identity, leads), "hosts": hosts["rows"],
-            "gaps": {"runs": run_gaps, "unidentified": unidentified, "unreadable": files["unreadable"],
+            "gaps": {"runs": run_gaps, "unidentified": unidentified, "disk_images": disk_images,
+                     "unreadable": files["unreadable"],
                      "unlisted": files["unlisted"], "clears": hosts["clears"], "no_event_logs": hosts["no_event_logs"]},
             "integrity": {**_integrity(files, checks, journal_path, build, alignment, identity),
                           "manifest": _manifest_row(checks["last_full"], state.manifests,

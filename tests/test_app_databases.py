@@ -1,18 +1,23 @@
-"""SQLite application databases: recognition, SQLECmd's browser and notification maps,
+"""SQLite application databases: recognition, SQLECmd's browser and notification maps and the app's own maps,
 WxTCmd's Windows Timeline, nothing-to-report runs, and working copies past Windows' path limit."""
 
 import csv
 import os
+import re
+import sqlite3
+from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 
 import pytest
+import yaml
 
 from glessner.identify import identify_bytes
 from glessner.long_paths import long_path
-from glessner.parsers import PARSERS, ParseContext
+from glessner.parsers import PARSERS, ParseContext, sqlecmd
 from glessner.runner import RunRecord, _status
 from glessner.tool_outputs import kind_of
-from glessner.tools import load_registry
+from glessner.tools import REGISTRY_DIR, load_registry
 
 SQLITE = b"SQLite format 3\x00" + b"\x00" * 84
 VISITS = ["ID", "VisitTime (UTC)", "LastVisitedTime (UTC)", "URLTitle", "URL", "VisitCount", "TypedCount", "Hidden",
@@ -131,6 +136,7 @@ def test_nothing_to_report_is_ok_only_where_the_registry_says_so():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows' path limit")
+@pytest.mark.usefixtures("tmp_path_removed")
 def test_working_copies_pass_the_windows_path_limit(tmp_path):
     """A working copy repeats the evidence's own folders, such as AppData/Local/ConnectedDevicesPlatform/L.<user>,
     under the run folder, and the two together can pass Windows' 260-character limit. The runner makes and reads each
@@ -269,3 +275,273 @@ def test_a_stop_inside_a_copied_run_s_record_write_leaves_the_record_as_copied(t
     copied = tmp_path / "copy" / "runs" / record.parent.name / "run.json"
     assert copied.read_bytes() == record.read_bytes()
     assert not (tmp_path / "copy" / "case.yaml").exists()   # not a case, so nothing opens it half made
+
+
+APP_MAPS = REGISTRY_DIR / "sqlecmd_maps"
+WITHOUT_GUID = APP_MAPS / "Glessner_ChromiumBrowser_DownloadsWithoutGUID.smap"
+VISIT_SOURCES = APP_MAPS / "Glessner_ChromiumBrowser_VisitSources.smap"
+GUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# A Chromium History's downloads columns at schema version 29, which has no downloads.guid, and columns added since
+# that SQLECmd's downloads map reads
+SCHEMA_29_DOWNLOADS = ("id", "current_path", "target_path", "start_time", "received_bytes", "total_bytes", "state",
+                       "danger_type", "interrupt_reason", "end_time", "opened", "referrer", "by_ext_id", "by_ext_name",
+                       "etag", "last_modified", "mime_type", "original_mime_type")
+LATER_DOWNLOADS = ("guid", "tab_url", "tab_referrer_url", "site_url", "last_access_time")
+CHROME = "D:\\Evidence\\case\\WS01\\Users\\{user}\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\History"
+CHROME_EVIDENCE = "WS01/Users/{user}/AppData/Local/Google/Chrome/User Data/Default/History"
+
+
+def app_map(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def history(path: Path, downloads: tuple[str, ...] = SCHEMA_29_DOWNLOADS, chains: bool = True) -> Path:
+    """A Chromium History with the five tables SQLECmd's Chromium maps identify it by and visit_source, a downloads
+    table of the columns `downloads`, and, with `chains`, the downloads_url_chains table."""
+    tables = {"urls": "id, url, title, visit_count, typed_count, last_visit_time, hidden, favicon_id",
+              "visits": "id, url, visit_time, from_visit, transition, segment_id, visit_duration",
+              "visit_source": "id, source", "segments": "id, name, url_id",
+              "keyword_search_terms": "keyword_id, url_id, lower_term, term", "downloads": ", ".join(downloads)}
+    if chains:
+        tables["downloads_url_chains"] = "id, chain_index, url"
+    con = sqlite3.connect(path)
+    with closing(con), con:
+        for name, columns in tables.items():
+            con.execute(f"CREATE TABLE {name} ({columns})")
+    return path
+
+
+def webkit(text: str) -> int:
+    """A UTC time as Chromium stores it: microseconds since 1601-01-01."""
+    return (int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp()) + 11_644_473_600) * 1_000_000
+
+
+def downloads_history(path: Path) -> Path:
+    """A schema 29 History with two downloads: a finished one, opened, whose URL chain of three is stored out of order,
+    and one still in progress, with a chain of two."""
+    history(path)
+    con = sqlite3.connect(path)
+    with closing(con), con:
+        con.executemany("INSERT INTO downloads (id, current_path, target_path, start_time, received_bytes, total_bytes, "
+                        "state, danger_type, interrupt_reason, end_time, opened, referrer) "
+                        "VALUES (?, ?, ?, ?, 10, 10, ?, 4, 0, ?, ?, '')", [
+                            (1, "C:\\Users\\bob\\Downloads\\tool.exe", "C:\\Users\\bob\\Downloads\\tool.exe",
+                             webkit("2015-03-24 20:00:00"), 1, webkit("2015-03-24 20:00:07"), 1),
+                            (2, "C:\\Users\\bob\\Downloads\\notes.txt.crdownload", "C:\\Users\\bob\\Downloads\\notes.txt",
+                             webkit("2015-03-25 09:00:00"), 0, 0, 0)])
+        con.executemany("INSERT INTO downloads_url_chains VALUES (?, ?, ?)", [
+            (1, 2, "https://cdn.example/tool.exe"), (1, 0, "https://evil.example/get"), (1, 1, "https://cdn.example/a"),
+            (2, 0, "https://files.example/notes"), (2, 1, "https://files.example/notes.txt")])
+    return path
+
+
+def identifies(map_file: Path, database: Path) -> bool:
+    """Whether SQLECmd reads `database` with the map: its IdentifyQuery gives its IdentifyValue."""
+    found = app_map(map_file)
+    with closing(sqlite3.connect(database)) as con:
+        return str(con.execute(found["IdentifyQuery"]).fetchone()[0]) == str(found["IdentifyValue"])
+
+
+def run_map(map_file: Path, database: Path, out: Path, source_file: str) -> list[dict[str, str]]:
+    """The rows of the map's one query on `database`, written to `out` as SQLECmd writes them: a CSV named
+    <time>_<CSVPrefix>_<BaseFileName>_<Id>.csv, with the database's path, `source_file`, in its SourceFile column and
+    an empty field for a NULL."""
+    found = app_map(map_file)
+    (query,) = found["Queries"]
+    with closing(sqlite3.connect(database)) as con:
+        cursor = con.execute(query["Query"])
+        columns = [column[0] for column in cursor.description]
+        rows = [{**dict(zip(columns, ("" if v is None else str(v) for v in row), strict=True)), "SourceFile": source_file}
+                for row in cursor]
+    write(out / f"20261029000000000000_{found['CSVPrefix']}_{query['BaseFileName']}_{found['Id']}.csv",
+          [*columns, "SourceFile"], rows)
+    return rows
+
+
+def parse(out: Path) -> list:
+    return list(PARSERS["sqlecmd_csv"](ParseContext(out, Path("D:/Evidence/case"))))
+
+
+def test_app_map_ids_differ_from_every_tool_map():
+    """Each app map is a SQLECmd map, with the fields SQLECmd's guide to maps requires, and an Id of its own: a lowercase
+    GUID, as the parser and tool_outputs read a CSV's name, that no SQLECmd map the parser reads has. A BaseFileName
+    holds no underscore, since the parser takes the map from the last two parts of a CSV's name, and each query's CSV
+    goes to a handler or to the visit join. The lab check compares the Ids with every map in SQLECmd's Maps folder."""
+    maps = [app_map(path) for path in sorted(APP_MAPS.glob("*.smap"))]
+    ids = {found["Id"] for found in maps}
+    assert len(maps) == len(ids) == 2 and all(GUID.fullmatch(map_id) for map_id in ids)
+    app_keys = set()
+    for found in maps:
+        assert {"Description", "Author", "Email", "Id", "Version", "CSVPrefix", "FileName", "IdentifyQuery",
+                "IdentifyValue", "Queries"} <= set(found)
+        for query in found["Queries"]:
+            assert "_" not in query["BaseFileName"] and {"Name", "Query"} <= set(query)
+            app_keys.add((query["BaseFileName"], found["Id"]))
+            name = f"20261029000000000000_{found['CSVPrefix']}_{query['BaseFileName']}_{found['Id']}.csv"
+            assert kind_of(name, "ID").parser == "sqlecmd_csv"
+    assert app_keys == {("DownloadsWithoutGUID", app_map(WITHOUT_GUID)["Id"]), sqlecmd.VISIT_SOURCES}
+    assert {key for key in sqlecmd.MAPS if key[1] in ids} == app_keys - {sqlecmd.VISIT_SOURCES}
+
+
+def test_downloads_identify_query_matches_only_a_history_without_guid(tmp_path):
+    """The app's downloads map reads a History whose downloads table has each column its query reads and no guid column,
+    which SQLECmd's downloads map needs, so the two never read the same History. A History without the URL chain table
+    or a column the query reads is left to neither, so the map never fails on a History it reads. The visit sources map
+    reads every History with the visit_source table."""
+    older, later = history(tmp_path / "older"), history(tmp_path / "later", SCHEMA_29_DOWNLOADS + LATER_DOWNLOADS)
+    no_chains = history(tmp_path / "no_chains", chains=False)
+    no_opened = history(tmp_path / "no_opened", tuple(c for c in SCHEMA_29_DOWNLOADS if c != "opened"))
+    assert [identifies(WITHOUT_GUID, db) for db in (older, later, no_chains, no_opened)] == [True, False, False, False]
+    other = tmp_path / "other.db"
+    con = sqlite3.connect(other)
+    with closing(con), con:
+        con.execute("CREATE TABLE downloads (id, guid)")
+    assert not identifies(WITHOUT_GUID, other) and not identifies(VISIT_SOURCES, other)
+    assert identifies(VISIT_SOURCES, older) and identifies(VISIT_SOURCES, later)
+
+
+def test_downloads_query_runs_on_a_schema_29_history(tmp_path):
+    """The query gives each column a name that SQLECmd's downloads map gives it, and times in UTC, with a row for each
+    URL in a download's chain, in the chain's order. downloads.opened is a flag, so it reads Yes or No, not a time."""
+    rows = run_map(WITHOUT_GUID, downloads_history(tmp_path / "History"), tmp_path, CHROME.format(user="bob"))
+    assert set(rows[0]) <= set(DOWNLOADS)
+    assert {"ID", "TargetPath", "DownloadURL", "StartTime", "EndTime", "Opened"} <= set(rows[0])
+    assert [(row["ID"], row["DownloadURL"]) for row in rows] == [
+        ("1", "https://evil.example/get"), ("1", "https://cdn.example/a"), ("1", "https://cdn.example/tool.exe"),
+        ("2", "https://files.example/notes"), ("2", "https://files.example/notes.txt")]
+    finished, in_progress = rows[0], rows[3]
+    assert [finished[c] for c in ("StartTime", "EndTime", "Opened", "State", "DangerType", "InterruptReason")] == [
+        "2015-03-24 20:00:00", "2015-03-24 20:00:07", "Yes", "Complete", "Content May Be Malicious", "No Interrupt"]
+    assert [in_progress[c] for c in ("StartTime", "EndTime", "Opened", "State")] == [
+        "2015-03-25 09:00:00", "1601-01-01 00:00:00", "No", "In Progress"]
+
+
+def test_app_downloads_rows_load_through_chromium_downloads():
+    """The app's downloads map's CSVs go to the handler of SQLECmd's downloads map, from a run's output folder and from
+    output found in the evidence alike."""
+    found = app_map(WITHOUT_GUID)
+    name = f"20261029000000000000_ChromiumBrowser_{found['Queries'][0]['BaseFileName']}_{found['Id']}.csv"
+    assert sqlecmd.MAPS[sqlecmd._map_key(name)] is sqlecmd.chromium_downloads
+    assert kind_of(name, ",".join(DOWNLOADS)).parser == "sqlecmd_csv"
+
+
+def test_schema_29_downloads_give_one_event_per_download(tmp_path):
+    """The app's map repeats a download's row for each URL in its chain, as SQLECmd's does, and the parser reads one set
+    of events for each download: its start, and its end where it has one, from the first URL of its chain. Opened is a
+    flag here, so no event says when the file was opened."""
+    out = tmp_path / "output"
+    out.mkdir()
+    run_map(WITHOUT_GUID, downloads_history(tmp_path / "History"), out, CHROME.format(user="bob"))
+    events = parse(out)
+    assert [(e.source_record, e.ts_desc) for e in events] == [
+        ("download|1|start", "Download started"), ("download|1|end", "Download finished"),
+        ("download|2|start", "Download started")]
+    started = events[0]
+    assert (started.source_file, started.user_name, started.file_path) == (
+        CHROME_EVIDENCE.format(user="bob"), "bob", "C:\\Users\\bob\\Downloads\\tool.exe")
+    assert started.message == "Chrome download: C:\\Users\\bob\\Downloads\\tool.exe from https://evil.example/get"
+    assert started.ts_us == int(datetime(2015, 3, 24, 20, tzinfo=UTC).timestamp()) * 1_000_000
+    assert (started.extra["Opened"], started.extra["State"]) == ("Yes", "Complete")
+
+
+def visits_output(tmp_path: Path, source: str | None = "4") -> Path:
+    """A SQLECmd output folder with bob's and alice's Chrome visits, each with visit IDs 70 and 71, and, unless `source`
+    is None, the VisitSources CSV of bob's History, which gives his visit 70 that source. The VisitSources CSV comes
+    after the visits' CSVs, as a later time in its name puts it."""
+    out = tmp_path / f"output-{source}"
+    out.mkdir()
+    for n, user in enumerate(("bob", "alice")):
+        write(out / f"{n}_ChromiumBrowser_HistoryVisits_1f37cc07-2b10-4c80-b845-84708e4f7429.csv", VISITS, [
+            {"ID": "7", "VisitID": visit, "VisitTime (UTC)": "2015-03-22 14:00:00", "URL": f"https://site.example/{visit}",
+             "URLTitle": "Site", "SourceFile": CHROME.format(user=user)} for visit in ("70", "71")])
+    if source is not None:
+        base, map_id = sqlecmd.VISIT_SOURCES
+        write(out / f"9_ChromiumBrowser_{base}_{map_id}.csv", ["VisitID", "Source", "SourceFile"],
+              [{"VisitID": "70", "Source": source, "SourceFile": CHROME.format(user="bob")}])
+    return out
+
+
+def test_visit_source_joins_onto_visits_by_file_and_visit_id(tmp_path):
+    """A visit_source row names the visit of its own History with its VisitID: bob's visit 70, not his visit 71 and not
+    alice's visit 70."""
+    joined = {(e.user_name, e.source_record): (e.extra or {}).get("visit_source") for e in parse(visits_output(tmp_path))}
+    assert joined == {("bob", "visit|70"): "4 (imported from Internet Explorer)", ("bob", "visit|71"): None,
+                      ("alice", "visit|70"): None, ("alice", "visit|71"): None}
+
+
+def test_imported_visit_message_names_its_source(tmp_path):
+    """An imported visit's message says where it came from, and a visit with no visit_source row reads as before. A
+    source value the app has no name for is given as its number."""
+    messages = {(e.user_name, e.source_record): e.message for e in parse(visits_output(tmp_path))}
+    assert messages[("bob", "visit|70")] == "Chrome visit, imported from Internet Explorer: https://site.example/70 (Site)"
+    assert messages[("bob", "visit|71")] == messages[("alice", "visit|71")] == (
+        "Chrome visit: https://site.example/71 (Site)")
+    unnamed = {(e.user_name, e.source_record): e for e in parse(visits_output(tmp_path, "9"))}[("bob", "visit|70")]
+    assert (unnamed.message, unnamed.extra["visit_source"]) == (
+        "Chrome visit, from visit source 9: https://site.example/70 (Site)", "9")
+
+
+def test_visit_ids_unchanged_by_the_join(tmp_path):
+    """The join changes a visit's message and extra, not its source record or time description, so its event ID, and any
+    mark on it, stays, and it adds no event."""
+    from glessner.events import event_uid
+
+    uids = lambda out: [event_uid("WS01", e.artifact, e.source_file, e.source_record, e.ts_desc) for e in parse(out)]
+    before, after = uids(visits_output(tmp_path, None)), uids(visits_output(tmp_path))
+    assert after == before and len(set(after)) == 4
+
+
+def sqlecmd_exe(tmp_path: Path, maps: bool = True) -> Path:
+    """A SQLECmd folder's executable, and, with `maps`, a Maps folder of two maps and the guide that SQLECmd's Maps
+    folder holds beside them."""
+    folder = tmp_path / "SQLECmd"
+    (folder / "Maps" if maps else folder).mkdir(parents=True)
+    if maps:
+        for name in ("Windows_ChromiumBrowser_Downloads.smap", "Windows_ChromiumBrowser_HistoryVisits.smap",
+                     "!OS_Application_OptionalDescription.guide"):
+            (folder / "Maps" / name).write_text(name, encoding="utf-8")
+    (folder / "SQLECmd.exe").write_bytes(b"MZ")
+    return folder / "SQLECmd.exe"
+
+
+def test_maps_folder_holds_the_tools_maps_and_the_apps(tmp_path):
+    """A run's maps folder holds every file of SQLECmd's Maps folder, then the app's maps."""
+    from glessner.runner import composed_files
+
+    exe = sqlecmd_exe(tmp_path)
+    files = composed_files(load_registry()["sqlecmd"], exe)
+    tool = {f"composed_maps/{p.name}": p for p in (exe.parent / "Maps").iterdir()}
+    app = {f"composed_maps/{p.name}": p for p in APP_MAPS.iterdir()}
+    assert files == tool | app and set(list(files)[len(tool):]) == set(app)
+    assert {p.name for p in APP_MAPS.iterdir()} == {WITHOUT_GUID.name, VISIT_SOURCES.name}
+
+
+def test_missing_tool_maps_folder_refuses_the_run(tmp_path):
+    """Without SQLECmd's Maps folder there is no maps folder to compose, so the run is refused before anything is made
+    (runner.run), naming the folder."""
+    from glessner.runner import RunError, composed_files
+
+    exe = sqlecmd_exe(tmp_path, maps=False)
+    with pytest.raises(RunError, match=re.escape(f"{exe.parent / 'Maps'} can't be listed")):
+        composed_files(load_registry()["sqlecmd"], exe)
+
+
+def test_sqlecmd_argv_passes_the_composed_maps_folder(synthetic_case, tmp_path):
+    """SQLECmd reads the maps folder composed in its run's output folder, and its arguments name no folder of its own."""
+    from glessner.runner import RunPlan, build_argv
+    from glessner.tools import DetectedTool
+
+    tool = DetectedTool(load_registry()["sqlecmd"], sqlecmd_exe(tmp_path), "2026.10.3")
+    argv = build_argv(synthetic_case, RunPlan(tool, "DC01", ("DC01/History",)), tmp_path / "out", {})
+    assert argv[argv.index("--maps") + 1] == str(tmp_path / "out" / "composed_maps")
+    assert not any(str(tool.executable.parent) in arg for arg in argv[1:])
+
+
+def test_sqlecmd_rules_label_counts_the_apps_maps(tmp_path):
+    """The label counts SQLECmd's maps and the app's, which add up to the maps in the folder a run composes."""
+    from glessner.runner import composed_files
+    from glessner.tools import rules_label
+
+    spec, exe = load_registry()["sqlecmd"], sqlecmd_exe(tmp_path)
+    assert rules_label(spec, exe) == "Maps, 2 maps with 2 Glessner maps"
+    assert sum(name.endswith(".smap") for name in composed_files(spec, exe)) == 4

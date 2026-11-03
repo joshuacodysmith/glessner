@@ -4,12 +4,18 @@ The signatures are the magic-byte constants below. Text logs that the import rea
 they're recognized from their first lines, with the method "content": W3C extended logs
 by their #Fields directive, JSON lines by a first line that is a JSON object, key=value logs by a first line of at
 least three key=value pairs, and CSV by a .csv or .tsv name and a delimited first line.
+
+Disk images and containers are recognized last, after every other check, so that no file another rule identifies is
+taken for one. No tool reads them: the analyst mounts or extracts an image first. The app reads only the MD5 and SHA-1
+that an E01 stores for its disk (stored_hashes).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import zlib
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -64,20 +70,64 @@ HIVE_TYPES = {
 }
 HIVE_LOG_SUFFIXES = (".log", ".log1", ".log2")
 
+DISK_IMAGE = "disk_image"
+# Containers, known by a signature at offset 0. An EWF segment (E01, SMART's s01, and L01) holds its segment number as
+# a 16-bit little-endian value at offset 9. SMART writes E01's signature.
+EWF_MAGICS = {b"EVF\x09\x0d\x0a\xff\x00": "E01", b"LVF\x09\x0d\x0a\xff\x00": "L01"}
+EWF_SEGMENT_OFFSET = 9
+E01_SEGMENT = "E01 segment "   # how an E01's detail starts
+# An EWF segment is a chain of sections after its 13-byte header. Each section starts with a 76-byte descriptor: its type
+# in 16 bytes, the next section's offset in the file in 8, and last an Adler-32 of the 72 bytes before it. An image's last
+# segment holds a digest section, whose data starts with the MD5 and the SHA-1, and a hash section, whose data starts
+# with the MD5. Each section's data has an Adler-32 after the bytes it covers.
+EWF_HEADER_BYTES = 13
+EWF_DESCRIPTOR_BYTES = 76
+EWF_DESCRIPTOR_COVERED = 72
+EWF_HASH_SECTIONS = {b"digest": 76, b"hash": 32}   # by section type, the bytes of its data that its checksum covers
+EWF_LAST_SECTIONS = (b"done", b"next")
+EWF_MAX_SECTIONS = 100_000   # past what a segment of 4 TB holds, so a crafted chain of sections ends
+MD5_BYTES, SHA1_BYTES = 16, 20
+CONTAINER_MAGICS ={b"EVF2\x0d\x0a\x81\x00": "Ex01", b"LEF2\x0d\x0a\x81\x00": "Lx01", b"ADSEGMENTEDFILE": "AD1 logical image",
+                    b"vhdxfile": "VHDX", b"conectix": "VHD, dynamic", b"KDMV": "VMDK sparse extent",
+                    b"# Disk DescriptorFile": "VMDK descriptor", b"QFI\xfb": "QCOW"}
+# The formats that hold files rather than a volume, by the first word of their detail
+LOGICAL_IMAGES = ("AD1", "L01", "Lx01")
+# A fixed VHD has no header: its only signature is the footer in its last 512 bytes.
+VHD_FOOTER_BYTES = 512
+VHD_FOOTER_MAGIC = b"conectix"
+# A raw image needs one of these names and a boot sector: the 0x55AA boot signature at offset 510, or a ReFS volume's
+# boot sector, which has none. A collected $Boot holds a boot sector too, and its name keeps it out.
+RAW_IMAGE_NAMES = (".dd", ".raw", ".img", ".001")
+BOOT_SIGNATURE = b"\x55\xaa"
+BOOT_SIGNATURE_OFFSET = 510
+# A volume boot sector's file system name at offset 3; FAT names its type at offset 54 (FAT12 and FAT16) or 82 (FAT32).
+# ReFS is checked apart, before the boot signature.
+FILE_SYSTEM_OFFSET = 3
+REFS_NAME = b"ReFS\x00\x00\x00\x00"
+FILE_SYSTEM_NAMES = {b"NTFS    ": "NTFS volume", b"EXFAT   ": "exFAT volume"}
+FAT_NAMES = ((54, b"FAT1"), (82, b"FAT32"))
+# A GPT disk's header follows its protective MBR, in the second sector of 512 or of 4,096 bytes.
+GPT_MAGIC = b"EFI PART"
+GPT_OFFSETS = (512, 4096)
+# An MBR's four partition entries each start with a status byte of 0x00 or 0x80 (active).
+MBR_STATUS_OFFSETS = (446, 462, 478, 494)
+
 
 @dataclass(frozen=True)
 class Identification:
     artifact: str | None   # evtx, registry, registry_log, lnk, prefetch, mft, mft_mirror, jumplist,
                            # recycle_bin, srum, event_xml, pcap, usnjrnl, sqlite, sqlite_log, tool_output (detail: the kind in
-                           # tool_outputs.py),
+                           # tool_outputs.py), console_log, disk_image (detail: the image's format),
                            # or a text log in IMPORTABLE; None if unidentified
-    method: str            # "signature", "content" (a text log), "name" (the USN journal), or "unidentified"
-    detail: str = ""       # hive type, prefetch format, the product a text log comes from, or why a file was not
-                           # identified
+    method: str            # "signature", "content" (a text log, event XML, or another tool's output), "name" (known by
+                           # its name alone: the USN journal, a SQLite log, or a console log), or "unidentified"
+    detail: str = ""       # hive type, prefetch format, the product a text log comes from, the tool that wrote a console
+                           # log, or why a file was not identified
 
 
-def identify_bytes(name: str, header: bytes) -> Identification:
-    """Identify an artifact from its filename and first bytes."""
+def identify_bytes(name: str, header: bytes, tail: bytes = b"") -> Identification:
+    """Identify an artifact from its filename and first bytes. `tail` is a .vhd file's last bytes, where a fixed VHD
+    keeps its only signature (identify_file reads them)."""
     lower = name.lower()
     if header.startswith(EVTX_MAGIC):
         return Identification("evtx", "signature")
@@ -129,16 +179,111 @@ def identify_bytes(name: str, header: bytes) -> Identification:
         found = _text_log(lower, text)
         if found:
             return found
-    if CONSOLE_LOG.fullmatch(lower):
-        return Identification(None, "unidentified", CONSOLE_LOG_NOTE)
+    if console_log := CONSOLE_LOG.fullmatch(name):
+        return Identification("console_log", "name", console_log["tool"])
+    if image := _disk_image(lower, header, tail):
+        return Identification(DISK_IMAGE, "signature", image)
     return Identification(None, "unidentified", _name_hint(lower, header[:HEADER_BYTES]))
 
 
 def identify_file(path: Path) -> Identification:
-    """Read a file's first bytes in read-only mode and identify it."""
+    """Read a file's first bytes in read-only mode and identify it. A .vhd file's last bytes are read too, for a fixed
+    VHD's footer."""
+    tail = b""
     with path.open("rb") as f:
         header = f.read(SNIFF_BYTES)
-    return identify_bytes(path.name, header)
+        if path.name.lower().endswith(".vhd"):
+            size = f.seek(0, os.SEEK_END)
+            if size >= VHD_FOOTER_BYTES:
+                f.seek(size - VHD_FOOTER_BYTES)
+                tail = f.read(VHD_FOOTER_BYTES)
+    return identify_bytes(path.name, header, tail)
+
+
+def _disk_image(lower_name: str, header: bytes, tail: bytes) -> str:
+    """The format of a disk image or container, as a detail such as "E01 segment 1"; '' for any other file."""
+    for magic, kind in EWF_MAGICS.items():
+        if header.startswith(magic) and len(header) >= EWF_SEGMENT_OFFSET + 2:
+            segment = int.from_bytes(header[EWF_SEGMENT_OFFSET:EWF_SEGMENT_OFFSET + 2], "little")
+            return f"{kind} segment {segment}"
+    if container := next((kind for magic, kind in CONTAINER_MAGICS.items() if header.startswith(magic)), ""):
+        return container
+    if lower_name.endswith(".vhd") and tail.startswith(VHD_FOOTER_MAGIC):
+        return "VHD, fixed"
+    if lower_name.endswith(RAW_IMAGE_NAMES):
+        return _raw_image(header)
+    return ""
+
+
+def _raw_image(header: bytes) -> str:
+    """What a raw image's first sectors show it to be: a volume by its file system's name, or a GPT or MBR disk; '' when
+    they hold no boot sector."""
+    file_system = header[FILE_SYSTEM_OFFSET:FILE_SYSTEM_OFFSET + 8]
+    if file_system == REFS_NAME:   # a ReFS boot sector has no boot signature
+        return "raw image, ReFS volume"
+    if header[BOOT_SIGNATURE_OFFSET:BOOT_SIGNATURE_OFFSET + 2] != BOOT_SIGNATURE:
+        return ""
+    if file_system in FILE_SYSTEM_NAMES:
+        return f"raw image, {FILE_SYSTEM_NAMES[file_system]}"
+    if any(header[offset:offset + len(name)] == name for offset, name in FAT_NAMES):
+        return "raw image, FAT volume"
+    if any(header[offset:offset + len(GPT_MAGIC)] == GPT_MAGIC for offset in GPT_OFFSETS):
+        return "raw image, GPT disk"
+    if all(header[offset] in (0x00, 0x80) for offset in MBR_STATUS_OFFSETS):
+        return "raw image, MBR disk"
+    return "raw image"
+
+
+def image_note(detail: str) -> str:
+    """What the analyst needs to know about a disk image of this format (its detail) beyond mounting or extracting it;
+    '' for most."""
+    if (kind := detail.split(" ", 1)[0]) in LOGICAL_IMAGES:
+        return f"An {kind} image holds files, not a volume: export its files first."
+    if detail.endswith("ReFS volume"):
+        return "A ReFS volume's extracted files hold no $MFT or $J for the file system tools."
+    return ""
+
+
+def stored_hashes(path: Path) -> tuple[str, str]:
+    """The MD5 and SHA-1 an E01 segment stores for the disk it imaged, in hex, '' for one it doesn't hold, cached by the
+    file's size and time. The imaging tool wrote them, and nothing here checks them against the image's data. Only an
+    image's last segment holds them. A section that fails its checksum gives nothing, and the walk stops at a
+    descriptor that does, and at a next offset that doesn't move forward within the file."""
+    st = path.stat()
+    return _stored_cached(str(path), st.st_size, st.st_mtime_ns)
+
+
+@lru_cache(maxsize=65536)
+def _stored_cached(path: str, size: int, mtime_ns: int) -> tuple[str, str]:
+    md5 = sha1 = ""
+    offset = EWF_HEADER_BYTES
+    with open(path, "rb") as f:
+        for _ in range(EWF_MAX_SECTIONS):
+            f.seek(offset)
+            descriptor = f.read(EWF_DESCRIPTOR_BYTES)
+            if not _checksum_holds(descriptor, EWF_DESCRIPTOR_COVERED):
+                break
+            kind = descriptor[:16].rstrip(b"\x00")
+            covered = EWF_HASH_SECTIONS.get(kind)
+            if covered and _checksum_holds(data := f.read(covered + 4), covered):
+                md5 = md5 or _hex_unless_zero(data[:MD5_BYTES])
+                if kind == b"digest":
+                    sha1 = sha1 or _hex_unless_zero(data[MD5_BYTES:MD5_BYTES + SHA1_BYTES])
+            following = int.from_bytes(descriptor[16:24], "little")
+            if kind in EWF_LAST_SECTIONS or not offset < following < size:
+                break
+            offset = following
+    return md5, sha1
+
+
+def _checksum_holds(data: bytes, covered: int) -> bool:
+    """Whether `data` is whole, and its first `covered` bytes give the Adler-32 written after them."""
+    return len(data) == covered + 4 and zlib.adler32(data[:covered]) == int.from_bytes(data[covered:], "little")
+
+
+def _hex_unless_zero(value: bytes) -> str:
+    """A stored hash in hex; '' for all zeros, which a tool writes for a hash it didn't compute."""
+    return value.hex() if any(value) else ""
 
 
 def text_encoding(head: bytes) -> str:
@@ -235,15 +380,32 @@ def _hive_type(lower_name: str) -> str:
 
 
 # The log each of Eric Zimmerman's tools writes to its output folder from release 2026.10, named
-# <yyyyMMddHHmmss>_<Tool>_<version>_ConsoleLog.txt. SBECmd's parser reads its own to name each CSV's hive.
-CONSOLE_LOG = re.compile(r"\d{14}_\w+?_\d+(?:\.\d+)+_consolelog\.txt")
-CONSOLE_LOG_NOTE = "an Eric Zimmerman tool's console log; no events are loaded from it"
+# <yyyyMMddHHmmss>_<Tool>_<version>_ConsoleLog.txt, known by its name. It holds no events, and no tool reads it, though
+# SBECmd's parser reads its own to name each CSV's hive.
+CONSOLE_LOG = re.compile(r"\d{14}_(?P<tool>\w+?)_\d+(?:\.\d+)+_consolelog\.txt", re.IGNORECASE)
 NAME_HINTS = {".evtx": "evtx", ".pf": "prefetch", ".lnk": "lnk", ".automaticdestinations-ms": "jumplist",
               ".customdestinations-ms": "jumplist"}
 # Names worth reading again when an older intake left them unidentified (intake.current_entries).
 NEWER_SIGNATURE_NAMES = (".automaticdestinations-ms", ".customdestinations-ms", "srudb.dat", ".xml", ".log", ".pcap",
                          ".pcapng", ".cap", "$j", "history", "shortcuts", ".sqlite", ".db", "-wal", "-shm",
                          "-journal")
+# The names of a disk image's first file: an EWF or AD1 image's first segment, a container, or a raw image. A split
+# VMDK's extents have a .vmdk name too (VMDK_EXTENT_NAME).
+IMAGE_NAMES = (".e01", ".ex01", ".l01", ".lx01", ".s01", ".ad1", ".vhd", ".vhdx", ".vmdk", ".qcow", ".qcow2",
+               *RAW_IMAGE_NAMES)
+# The extents of a split VMDK, <name>-s001.vmdk on, which its descriptor, <name>.vmdk, names. The number has at least
+# three digits, so a disk of more than 999 extents goes on at <name>-s1000.vmdk. Each extent starts with a sparse
+# extent's signature, but the descriptor is the image's first file.
+VMDK_EXTENT_NAME = re.compile(r"-s\d{3,}\.vmdk$")
+# The names of any segment: EWF names its segments .E01 to .E99 and then .EAA on, L01 and SMART (.s01) the same way,
+# Ex01 and Lx01 .Ex01 and .Lx01 on, and AD1 .ad1 on. A few other names fit too, such as .exe and .sys, and reading such
+# a file again costs one read of its first bytes.
+SEGMENT_NAME = re.compile(r"\.(?:[el]x?\d\d|s\d\d|[els][a-z]{2}|ad\d+)$")
+
+
+def image_name(lower_name: str) -> bool:
+    """Whether a file's name, in lower case, is one a disk image's file may have."""
+    return lower_name.endswith(IMAGE_NAMES) or SEGMENT_NAME.search(lower_name) is not None
 
 
 def _name_hint(lower_name: str, header: bytes) -> str:

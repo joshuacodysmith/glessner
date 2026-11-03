@@ -11,7 +11,7 @@ from glessner.filters import FilterError, normalize
 from glessner.journal import JOURNAL_FILE, Journal
 from glessner.queries import QueryError
 from glessner.rules import RuleError, parse, parse_time
-from glessner.server import App, api_followup, api_mark, api_rule, api_rules, api_tag, api_tag_suggestion
+from glessner.server import App, api_followup, api_mark, api_rule, api_rules, api_suggestion, api_tag, api_tag_suggestion
 
 
 @pytest.mark.parametrize("mark", [{}, [], ["Malicious"], None, 7, "Nope"], ids=repr)
@@ -217,6 +217,37 @@ def test_an_empty_uid_list_is_refused_as_a_query_error_where_the_route_needs_an_
     assert journal_text(app) == before
 
 
+@pytest.mark.parametrize("decision", ["accept", "reject", "restore"])
+def test_a_source_suggestion_decision_checks_uids_as_the_other_event_routes_do(work, decision):
+    """A string, a number, and a dict are no list of event IDs, and an empty string, a number, null, and a list are no
+    event ID. Each is a QueryError, with a confirm or without, and so is a confirmed request that names no events.
+    An empty list is a QueryError without a confirm, since only a request without uids covers every pending
+    suggestion. With a confirm, an accept or reject of an empty list decides nothing. Nothing is journaled."""
+    app, first, _ = work
+    before = journal_text(app)
+    for uids in ("ab", 5, {"a": 1}, [""], [7], [None], [["x"]], [first, ""]):
+        for confirmed in ({}, {"confirmed": {"count": 1}}):
+            with pytest.raises(QueryError, match=r"uids must be|names the events it covers in uids"):
+                api_suggestion(app, {"source": "hayabusa", "decision": decision, "uids": uids, **confirmed})
+    with pytest.raises(QueryError, match="names the events it covers in uids"):
+        api_suggestion(app, {"source": "hayabusa", "decision": decision, "confirmed": {"count": 1}})
+    with pytest.raises(QueryError, match="uids must name at least one event"):
+        api_suggestion(app, {"source": "hayabusa", "decision": decision, "uids": []})
+    if decision != "restore":   # a restore needs uids, confirmed or not
+        answer = api_suggestion(app, {"source": "hayabusa", "decision": decision, "uids": [], "confirmed": {"count": 0}})
+        assert answer["changed"] == 0
+    assert journal_text(app) == before
+
+
+def test_a_source_suggestion_decision_that_names_an_event_twice_journals_and_counts_it_once(work):
+    """A reject and a restore name their events as targets, each once and in the order first named."""
+    app, first, second = work
+    answer = api_suggestion(app, {"source": "hayabusa", "decision": "reject", "uids": [first, second, first]})
+    assert (last_entry(app)["targets"], answer["changed"]) == ([first, second], 2)
+    answer = api_suggestion(app, {"source": "hayabusa", "decision": "restore", "uids": [second, second]})
+    assert (last_entry(app)["targets"], answer["changed"]) == ([second], 1)
+
+
 def test_uids_that_are_not_all_text_are_refused_with_a_400_on_each_route(running):
     """A list inside `uids` is refused as a 400 and journals nothing on each route that reads `uids`. A step that
     dropped repeats before the string check would fail on the list with a TypeError, which the server answers with a
@@ -224,7 +255,8 @@ def test_uids_that_are_not_all_text_are_refused_with_a_400_on_each_route(running
     app, port, _ = running
     session = login(port, app)
     routes = {"mark": {"value": "suspicious"}, "tag": {"add": ["T1059"]}, "followup": {"done": True},
-              "tag_suggestion": {"tags": ["tactic:TA0008"], "decision": "dismissed"}}
+              "tag_suggestion": {"tags": ["tactic:TA0008"], "decision": "dismissed"},
+              "suggestion": {"source": "hayabusa", "decision": "accept"}}
     entries = lambda: journal_text(app).count("\n")
     before = entries()
     answers = {route: request(port, "POST", f"/api/{route}", session=session, body={"uids": [["x"]], **rest})

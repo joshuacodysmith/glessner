@@ -146,8 +146,9 @@ function refocus(field) {
   if (field.start !== null && node.setSelectionRange) node.setSelectionRange(field.start, field.end);
 }
 
-// What the status line says of edit forms that couldn't open again, as their findings were retired since
-const retiredWords = (n) => (n === 1 ? 'The finding being edited was retired, so its changes are not kept.'
+// What the status line says of edit forms that couldn't open again, as their findings were retired since: after the
+// Findings page's draw, and after a reload that drew it (place.js)
+export const retiredWords = (n) => (n === 1 ? 'The finding being edited was retired, so its changes are not kept.'
   : `${n} findings being edited were retired, so their changes are not kept.`);
 
 // Whether a new finding's form, as a draft gives it, holds anything typed or picked
@@ -231,7 +232,8 @@ function findingCard(f, slot, draft = null, reason = null) {
     const head = el('div', { class: 'finding-head' }, severityChip(f.severity), title, acts);
     const parts = [head];
     if (f.retired) {
-      acts.append(button('Restore', () => change({ op: 'restore', finding: f.id }, `Restored the finding "${f.title}"`)));
+      acts.append(button('Restore', (ev) => changeFrom(ev.currentTarget, { op: 'restore', finding: f.id },
+                                                       `Restored the finding "${f.title}"`)));
       parts.push(el('div', { class: 'finding-line' }, `Retired ${fmtAt(f.retired.at)} by ${f.retired.who}` +
                  (f.retired.reason ? `. Reason: ${f.retired.reason}` : '')));
     } else if (editing) {
@@ -272,7 +274,8 @@ function eventChips(f, editing) {
     const pill = el('span', { class: 'ev-chip', 'data-uid': e.uid }, markBadge(e), open);
     if (!editing) return pill;
     return el('span', { class: 'ev-chip-edit' }, pill,
-      button('Unlink', () => change({ op: 'unlink', finding: f.id, targets: [e.uid] }, `Unlinked 1 event from the finding "${f.title}"`),
+      button('Unlink', (ev) => changeFrom(ev.currentTarget, { op: 'unlink', finding: f.id, targets: [e.uid] },
+                                          `Unlinked 1 event from the finding "${f.title}"`),
              { class: 'quiet small', title: `Unlink ${what} ${e.host} ${when} from this finding` }));
   };
   const first = f.events.slice(0, CHIPS), rest = f.events.slice(CHIPS);
@@ -375,7 +378,8 @@ function retireButton(f, kept = null) {
     const reason = el('input', { type: 'text', 'aria-label': 'Reason', placeholder: 'Reason (optional)', size: '32' });
     reason.value = text;
     const row = el('div', { class: 'actions finding-retire' }, reason,
-      button('Retire the finding', () => change({ op: 'retire', finding: f.id, reason: reason.value }, `Retired the finding "${f.title}"`)),
+      button('Retire the finding', (ev) => changeFrom(ev.currentTarget, { op: 'retire', finding: f.id, reason: reason.value },
+                                                      `Retired the finding "${f.title}"`)),
       button('Cancel', () => { row.replaceWith(retire); retire.focus(); }));
     return { row, reason };
   };
@@ -409,6 +413,19 @@ async function change(body, said, page = PAGE, form = null) {
   } finally {
     if (form) saving.delete(form);
   }
+}
+
+// change() from a button that is disabled from the click until the write answers, so a second click can't send it
+// again. A write that went through leaves the button disabled, for the page's redraw after it to replace; a refused
+// one enables it for another try, as a finding form's Save is.
+async function changeFrom(clicked, body, said, page = PAGE) {
+  clicked.disabled = true;
+  const res = await change(body, said, page);
+  if (!res) {
+    clicked.disabled = false;
+    clicked.focus();
+  }
+  return res;
 }
 
 // A form a redraw left out while its write was out, whose write then failed: its words go to the page's next draw, at
@@ -530,6 +547,7 @@ export function findingRow(ev, uids) {
                          el('option', { value: 'new' }, 'New finding…'));
   };
   const add = button(`Add ${targetWords(uids)}`, async () => {
+    if (!n) { setStatus('Tick the events to add first.'); return; }
     if (!pick.value) { setStatus('Choose the finding to add to, or New finding.'); return; }
     if (pick.value === 'new') { showFindings({ newFrom: uids }); return; }
     const f = (titles || []).find((x) => String(x.id) === pick.value);
@@ -539,8 +557,8 @@ export function findingRow(ev, uids) {
                                 effect: `All ${n.toLocaleString()} are linked to the finding. Their marks and tags don't change.` })) return;
       consent.confirmed = { count: n };
     }
-    await change({ op: 'link', finding: Number(pick.value), targets: uids, ...consent },
-                 `Linked ${plural(n, 'event')} to the finding "${f?.title || ''}"`, `event:${S.focus}`);
+    await changeFrom(add, { op: 'link', finding: Number(pick.value), targets: uids, ...consent },
+                     `Linked ${plural(n, 'event')} to the finding "${f?.title || ''}"`, `event:${S.focus}`);
   }, { title: 'Link the event to the finding it supports. The finding stays yours to word.' });
   const picker = el('div', { class: 'verdict-row small finding-add', hidden: '' }, el('span', { class: 'muted' }, 'Finding:'), pick, add);
   const plus = button('+ Finding', () => {

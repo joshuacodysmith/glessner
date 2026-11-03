@@ -19,7 +19,7 @@ from test_tool_outputs import EVTX_COLUMNS, evtx_rows, write_rows
 
 from glessner import runner
 from glessner.case import create_case
-from glessner.events import _extended_forms, connect
+from glessner.events import AmbiguousRoot, _extended_forms, connect, names_by_root
 from glessner.intake import add_new, intake, read_manifest, verify
 from glessner.runner import (
     RunRecord,
@@ -525,13 +525,11 @@ ROW = "//?/D:/ev/logs/eve.json"
     (["logs/eve.json"], ["logs/eve.json"], [ROW]),
     (["LOGS/EVE.json"], ["logs/eve.json"], [ROW]),
     (["eve.json"], ["eve.json"], [ROW]),
-    (["eve.json", "logs/eve.json"], ["eve.json"], []),
-    (["eve.json", "logs/eve.json"], ["logs/eve.json"], [ROW]),
 ])
-def test_a_row_names_the_longest_file_its_run_read_that_its_path_ends_in(inputs, read, replaced):
+def test_a_row_names_the_file_its_run_read_that_its_path_ends_in(inputs, read, replaced):
     """A run's one row, `//?/D:/ev/logs/eve.json`, is the root `//?/D:/ev` and `logs/eve.json` or the root
-    `//?/D:/ev/logs` and `eve.json`, which only the files the run read tell apart: it names the longest of them its path
-    ends in. A load that reads `eve.json` leaves the row of a run that read `logs/eve.json`."""
+    `//?/D:/ev/logs` and `eve.json`, which the files the run read tell apart when it read only one of them. A load that
+    reads `eve.json` leaves the row of a run that read `logs/eve.json`."""
     con = extended_rows(("r1", ROW))
     assert sorted(_extended_forms(con, "suricata", "SENSOR", {"r1": inputs}, read)) == replaced
 
@@ -575,13 +573,19 @@ def test_the_root_the_evidence_is_at_decides_between_roots_that_explain_the_same
     assert sorted(_extended_forms(con, "suricata", "SENSOR", {"r1": inputs}, read, "//?/D:/ev")) == replaced
 
 
-def test_a_root_the_evidence_is_not_at_leaves_the_shortest_of_the_roots_that_explain_the_most_rows():
-    """With the evidence somewhere else now, the rows alone can't tell `//?/D:/ev` from its parent, so the shortest root
-    is taken, as it is with no root given."""
-    con = extended_rows(("r1", "//?/D:/ev/eve.json"))
-    inputs = {"r1": ["eve.json", "ev/eve.json"]}
-    assert _extended_forms(con, "suricata", "SENSOR", inputs, ["ev/eve.json"], "//?/E:/other") == {"//?/D:/ev/eve.json"}
-    assert _extended_forms(con, "suricata", "SENSOR", inputs, ["eve.json"], "//?/E:/other") == set()
+@pytest.mark.parametrize("root", ["//?/E:/other", ""])
+@pytest.mark.parametrize(("row", "inputs"), [
+    ("//?/D:/ev/eve.json", ["eve.json", "ev/eve.json"]),
+    (ROW, ["eve.json", "logs/eve.json"]),
+])
+def test_rows_that_fit_two_roots_the_evidence_is_not_at_are_left(row, inputs, root):
+    """With the evidence somewhere else now, or no root given, the rows alone can't tell `//?/D:/ev` from the folder
+    above or below it, so no root is guessed: a load of either file leaves the row, and names_by_root says why."""
+    con = extended_rows(("r1", row))
+    for read in inputs:
+        assert _extended_forms(con, "suricata", "SENSOR", {"r1": inputs}, [read], root) == set()
+    with pytest.raises(AmbiguousRoot):
+        names_by_root([row], inputs, root)
 
 
 def test_a_row_that_ends_in_a_file_s_characters_without_a_slash_before_them_is_not_that_file_s():
@@ -634,6 +638,28 @@ def test_a_load_replaces_the_rows_of_the_file_the_evidence_folder_s_name_makes_a
     second = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["eve.json"])
     assert (second.status, second.loaded_rows, second.replaced_rows) == ("ok", first.loaded_rows, first.loaded_rows)
     assert {(run, source): n for run, source, n in sources_by_run(case)} == {(second.run_id, "eve.json"): first.loaded_rows}
+
+
+def test_a_load_after_the_evidence_moved_leaves_rows_its_folder_s_name_makes_ambiguous(tmp_path, monkeypatch):
+    """As above, but the evidence moved to another folder between the two loads, so its path no longer says which root
+    the stored name `.../moved/eve.json` has. A load of `moved/eve.json` replaces none of the first run's rows, which may
+    be those of `eve.json`, a file it didn't read; a load of both files again replaces them whole."""
+    (tmp_path / "evidence" / "moved").mkdir(parents=True)
+    (tmp_path / "evidence" / "moved" / "eve.json").write_text("", encoding="utf-8")
+    case = linked_evidence_case(tmp_path, files=("eve.json",), single_host="SENSOR")
+    with loaded_under_the_written_root(monkeypatch):
+        first = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["eve.json", "moved/eve.json"])
+        assert first.status == "ok" and first.loaded_rows
+    stored = sources_by_run(case)
+    (tmp_path / "evidence").rmdir()   # the junction, not the folder it leads to
+    (tmp_path / "moved").rename(tmp_path / "elsewhere")
+    junction(tmp_path / "evidence", tmp_path / "elsewhere")
+    deeper = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["moved/eve.json"])
+    assert (deeper.status, deeper.loaded_rows, deeper.replaced_rows) == ("ok", 0, 0)
+    assert sources_by_run(case) == stored
+    both = load_found_output(case, "suricata", "suricata_eve", "SENSOR", ["eve.json", "moved/eve.json"])
+    assert (both.status, both.replaced_rows) == ("ok", first.loaded_rows)
+    assert {(run, source): n for run, source, n in sources_by_run(case)} == {(both.run_id, "eve.json"): first.loaded_rows}
 
 
 def test_add_new_evidence_after_a_linked_load_ends_with_a_row_per_record(tmp_path, monkeypatch):

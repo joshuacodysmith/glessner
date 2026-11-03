@@ -1,16 +1,16 @@
 import { HISTORY_LIMIT, loadHistory, retractNote } from './audit.js';
 import { clockFolds, clockHover, clockNote, setPairLink } from './clock.js';
 import { askSelection, CONFIRM_ABOVE, markWord } from './confirm.js';
-import { $, api, codePrefix, el, fmtAt, fmtUs, LISTED_EVENTS, MARK_VALUE, markBadge, marked, MARKS, plural, post, reportAction, S, setStatus } from './core.js';
+import { $, api, codePrefix, el, fmtAt, fmtUs, LISTED_EVENTS, lookup, MARK_VALUE, markBadge, marked, MARKS, plural, post, reportAction, S, setStatus } from './core.js';
 import { refreshCounts } from './counts.js';
 import { fetchView } from './data.js';
 import { draw } from './draw.js';
 import { caveatBox, findingRow } from './findings.js';
 import { followPage } from './frame.js';
 import { reloadLanes } from './lanes.js';
-import { addNote, pivot, renderRelated } from './pages.js';
+import { addNote, listFind, pivot, renderRelated } from './pages.js';
 import { pivotPanel, saveWindow } from './pivots.js';
-import { reviewBar } from './review.js';
+import { groupReviewOf, reviewBar } from './review.js';
 import { addToSearch, runSearch } from './search.js';
 import { tagZone } from './tags.js';
 import { eventLabel, eventShort, trailBar, trailEvent, trailPivot, trailText } from './trail.js';
@@ -27,13 +27,16 @@ export const LOGON_TYPES = { 2: 'Interactive', 3: 'Network', 4: 'Batch', 5: 'Ser
 export const ARTIFACT_DETAILS = {
   evtx: ['Event data', null],
   hayabusa: ['Hayabusa details', ['Details', 'MitreTactics', 'MitreTags', 'OtherTags', 'RuleFile']],
-  mft: ['MFT entry', ['FileSize', 'InUse', 'IsDirectory', 'SI<FN', 'uSecZeros', 'Copied', 'HasAds', 'IsAds', 'ZoneIdContents',
-                     'ReparseTarget', 'EntryNumber', 'SequenceNumber', 'ParentEntryNumber']],
+  mft: ['MFT entry', ['FileSize', 'InUse', 'IsDirectory', 'SI<FN', 'FnEqualsSi', 'uSecZeros', 'Copied', 'HasAds', 'IsAds',
+                     'ZoneIdContents', 'ReparseTarget', 'EntryNumber', 'SequenceNumber', 'ParentEntryNumber']],
   prefetch: ['Prefetch', ['RunCount', 'Hash', 'Size', 'Version', 'FilesLoadedCount', 'Volume0Name', 'Volume0Serial', 'Note',
                           'ParsingError']],
   lnk: ['Shortcut (LNK)', ['LocalPath', 'NetworkPath', 'CommonPath', 'Arguments', 'WorkingDirectory', 'RelativePath', 'FileSize',
                            'DriveType', 'VolumeLabel', 'VolumeSerialNumber', 'MachineID', 'MachineMACAddress', 'MACVendor']],
-  registry: ['Registry value', ['HiveType', 'Category', 'ValueType', 'ValueData', 'ValueData2', 'ValueData3', 'Comment', 'Deleted']],
+  // The MountedDevices decode's fields follow the ValueData2 they are read from
+  registry: ['Registry value', ['HiveType', 'Category', 'ValueType', 'ValueData', 'ValueData2', 'DataFormat', 'DiskSignature',
+                                'PartitionOffset', 'PartitionSector', 'PartitionGuid', 'DeviceBus', 'DeviceVendorProduct',
+                                'DeviceInstance', 'DeviceClassGuid', 'ValueData3', 'Comment', 'Deleted']],
   shellbags: ['ShellBag', ['AbsolutePath', 'ShellType', 'Value', 'FirstInteracted', 'LastInteracted', 'LastWriteTime',
                            'CreatedOn', 'ModifiedOn', 'AccessedOn', 'HasExplored', 'MFTEntry', 'MFTSequenceNumber', 'Profile',
                            'Hive', 'BagPath', 'Slot', 'Miscellaneous']],
@@ -66,10 +69,6 @@ export const NOT_RAW = new Set(['extra', 'hits', 'mark', 'notes', 'suggestions',
                                 'pair', 'clock', 'tags', 'tag_suggestions', 'split', 'provenance', 'pivots', 'id_changed',
                                 'id_also_named', 'unplaced', 'followup', 'rejection_notes',
                                 'account_key', 'hashes', 'caveat', 'findings', 'host_clock']);
-
-// A table's entry for a key read from the evidence or the server, which may name a property every object has, such as
-// constructor; undefined when the table doesn't hold the key itself.
-const lookup = (table, key) => (table && Object.hasOwn(table, key) ? table[key] : undefined);
 
 // Counts the pages asked of the Details panel, so only the latest draws. A page that draws when its request answers,
 // such as an Event page, a search, or To investigate, claims the panel when asked; claimDetails returns a check that no
@@ -190,22 +189,34 @@ function settlePage(key, whole = true) {
 
 // Show one page in the Details panel. The panel is a band over one scroller, #detailsBody: the page goes
 // into the body, and the band names the page, with Back and the trail. The scroll position resets only when the page or
-// event changes. A page that says how to reopen itself joins the Back history when another page replaces it.
-// A page redrawn, as after a tick, keeps the claim its own request holds.
-export function setPage(name, nodes, { key = name, title = '', reopen = null } = {}) {
+// event changes. A page that says how to reopen itself joins the Back history when another page replaces it, except a
+// page of the same `group`, such as another event of one selection list: the pages of a group take one place in the
+// history, the last one shown. A redraw on the page's own key joins it too when it `leaves` the page behind, as a new
+// selection leaves the page of a selection list's event; `leaves` is then that page's title in Back. A page redrawn, as
+// after a tick, keeps the claim its own request holds.
+export function setPage(name, nodes, { key = name, title = '', reopen = null, group = null, leaves = null } = {}) {
   const panel = $('details'), body = $('detailsBody');
   const same = panel.dataset.key === key;
   if (!same) claimDetails();
   if (!same) S.finds = { key, lists: new Map() };   // a new page's lists start with no find
+  // A new page's groups start as it draws them; the Suggestions page notes its groups under its key as it builds them
+  if (S.folds.key !== key) S.folds = { key, open: new Map() };
+  if (S.decided.key !== key) S.decided = { key, rows: new Map() };   // and with no rows decided
+  if (S.ticks.key !== key) S.ticks = { key, groupBy: null, groups: new Map() };   // or ticked
   const top = body.scrollTop;
   const places = same ? [...body.querySelectorAll('[data-scroll]')].map((n) => [n.dataset.scroll, n.scrollTop]) : [];
-  if (!same && S.page && !S.goingBack) {
-    S.back.push(S.page);
+  let left = null;   // the page on screen, as it joins Back
+  if (S.page && !S.goingBack) {
+    if (!same && !(group && S.page.group === group)) left = S.page;
+    else if (same && leaves) left = { ...S.page, title: leaves };
+  }
+  if (left) {
+    S.back.push(left);
     if (S.back.length > 20) S.back.shift();
   }
   S.goingBack = false;
   if (name !== 'event' && name !== 'search') S.highlight = null;   // search terms stay highlighted on its events only
-  S.page = reopen ? { key, title, reopen } : null;
+  S.page = reopen ? { key, title, reopen, group } : null;
   bandTitle = title;
   panel.dataset.page = name;
   panel.dataset.key = key;
@@ -432,8 +443,9 @@ export const artifactName = (id) => lookup(S.meta?.artifact_names, id) || id;
 // An event's pending suggestions as the lists rank them: Malicious, then Suspicious, then Authorized, with ties by source
 // name.
 const SUGGESTION_RANK = { malicious: 0, suspicious: 1, authorized: 2 };
+const suggestionRank = (value) => lookup(SUGGESTION_RANK, value) ?? 3;
 function pendingSuggestions(ev) {
-  const rank = (x) => lookup(SUGGESTION_RANK, x.value) ?? 3;
+  const rank = (x) => suggestionRank(x.value);
   return ev.suggestions.filter((x) => !x.rejected)
     .sort((a, b) => rank(a) - rank(b) || (a.source < b.source ? -1 : a.source > b.source ? 1 : 0));
 }
@@ -495,38 +507,137 @@ export function hitChips(hits) {
   return { lead: [...lead, more], rest };
 }
 
-// The events a group mark would change, with their current marks, so a group mark can't replace a Malicious mark the
-// zone never showed. `chosen` is /api/selected's answer.
-export function selectionList(chosen, n) {
-  if (chosen.error) return el('p', { class: 'muted' }, `Could not list the selected events: ${chosen.error}`);
-  const rows = chosen.events.map((e) => el('li', {}, markBadge(e),
-    el('span', { class: 'sel-text', title: e.msg }, `${fmtUs(e.ts)}  ${e.host}  ${codePrefix(e)}${e.msg}`)));
-  return el('div', {}, el('ul', { class: 'selection-list', 'data-scroll': 'selection' }, ...rows),
-    ...(n > chosen.events.length ? [el('p', { class: 'muted' }, `Listing the first ${chosen.events.length} of ${n}.`)] : []));
+// The rows the selection list shows at once, as app.css sizes it; it scrolls for the rest
+const LIST_ROWS = 8;
+// A host name up to this long stays whole in the header; a longer one gives up room for the start of the kind
+const LONG_HOST_CHARS = 12;
+
+// The Event page's selection list: the events it lists, kept with the Set in S.selected it was made from (`of`), whose
+// events are its ticked rows. A tick or Select all adds to that Set and an untick takes from it, and the row stays
+// listed; a shift-click on the timeline adds an event to the list or takes it out. A new Set in S.selected, as a plain
+// click or a page that opens one event makes, starts a new list from it. `find`, `scroll`, and `note` keep the list's
+// find text, its place, and the verdict zone's note through the events its rows open, and `at` is the event the page
+// showed when the list last drew.
+export function selectionListing() {
+  if (S.listed?.of !== S.selected) S.listed = newListing(S.selected);
+  for (const uid of S.selected) S.listed.uids.add(uid);
+  return S.listed;
+}
+
+// A selection list of `uids`, whose ticked rows are the events of `of`, a Set in S.selected
+export const newListing = (of, uids = []) => ({ of, uids: new Set(uids), find: '', scroll: 0, note: '', at: null });
+
+// Take an event out of the selection and out of its list, as a shift-click on the timeline does
+export function deselect(uid) {
+  S.selected.delete(uid);
+  if (S.listed?.of === S.selected) S.listed.uids.delete(uid);
+}
+
+// A row's click opens its event on the page, and the list stays as it was: its ticks, its find, its place, and the
+// timeline's window
+function openListed(e) {
+  if (S.focus === e.uid) return;
+  S.focus = e.uid;
+  S.windowLinks = [];
+  draw();
+  loadDetails(e.uid, e.ts);
+}
+
+// The events a mark of the ticked rows would change, with their current marks, so a group mark can't replace a Malicious
+// mark the zone never showed: a caption with the count, Select all, and a find box, then a row for each listed event
+// with its tick, its badge, and its text, in time order. The row of the event on the page is highlighted. A tick selects
+// its event on the timeline and draws the page again; a click elsewhere on a row opens its event. `chosen` is
+// /api/selected's answer for the listed events.
+function selectionList(chosen, listing) {
+  if (chosen.error) return [el('p', { class: 'muted' }, `Could not list the selected events: ${chosen.error}`)];
+  const total = listing.uids.size;
+  const redraw = () => { draw(); if (S.focus) loadDetails(S.focus); };
+  const rows = chosen.events.map((e) => {
+    const box = el('input', { type: 'checkbox', 'aria-label': 'Tick to mark',
+                              title: 'A tick selects the event on the timeline, and the marks above act on the selected events' });
+    box.checked = S.selected.has(e.uid);
+    box.addEventListener('change', () => { if (box.checked) S.selected.add(e.uid); else S.selected.delete(e.uid); redraw(); });
+    const onPage = e.uid === S.focus;
+    return el('li', { 'data-uid': e.uid, ...(onPage ? { class: 'on-page', 'aria-current': 'true' } : {}),
+                      onclick: (ev) => { if (ev.target !== box) openListed(e); } },
+              box, markBadge(e), el('span', { class: 'sel-text', title: e.msg }, `${fmtUs(e.ts)}  ${e.host}  ${codePrefix(e)}${e.msg}`));
+  });
+  const list = el('ul', { class: 'selection-list', 'aria-label': 'Listed events' }, ...rows);
+  list.addEventListener('scroll', () => { listing.scroll = list.scrollTop; });
+  const caption = el('strong', {}, S.selected.size === total ? `The ${plural(total, 'selected event')}, in time order`
+                                                             : `The ${plural(total, 'listed event')}, in time order`);
+  const inView = el('span', { class: 'muted sel-in-view' });
+  const hiddenTicks = el('span', { class: 'find-ticks', hidden: '' });
+  let shown = null;   // the uids of the rows the find shows, or null with no find
+  // One button, as on the other ticked lists: Select all, or Select none once every row is ticked; with a find on, it
+  // ticks the shown rows, or unticks them once every shown row is ticked
+  const all = [...listing.uids].every((uid) => S.selected.has(uid));
+  const everyShownTicked = () => shown.size > 0 && [...shown].every((uid) => S.selected.has(uid));
+  const selectLabel = () => {
+    if (!shown) return all ? 'Select none' : 'Select all';
+    return `${everyShownTicked() ? 'Unselect' : 'Select'} the ${shown.size.toLocaleString()} shown`;
+  };
+  const selectAll = button('Select all', () => {
+    if (shown) {
+      const every = everyShownTicked();
+      for (const uid of shown) { if (every) S.selected.delete(uid); else S.selected.add(uid); }
+    } else if (all) S.selected.clear();
+    else for (const uid of listing.uids) S.selected.add(uid);
+    redraw();
+  }, { class: 'linklike' });
+  const listed = new Set(chosen.events.map((e) => e.uid));
+  const cut = total > chosen.events.length;
+  const find = listFind(list, { kept: listing, rows: 'li', cells: '.sel-text', highlight: '.sel-text',
+                                covers: 'The selection and the marks still cover', listed: cut ? chosen.events.length : null,
+                                total, more: 'events', onApply: (set) => {
+    shown = set;
+    const n = set ? set.size : rows.length;
+    selectAll.textContent = selectLabel();
+    inView.hidden = n <= LIST_ROWS;
+    inView.textContent = `${LIST_ROWS} of ${n.toLocaleString()} in view; scroll for the rest`;
+    const here = set || listed;
+    const elsewhere = [...S.selected].filter((uid) => !here.has(uid)).length;
+    hiddenTicks.hidden = !elsewhere;
+    hiddenTicks.textContent = elsewhere ? `${plural(elsewhere, 'selected event')} ${elsewhere === 1 ? "isn't" : "aren't"} shown here` : '';
+  } });
+  find.box.append(hiddenTicks);
+  const head = el('div', { class: 'sel-caption' }, caption, inView, selectAll, find.box);
+  return [head, ...(cut ? [find.foot, list, el('p', { class: 'muted' }, `Listing the first ${chosen.events.length} of ${total}.`)]
+                        : [list, find.foot])];
 }
 
 // The header's right zone, as the header's grid takes it: the first row is the verdict, then the pill and
 // either who set the mark or the one decision a pending suggestion needs; the second row is the other marks, a note
 // box, + Tag, and the toggle for Hayabusa's suggested tags. What does not fit in two rows goes to `more`, the header's
 // third row: a second pending source, the mark's note, the event's tags and open suggestions, rejected suggestions, the
-// read-only hint, and, with several events selected, their list with their marks (`chosen`) above the buttons that mark
-// them all.
+// read-only hint, and, with several events listed, their list with their marks and ticks (`chosen`, for `listing`), under
+// the buttons that mark the `n` selected, the ticked ones.
 // The verdict as a pill: the word alone. The identity line's badge stands for the state, so the pill carries none.
 const pill = (label) => el('span', { class: `status ${label.toLowerCase()}` }, label);
 
-export function verdictZone(ev, uid, n, chosen = null) {
-  const several = n > 1;
+export function verdictZone(ev, uid, n, chosen = null, listing = null) {
+  const several = chosen !== null;
+  const total = several ? listing.uids.size : n;
   const label = ev.mark.label;
   // The placeholder is the box's only label and the box is 120 px, so it is short; the long wording is in the title.
-  const noteFor = several ? `Note for marking ${n} events (optional)` : 'Note for this mark (optional)';
+  const noteFor = several ? `Note for marking ${plural(n, 'event')} (optional)` : 'Note for this mark (optional)';
   const note = el('input', { type: 'text', class: 'mark-note', placeholder: 'Note (optional)', title: noteFor,
                              'aria-label': noteFor });
+  if (several) {
+    // The note stays with the list, as its find does, through a tick's redraw and the events its rows open
+    note.value = listing.note;
+    note.addEventListener('input', () => { listing.note = note.value; });
+  }
   // A mark of a selection above CONFIRM_ABOVE events asks first; the question goes under the selection's list
   const slot = el('div', { class: 'confirm-slot' });
-  const markButton = (m, extra = '') => button(several ? `${m} (${n})` : m, () => applyMark(m, note.value, [...S.selected], { host: slot }),
-                                               { class: `mark-${m.toLowerCase()} ${extra}`.trim() });
-  const heading = el('h3', {}, several ? `Verdict for ${n} selected events` : 'Verdict');
-  const tags = tagZone(ev, uid, n);   // ATT&CK tactics and techniques, and the analyst's own tags
+  const markButton = (m, extra = '') => button(several ? `${m} (${n})` : m, async () => {
+    if (several && !n) { setStatus('Tick the events to mark first.'); return; }
+    // The note stays for another try until a mark is written
+    if (await applyMark(m, note.value, [...S.selected], { host: slot }) && several) listing.note = '';
+  }, { class: `mark-${m.toLowerCase()} ${extra}`.trim() });
+  const heading = el('h3', {}, !several ? 'Verdict' : n === total ? `Verdict for ${n.toLocaleString()} selected events`
+    : `Verdict for ${n.toLocaleString()} selected of ${total.toLocaleString()} listed events`);
+  const tags = tagZone(ev, uid, n, several);   // ATT&CK tactics and techniques, and the analyst's own tags
   const more = [...readOnlyHint()];
   const pending = pendingSuggestions(ev);
   const decision = (x) => el('div', { class: `decision ${x.value}` },
@@ -539,7 +650,7 @@ export function verdictZone(ev, uid, n, chosen = null) {
   if (several) {
     line = [heading];
     marks = [...MARKS.map((m) => markButton(m)), note];
-    more.push(selectionList(chosen, n), slot);
+    more.push(...selectionList(chosen, listing), slot);
   } else if (label === 'Unreviewed') {
     const [first, ...rest] = pending.map(decision);   // the first source sits by the identity, the others below it
     line = [heading, pill('Unreviewed'),
@@ -608,9 +719,9 @@ export function eventUrl(uid, ts = null) {
   return `/api/event?uid=${encodeURIComponent(uid)}` + (at == null ? '' : `&ts=${at}`);
 }
 
-// The selected events and their marks, for the verdict zone's list; an error's message in place of them.
-async function selectedEvents() {
-  const uids = [...S.selected].slice(0, LISTED_EVENTS);
+// The listed events and their marks, for the verdict zone's list; an error's message in place of them.
+async function listedEvents(listing) {
+  const uids = [...listing.uids].slice(0, LISTED_EVENTS);
   try { return await api(`/api/selected?${uids.map((u) => `uid=${encodeURIComponent(u)}`).join('&')}`); }
   catch (err) { return { error: err.message, events: [] }; }
 }
@@ -629,14 +740,19 @@ export async function fillFocusEvent(uid) {
   if (S.focus === uid) S.focusEvent = focusEventOf(uid, ev);
 }
 
+// The text typed in the Event page's Notes box and its event, so a redraw of that event's page, as a tick in the
+// selection list makes, keeps it until the note is added; another event's page starts empty
+let typedNote = { uid: null, text: '' };
+
 export async function loadDetails(uid, ts = null) {
   const latest = claimDetails();
   const drew = pageRead();
   const via = S.trailVia;   // set by a click on a pivot's list, or by Back: how the event opened relates to the trail
   S.trailVia = false;
-  const n = S.selected.size;
+  const listing = selectionListing();
+  const several = listing.uids.size > 1;
   let ev, chosen;
-  try { [ev, chosen] = await Promise.all([readEvent(uid, ts), n > 1 ? selectedEvents() : null]); }
+  try { [ev, chosen] = await Promise.all([readEvent(uid, ts), several ? listedEvents(listing) : null]); }
   catch (err) {
     if (latest()) setPage('event', [el('p', { class: 'pad' }, `Could not load the event: ${err.message}`)]);
     return;
@@ -645,7 +761,7 @@ export async function loadDetails(uid, ts = null) {
   if (ev.id_changed && ev.event_uid !== uid) {
     // An earlier ID a case format upgrade changed: the page goes on as the event's own, so a mark or a
     // note made here names the event's current ID
-    S.selected.delete(uid);
+    deselect(uid);
     S.selected.add(ev.event_uid);
     S.focus = uid = ev.event_uid;
     draw();
@@ -678,17 +794,17 @@ export async function loadDetails(uid, ts = null) {
                                                     `time on ${ev.host}, this one too, though ${ev.host}'s clock didn't write it.` },
          `Host offset ${offsetText}`);
   // The identity line starts with the badge, whose hover says who marked the event and when
-  const ident = el('div', { class: 'ev-ident' }, eventBadge(ev),
+  const ident = el('div', { class: ev.host.length > LONG_HOST_CHARS ? 'ev-ident long-host' : 'ev-ident' }, eventBadge(ev),
     el('span', { class: 'time', ...(timeTitle ? { title: timeTitle } : {}), ...(offsetS ? {} : holds) },
        ev.adjusted_ts_us == null ? 'No time' : `${fmtUs(ev.adjusted_ts_us)} UTC`),
-    el('span', { class: 'host' }, ev.host),
+    el('span', { class: 'host', title: ev.host }, ev.host),
     el('span', { class: 'kind', title: kind }, kind));
   const hits = hitChips(ev.hits);
   const summary = eventSummary(ev).join(' · ');
   // The clock chip is the summary row's first item, under the time it explains, so it takes no room from the kind
   const sum = el('div', { class: 'ev-sum' }, ...(chip ? [chip] : []), ...hits.lead,
                  ...(summary ? [el('span', { class: 'ev-summary', title: summary }, summary)] : []));
-  const verdict = verdictZone(ev, uid, n, chosen);
+  const verdict = verdictZone(ev, uid, S.selected.size, chosen, listing);
   const headMore = [
     // Moved by a split by recorded computer: the host folder it came from, and the split's journal entry
     ...(ev.split ? [el('div', { class: 'muted split-from' },
@@ -705,8 +821,13 @@ export async function loadDetails(uid, ts = null) {
   // An account known only by its SID, named from the host's 4624s and 4672s, says so beneath it:
   // the name was looked up, not recorded in this event.
   const lookedUp = extra && typeof extra.AccountLookedUp === 'string' ? extra.AccountLookedUp : '';
+  if (typedNote.uid !== uid) typedNote = { uid, text: '' };
+  const typed = typedNote;
   const noteInput = el('input', { type: 'text', placeholder: 'Add a note to this event', size: '28' });
-  noteInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addNote(uid, noteInput.value); });
+  noteInput.value = typed.text;
+  noteInput.addEventListener('input', () => { typed.text = noteInput.value; });
+  const saveNote = async () => { if (await addNote(uid, noteInput.value)) typed.text = ''; };
+  noteInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') saveNote(); });
   // A retracted note stays, struck through; the others can be retracted.
   const notes = (ev.notes || []).length
     ? el('ul', { class: 'notes' }, ...ev.notes.map((x) => el('li', { class: x.retracted ? 'gone' : '' },
@@ -759,7 +880,7 @@ export async function loadDetails(uid, ts = null) {
     rawFields(ev, extra),
     el('h3', {}, 'Notes'),
     notes,
-    el('div', { class: 'actions' }, noteInput, button('Add note', () => addNote(uid, noteInput.value))),
+    el('div', { class: 'actions' }, noteInput, button('Add note', saveNote)),
     historyFold,   // every journal entry for this event
   ].filter(Boolean);
 
@@ -780,6 +901,11 @@ export async function loadDetails(uid, ts = null) {
 
   const when = ev.adjusted_ts_us == null ? '' : ` at ${fmtUs(ev.adjusted_ts_us).slice(11, 19)}`;
   const bar = reviewBar(ev, uid);   // Review one by one: where the analyst is in the queue, and its decisions
+  // A new selection drawn on the page of a list's event, as a plain click on that event makes, leaves the list behind. The
+  // list's page joins Back, named by the list, while the list still holds that event and another, as its reopen needs.
+  const prior = S.page?.group;
+  const leaves = prior?.uids && prior !== listing && prior.uids.size > 1 && prior.uids.has(uid)
+    ? `the ${plural(prior.uids.size, 'listed event')}` : null;
   setPage('event', [
     ...(bar ? [bar] : []),
     el('div', { class: `ev-head ${ev.mark.label.toLowerCase()}` }, ident, sum, verdict.zone,
@@ -787,8 +913,26 @@ export async function loadDetails(uid, ts = null) {
     provenanceLine(ev),
     el('div', { class: 'ev-body' }, el('div', { class: 'ev-facts', 'data-scroll': 'facts' }, ...facts),
        el('div', { class: 'ev-work', 'data-scroll': 'work' }, ...work)),
-  ], { key: `event:${uid}`, title: `the ${ev.host} event${when}`,
-       reopen: () => { S.selected = new Set([uid]); S.focus = uid; S.windowLinks = []; draw(); loadDetails(uid); } });
+  ], { key: `event:${uid}`, title: `the ${ev.host} event${when}`, group: several ? listing : groupReviewOf(uid), leaves,
+       // Back to an event of a selection list brings the list back, with its ticks as they were left, while the list still
+       // holds that event and another; otherwise the event is selected alone
+       reopen: () => {
+         if (several && listing.uids.size > 1 && listing.uids.has(uid)) { S.selected = listing.of; S.listed = listing; }
+         else S.selected = new Set([uid]);
+         S.focus = uid; S.windowLinks = []; draw(); loadDetails(uid);
+       } });
+  if (several) {
+    // The list keeps its place, and comes to the row of the event on the page when the page has moved to another event,
+    // unless the find hides that row
+    const list = $('detailsBody').querySelector('.selection-list');
+    const row = list?.querySelector('li.on-page:not(.find-out)');
+    if (list) list.scrollTop = listing.scroll;
+    if (row && listing.at !== uid) {
+      const r = row.getBoundingClientRect(), box = list.getBoundingClientRect();
+      if (r.top < box.top || r.bottom > box.bottom) list.scrollTop += r.top - box.top;
+    }
+    listing.at = uid;
+  }
   renderRelated();
   drew(`event:${uid}`, () => loadDetails(uid, ts));
 }
@@ -859,14 +1003,15 @@ export const focusedPageAction = () => (S.focus ? pageAction(`event:${S.focus}`)
 
 // The timeline and counts follow a write the server has answered: the lanes, the window's data, and the counts. The write
 // is done once its answer arrives, so a reload that fails doesn't fail it, and lanes that don't reload don't keep the
-// window's data and the counts from following. Returns the lanes error's message, or '' when the lanes reloaded. A window
-// whose data fails to load says so on the status line itself (data.loadView), which the write's line then replaces.
+// window's data and the counts from following. Returns the message of the lanes' failure, else of the window's data's, or
+// '' when both reloaded. A window whose data fails to load also says so on the status line (data.loadView), which the
+// write's line then replaces.
 export async function reloadTimeline() {
   let failed = '';
   try { await reloadLanes(); } catch (err) { failed = err.message; }
-  await fetchView();
+  const viewFailed = await fetchView();
   refreshCounts();
-  return failed;
+  return failed || viewFailed;
 }
 
 // The status line's last action for a write, set after the redraw so that it stays. With the message of a reload that
@@ -899,22 +1044,99 @@ export async function applyMark(label, note, uids = [...S.selected], { host = nu
   return true;
 }
 
+// What a reject leaves of its `changed` events, `marked` of which carry a mark: rejecting a suggestion on an event already
+// marked, as the right-click menu can, leaves the mark.
+function rejectLeaves(changed, marked) {
+  const unmarked = changed - marked;
+  if (!marked) return changed === 1 ? 'the event stays Unreviewed' : 'the events stay Unreviewed';
+  if (!unmarked) return changed === 1 ? 'the event keeps its mark' : 'the events keep their marks';
+  return `${plural(marked, 'event keeps its mark', 'events keep their marks')} and ` +
+         `${unmarked.toLocaleString()} ${unmarked === 1 ? 'stays' : 'stay'} Unreviewed`;
+}
+
+// What the status line says a suggestion decision did, from the server's answer. An accept names the mark it gave, or each
+// mark and its count when a source's suggestions differ. A reject says what becomes of the events.
+export function decisionWords(decision, source, { changed, skipped = 0, accepted = {}, marked = 0 }) {
+  const count = changed ? plural(changed, `${source} suggestion`) : `no ${source} suggestions`;
+  let words = `Restored ${count}`;
+  if (decision === 'accept') {
+    const marks = Object.entries(accepted).sort(([a], [b]) => suggestionRank(a) - suggestionRank(b));
+    words = `Accepted ${count}`;
+    if (marks.length === 1) words += ` as ${markWord(marks[0][0])}`;
+    else if (marks.length) words += `: ${marks.map(([value, n]) => `${n.toLocaleString()} as ${markWord(value)}`).join(', ')}`;
+  } else if (decision === 'reject') {
+    words = changed ? `Rejected ${count}; ${rejectLeaves(changed, marked)}` : `Rejected ${count}`;
+  }
+  return skipped ? `${words}. ${skipped.toLocaleString()} skipped as decided meanwhile` : words;
+}
+
 // Accept, reject, or restore one source's suggestions: for the given events, one group of the Suggestions
 // page, or all of its pending ones. `fromEvent` re-renders the Event page; other pages refresh themselves. An accept's
 // `note` is journaled after its fixed text. A group action the analyst confirmed names its exact
 // events in `uids` and the count the confirm stated in `confirmed`; the status line then says how many the server
-// skipped as decided meanwhile.
-export async function decide(decision, source, uids, { group = null, groupBy = null, fromEvent = !!uids, note = '', confirmed = null } = {}) {
+// skipped as decided meanwhile. `pendingOnly` holds a decision on named events to the same, with no question asked.
+export async function decide(decision, source, uids, { group = null, groupBy = null, fromEvent = !!uids, note = '', confirmed = null, pendingOnly = false } = {}) {
   const done = fromEvent ? focusedPageAction() : () => false;
   const body = group != null ? { decision, source, group, group_by: groupBy } : uids ? { decision, source, uids } : { decision, source };
   if (note.trim()) body.note = note;
   if (confirmed) body.confirmed = confirmed;
+  if (pendingOnly) body.pending_only = true;
   let res;
   try { res = await post('/api/suggestion', body); }
   catch (err) { setStatus(`Suggestion change failed: ${err.message}`); return null; }
   const reloadError = await reloadTimeline();
-  const skipped = res.skipped ? `, ${res.skipped.toLocaleString()} skipped as decided meanwhile` : '';
-  reportWrite(`${decision}: ${plural(res.changed, 'event')} (${source})${skipped}`, res.server_ms, reloadError);   // after the redraw
+  reportWrite(decisionWords(decision, source, res), res.server_ms, reloadError);   // after the redraw
+  done();
+  return res;
+}
+
+// A list's rejection is out, from its request until its answer is handled. A second click sends nothing, even on a button a
+// tick has drawn since: the server would skip every event the first decided, and that answer would replace the first's on
+// the status line.
+let rejectOut = false;
+
+// Reject the pending suggestions of a list's ticked events, whichever sources suggest them, which the server finds. Above
+// CONFIRM_ABOVE events it asks first, and the entries then carry the count the analyst confirmed. `clicked`, the list's
+// button, is off from the request on: a write that went through leaves it off for the redraw to replace, and a refused one
+// turns it on for another try. Returns the server's answer, whose `changed` is 0 when every event was decided meanwhile, or
+// null when the click wrote nothing: a Cancel, a refusal, or a click while a rejection is out. A list then keeps its ticks
+// and note.
+export async function rejectTicked(uids, note, clicked) {
+  if (!uids.length || rejectOut) return null;
+  const consent = {};
+  if (uids.length > CONFIRM_ABOVE) {
+    const n = uids.length.toLocaleString();
+    const asked = await askSelection({ action: `Reject the suggestions on ${plural(uids.length, 'event')}`, uids,
+                                       effect: `All ${n} stay Unreviewed, and their sources stop suggesting them.`,
+                                       record: 'The journal records one entry for each source, listing its events, with your name and the time.' });
+    if (!asked) return null;
+    consent.confirmed = { count: uids.length };
+  }
+  rejectOut = true;
+  clicked.disabled = true;
+  try {
+    const res = await sendRejection({ uids, note, ...consent });
+    if (!res) {
+      clicked.disabled = false;
+      clicked.focus();
+    }
+    return res;
+  } finally {
+    rejectOut = false;
+  }
+}
+
+// rejectTicked's request, and the timeline and the status line after it. Returns the answer, or null for a refusal.
+async function sendRejection(body) {
+  const done = focusedPageAction();
+  let res;
+  try { res = await post('/api/reject_ticked', body); }
+  catch (err) { setStatus(`Suggestion change failed: ${err.message}`); return null; }
+  const reloadError = await reloadTimeline();
+  const skipped = res.skipped ? `${plural(res.skipped, 'event')} skipped as decided meanwhile` : '';
+  const stay = res.changed === 1 ? 'it stays' : 'they stay';
+  reportWrite(res.changed ? `Rejected suggestions on ${plural(res.changed, 'event')} (${res.sources.join(', ')}); ${stay} Unreviewed${skipped ? `, ${skipped}` : ''}`
+    : `Rejected no suggestion: ${skipped}`, res.server_ms, reloadError);
   done();
   return res;
 }

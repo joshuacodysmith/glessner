@@ -40,18 +40,69 @@ def names_journal_class(annotation, classes=frozenset({"Journal"})) -> bool:
 
 
 ATTRIBUTE_CALLS = ("getattr", "hasattr", "setattr", "delattr")
+GETTERS = ("attrgetter", "methodcaller")   # operator's, which take an attribute's or a method's name as text
+
+
+def bindings(target, value):
+    """The (target, value) pairs that binding `value` to `target` makes: a tuple or list unpacked from a tuple or list
+    written out with no starred item, item by item. With a starred target, the items before it take the first values
+    and the items after it the last; the starred target takes a list, never a Journal, so it's left out."""
+    targets = target.elts if isinstance(target, ast.Tuple | ast.List) else None
+    values = value.elts if isinstance(value, ast.Tuple | ast.List) else None
+    if targets is None or values is None or any(isinstance(given, ast.Starred) for given in values):
+        yield target, value
+        return
+    star = next((i for i, item in enumerate(targets) if isinstance(item, ast.Starred)), None)
+    if star is None and len(targets) == len(values):
+        pairs = zip(targets, values, strict=True)
+    elif star is not None and len(values) >= len(targets) - 1:
+        after = len(targets) - star - 1
+        pairs = [*zip(targets[:star], values[:star], strict=True),
+                 *zip(targets[star + 1:], values[len(values) - after:], strict=True)]
+    else:   # an unpacking that fails when it runs binds nothing
+        pairs = []
+    for item, given in pairs:
+        yield from bindings(item, given)
+
+
+def bound(node):
+    """The (target, value) pairs a node binds: an assignment's, a walrus's, a with's `as` target with its context
+    manager, and a for loop's or a comprehension's target with each item of a tuple, list, or set written out."""
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            yield from bindings(target, node.value)
+    elif isinstance(node, ast.AnnAssign | ast.NamedExpr) and node.value:
+        yield node.target, node.value
+    elif isinstance(node, ast.withitem) and node.optional_vars:
+        yield from bindings(node.optional_vars, node.context_expr)
+    elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and isinstance(node.iter, ast.Tuple | ast.List | ast.Set):
+        for item in node.iter.elts:
+            yield from bindings(node.target, item)
+
+
+def held_as(target) -> str:
+    """The name a target binds: a variable's, or an attribute's, such as log for self.log; "" for any other target."""
+    if isinstance(target, ast.Name):
+        return target.id
+    return target.attr if isinstance(target, ast.Attribute) else ""
 
 
 def private_uses(source: str) -> list[str]:
     """What the source takes from journal.py that is private, as written: each underscore name it imports from the module,
-    and each underscore attribute it reads, tests, sets, or deletes by name (getattr, hasattr, setattr, delattr, or a key of
-    vars() or __dict__) of the module, of the Journal class, or of a Journal. A Journal is a variable or parameter
-    annotated Journal (also Optional[Journal], or the class under an alias it imports), a name assigned a Journal(...) or
-    another Journal, a name `journal`, or an attribute `.journal`. Only code counts: a docstring or a comment that names
-    one is no use. A name built at run time, such as getattr(journal, "_" + "skip"), is beyond a static check."""
+    and each underscore attribute it reads, tests, sets, or deletes by name (getattr, hasattr, setattr, delattr, a key of
+    vars() or __dict__, or operator's attrgetter or methodcaller, also under an alias it imports, applied to it) of the
+    module, of the Journal class, or of a Journal. A Journal is a variable or parameter annotated Journal (also
+    Optional[Journal], or the class under an alias it imports), a name `journal`, an attribute `.journal`, or a name or
+    an attribute assigned a Journal(...) or another Journal (bound), also by unpacking (bindings), as a with's `as`
+    target, or as a loop's target. A conditional expression, or an `and` or `or`, that may give a Journal counts as one.
+    An attribute name that holds a Journal anywhere in the source counts on any object. Only code counts: a docstring or a
+    comment that names one is no use. A name built at run time, such as getattr(journal, "_" + "skip"), a value unpacked
+    from anything but a tuple or list written out with no starred item, a value looped over from anything but a tuple,
+    list, or set written out, and a getter stored before it's applied are beyond a static check."""
     tree = ast.parse(source)
     nodes = list(ast.walk(tree))
     modules, journals, classes, found = set(), {"journal"}, {"Journal"}, []
+    getters = {name: name for name in GETTERS}   # each name a getter is called by, and the getter it is
     for node in nodes:   # the imports first: they bind the names the rest is read by
         if isinstance(node, ast.ImportFrom):
             if node.module == "glessner.journal" or (node.level == 1 and node.module == "journal"):
@@ -59,6 +110,8 @@ def private_uses(source: str) -> list[str]:
                 classes |= {a.asname for a in node.names if a.name == "Journal" and a.asname}
             elif node.module in (None, "glessner"):
                 modules |= {a.asname or a.name for a in node.names if a.name == "journal"}
+            elif node.module == "operator":
+                getters |= {a.asname: a.name for a in node.names if a.name in GETTERS and a.asname}
         elif isinstance(node, ast.Import):
             modules |= {a.asname for a in node.names if a.name == "glessner.journal" and a.asname}
     journals |= classes
@@ -68,24 +121,48 @@ def private_uses(source: str) -> list[str]:
             return node.id in modules | journals
         if isinstance(node, ast.NamedExpr):
             return of_journal(node.value)
+        if isinstance(node, ast.IfExp):
+            return of_journal(node.body) or of_journal(node.orelse)
+        if isinstance(node, ast.BoolOp):
+            return any(of_journal(given) for given in node.values)
         if isinstance(node, ast.Call):
             return names_journal_class(node.func, classes)
         return isinstance(node, ast.Attribute) and node.attr in modules | journals
 
     for node in nodes:
         if isinstance(node, ast.arg | ast.AnnAssign) and node.annotation and names_journal_class(node.annotation, classes):
-            journals.add(node.arg if isinstance(node, ast.arg) else getattr(node.target, "id", ""))
+            journals.add(node.arg if isinstance(node, ast.arg) else held_as(node.target))
     known = None
     while known != len(journals):   # a name assigned from a Journal is one, whatever order the assignments come in
         known = len(journals)
         for node in nodes:
-            if isinstance(node, ast.Assign | ast.NamedExpr):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                if of_journal(node.value):
-                    journals |= {t.id for t in targets if isinstance(t, ast.Name)}
+            for target, value in bound(node):
+                if of_journal(value) and (name := held_as(target)):
+                    journals.add(name)
 
     def private_name(node) -> bool:
         return isinstance(node, ast.Constant) and isinstance(node.value, str) and is_private(node.value)
+
+    def private_path(obj, path) -> bool:
+        """Whether a getter's dotted name, read from `obj` as attrgetter reads it, reaches a private attribute of the
+        module, the Journal class, or a Journal."""
+        if not (isinstance(path, ast.Constant) and isinstance(path.value, str)):
+            return False
+        held = of_journal(obj)
+        for part in path.value.split("."):
+            if held and is_private(part):
+                return True
+            held = part in modules | journals
+        return False
+
+    def getter_read(node) -> bool:
+        """Whether a node is attrgetter(...) or methodcaller(...) applied to an object it reads a private attribute of."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Call) and len(node.args) == 1):
+            return False
+        getter = node.func
+        kind = getters.get(getattr(getter.func, "id", getattr(getter.func, "attr", "")))
+        names = getter.args[:1] if kind == "methodcaller" else getter.args   # a method's arguments follow its name
+        return kind is not None and any(private_path(node.args[0], name) for name in names)
 
     def dict_of_journal(node) -> bool:
         """Whether a node is vars(x) or x.__dict__ of a Journal or the module."""
@@ -98,8 +175,9 @@ def private_uses(source: str) -> list[str]:
             return is_private(node.attr) and of_journal(node.value)
         if isinstance(node, ast.Subscript):
             return dict_of_journal(node.value) and private_name(node.slice)
-        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ATTRIBUTE_CALLS
-                and len(node.args) > 1 and of_journal(node.args[0]) and private_name(node.args[1]))
+        return getter_read(node) or (
+            isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ATTRIBUTE_CALLS
+            and len(node.args) > 1 and of_journal(node.args[0]) and private_name(node.args[1]))
 
     found += [f"reads {ast.unparse(node)}" for node in nodes if private_read(node)]
     return found
@@ -138,6 +216,25 @@ def test_the_check_for_private_names_finds_each_way_to_reach_one_and_ignores_pro
         "def f(journal):\n    delattr(journal, '_skip')": ["reads delattr(journal, '_skip')"],
         "def f(journal):\n    return vars(journal)['_skip']": ["reads vars(journal)['_skip']"],
         "def f(journal):\n    return journal.__dict__['_skip']": ["reads journal.__dict__['_skip']"],
+        # Unpacked, chosen by a condition, as a with's or a loop's target, or held under another attribute name
+        "def f(app):\n    k, j = app.cache, app.journal\n    return j._skip": ["reads j._skip"],
+        "def f(app):\n    (j, k), m = (app.journal, 1), 2\n    return j._skip": ["reads j._skip"],
+        "def f(app):\n    j, *rest = app.journal, 1, 2\n    return j._skip": ["reads j._skip"],
+        "def f(app):\n    *rest, j, k = 1, 2, app.journal, 3\n    return j._skip": ["reads j._skip"],
+        "def f(app, x):\n    j = app.journal if x else None\n    return j._skip": ["reads j._skip"],
+        "def f(app, other):\n    j = other or app.journal\n    return j._skip": ["reads j._skip"],
+        "def f(app):\n    with app.journal as j:\n        return j._skip": ["reads j._skip"],
+        "def f(app):\n    for j in (app.cache, app.journal):\n        return j._skip": ["reads j._skip"],
+        "def f(app):\n    return [j._skip for j in [app.journal]]": ["reads j._skip"],
+        "def f(self, app):\n    self.log = app.journal\n    return self.log._skip": ["reads self.log._skip"],
+        "class A:\n    def __init__(self, case):\n        self.log: Journal = Journal(case)\n\n    def f(self):\n"
+        "        return self.log._skip": ["reads self.log._skip"],
+        # Read by operator's getters, which take the name as text
+        "def f(journal):\n    return operator.attrgetter('_skip')(journal)": ["reads operator.attrgetter('_skip')(journal)"],
+        "def f(journal):\n    return attrgetter('path', '_skip')(journal)": ["reads attrgetter('path', '_skip')(journal)"],
+        "def f(app):\n    return attrgetter('journal._skip')(app)": ["reads attrgetter('journal._skip')(app)"],
+        "def f(journal):\n    return methodcaller('_started')(journal)": ["reads methodcaller('_started')(journal)"],
+        "from operator import attrgetter as ag\n\ndef f(j: Journal):\n    return ag('_skip')(j)": ["reads ag('_skip')(j)"],
     }
     for source, expected in found.items():
         assert private_uses(source) == expected, source
@@ -150,6 +247,16 @@ def test_the_check_for_private_names_finds_each_way_to_reach_one_and_ignores_pro
         "def f(app):\n    j = app.cache\n    return j._skip",
         "def f(j: Optional[Other]):\n    return j._skip",
         "def f(journal):\n    return hasattr(journal, 'started') and vars(journal)['path']",
+        "def f(app):\n    j, k = app.cache, app.journal\n    return j._skip",
+        "def f(app):\n    j, *rest = app.cache, app.journal, 2\n    return j._skip",
+        "def f(app):\n    j, *rest, k = app.journal, app.cache\n    return k._skip",
+        "def f(app, x):\n    j = app.cache if x else None\n    return j._skip",
+        "def f(app):\n    with app.cache as j:\n        return j._skip",
+        "def f(app):\n    for j in (app.cache, app.other):\n        return j._skip",
+        "def f(self, app):\n    self.cache = app.cache\n    return self.cache._skip",
+        "def f(other):\n    return attrgetter('_skip')(other)",
+        "from operator import attrgetter as ag\n\ndef f(other):\n    return ag('_skip')(other)",
+        "def f(journal):\n    return methodcaller('started', '_x')(journal)",
     ]
     for source in quiet:
         assert private_uses(source) == [], source
@@ -171,7 +278,7 @@ def given_last(path: Path):
 
 def test_the_overview_reads_the_last_action_with_the_journal_s_public_reader():
     assert callable(journal_module.last_action)
-    assert overview._last_action is journal_module.last_action
+    assert overview.last_action is journal_module.last_action
 
 
 def test_the_last_action_is_the_newest_entry_by_someone_that_the_shared_reader_gives(tmp_path):

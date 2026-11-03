@@ -56,7 +56,7 @@ A score gives the reached, partly reached, and missed counts of the items in sco
 
 ## Gap states
 
-Each gap in a write-up has one state. Item states measure the build the check ran on, and gap states say where each gap stands in the release the write-up names. A gap can be fixed while the item it lowered keeps its state until the check runs again.
+Each gap in a write-up has one state. Item states measure the build the check ran on, and gap states say where each gap stands in the release the write-up names. A gap can be fixed while the item it lowered keeps its state until the check runs again. A gap built after that release says so in its state, such as "Planned in v0.3.0, and built since for the next release".
 
 | State | Meaning | Example |
 |---|---|---|

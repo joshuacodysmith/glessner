@@ -64,9 +64,16 @@ header { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; pad
                 border-bottom: 2px solid var(--malicious-text); }
 .case-changed button { margin-left: 8px; font-weight: 400; }
 /* The case page's status shrinks before the Case panel takes a second row, which the lanes would pay for; setStatus
-   puts the whole text in its hover. */
-body:not(.start-page) #status { flex: 1 1 160px; min-width: 0; text-align: right; white-space: nowrap; overflow: hidden;
+   puts the whole text in its hover. In the row of the case's name and state (frame.js, fitStatus) it takes two lines,
+   which fit the height those give the row and hold a one-event decision at 190 px. In any other row it takes one, so no
+   text makes the header grow. The action comes first, so a cut takes the view's notes first. A line clamp's ellipsis falls
+   outside right-aligned text, so the two lines are left-aligned in a box that keeps to the right. */
+body:not(.start-page) #status { flex: 1 1 190px; min-width: 0; text-align: right; white-space: nowrap; overflow: hidden;
                                 text-overflow: ellipsis; }
+body:not(.start-page) #status.beside-case { display: flex; justify-content: flex-end; white-space: normal;
+                                            font-size: var(--t-12); line-height: 1.25; }
+body:not(.start-page) #status.beside-case > span { min-width: 0; overflow: hidden; text-align: left; display: -webkit-box;
+                                                   -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 /* Controls follow the scheme: a field is --panel on --fg, a border is --line-strong (3:1 against what it sits on), and
    a placeholder is --muted, since a note box's placeholder is its only label */
 button, select, textarea, input:not([type=checkbox]):not([type=radio]) {
@@ -92,6 +99,26 @@ button.linklike:hover { text-decoration: underline; }
 .linklike.dim { font-weight: 400; background-image: linear-gradient(to right, currentColor 0 6px, transparent 6px 10px);
                 background-size: 10px 1px; background-repeat: repeat-x; background-position: 0 100%; }
 .linklike.dim:hover { background-image: none; text-decoration: underline; }
+/* Fold arrows share one 16 px glyph at weight 400, so an arrow in a bold label draws as wide as the others. An arrow
+   that is its own button is centered in a 24 px square, the target size WCAG 2.5.8 asks for. An arrow inside a larger
+   control (a heading, a link, a summary) takes a 16 px cell, and the control is at least 24 px tall. Two arrows take
+   less: a lane label's arrow takes a 14 px cell in the lanes' 20 px row, and the suggested tags toggle's arrow takes
+   10 px of its line. */
+.sg-head button.twisty, .frow button.tw, .pv .pv-tw {
+  display: inline-flex; align-items: center; justify-content: center; flex: none; width: 24px; height: 24px; padding: 0;
+  border: 0; border-radius: 4px; background: transparent; color: var(--accent); font-size: var(--t-16);
+  font-weight: 400; line-height: 1; }
+#viewPanel .fold-arrow, #labels .row .twisty, button.tw > [aria-hidden], .pin-line button.linklike::after,
+details.fold > summary::before {
+  display: inline-block; flex: none; width: 16px; font-size: var(--t-16); font-weight: 400; line-height: 1;
+  text-align: center; }
+/* Beside text, the arrow is drawn 1 px lower, level with the text's lowercase letters. The offset moves only the
+   drawing, so no line or row changes. */
+#labels .row .twisty, button.tw > [aria-hidden], .pin-line button.linklike::after { position: relative; top: 1px; }
+/* On hover an arrow that is its own button is underlined, as a link-like button is. In a control with a label, the
+   label is underlined and the arrow is not. */
+.sg-head button.twisty:hover, .frow button.tw:hover, .pv .pv-tw:hover, #viewPanel h3 button.fold:hover .fold-title,
+#labels .row.group:hover, details.fold > summary:hover { text-decoration: underline; }
 button.primary { background: var(--fg); border-color: var(--fg); color: var(--panel); font-weight: 600; }
 button.primary.mark-suspicious { background: var(--fill-suspicious); border-color: var(--suspicious-text); color: var(--on-amber); }
 button.primary.mark-malicious { background: var(--fill-malicious); border-color: var(--fill-malicious); color: var(--on-fill); }
@@ -121,20 +148,23 @@ main { position: relative; flex: 1 1 auto; min-width: 0; display: grid; grid-tem
 #axisSpacer button[hidden] { display: none; }
 #axis { height: 30px; display: block; min-width: 0; }
 #scroller { display: flex; overflow-y: auto; overflow-x: hidden; min-height: 0; }
-#labels { width: var(--label-w, 260px); flex: none; border-right: 1px solid var(--line); }
+/* A press on the lanes, the space under them, or an axis pans, never selects */
+#scroller, #axis, .zone-axis { cursor: grab; user-select: none; }
+#labels { width: var(--label-w, 260px); flex: none; border-right: 1px solid var(--line); cursor: auto; user-select: text; }
 #labels .row { height: 20px; line-height: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
                padding-right: 6px; cursor: default; }
 #labels .row.group { background: var(--bg); cursor: pointer; font-weight: 600; }
-#labels .row .twisty { display: inline-block; width: 14px; color: var(--muted); }
+#labels .row .twisty { width: 14px; color: var(--muted); }   /* 14 px, the depth step, so a label keeps its place */
 #labels .row .count { color: var(--muted); font-weight: 400; margin-left: 6px; font-variant-numeric: tabular-nums; }
-#lanes { flex: 1; display: block; min-width: 0; cursor: grab; }
-#lanes.dragging { cursor: grabbing; }
+#lanes { flex: 1; display: block; min-width: 0; }
+#lanesBox.dragging, #lanesBox.dragging *, #lanesBox.dragging #labels .row.group { cursor: grabbing; }
 /* The Details panel: a warm band that names the page and holds Back and the trail, over one
    scroller. It opens at two-thirds of the stage (flex-basis 66.7% here for the first paint; dividers.js sets pixels). */
 #details { flex: 0 0 66.7%; display: flex; flex-direction: column; overflow: hidden; margin: 0 16px 12px; background: var(--panel);
            border: 1px solid var(--line); border-top: 3px solid var(--band-details-edge); }
 #detailsBand { flex: none; }
 #detailsBand .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+#detailsBand .back-bar { min-width: 0; overflow-wrap: anywhere; }   /* Back to a page named for a long rule title wraps */
 #detailsBody { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 8px 12px; }
 #details h2 { font-size: var(--t-14); margin: 0 0 6px; }
 #details h3 { font-size: var(--t-11); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
@@ -178,6 +208,8 @@ main { position: relative; flex: 1 1 auto; min-width: 0; display: grid; grid-tem
 .ev-ident .time { flex: none; font: 600 var(--t-16)/1.3 var(--mono); font-variant-numeric: tabular-nums; }
 .ev-ident .host { flex: none; font-size: var(--t-16); font-weight: 600; }
 .ev-ident .kind { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }   /* the kind takes the room the time and host leave; a min-width above that room is clipped by .ev-ident at its edge, with no ellipsis */
+.ev-ident.long-host .host { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }   /* a long name gives up room with an ellipsis, down to the kind's minimum */
+.ev-ident.long-host .kind { flex: 1 1 0; min-width: 7ch; }   /* room for a five-digit event ID and the ellipsis */
 .ev-sum { display: flex; flex-wrap: nowrap; gap: 0 6px; align-items: center; min-width: 0; }
 .ev-sum .chip { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ev-sum .clock-chip { flex: none; }   /* the offset's words are never cut */
@@ -221,12 +253,24 @@ main { position: relative; flex: 1 1 auto; min-width: 0; display: grid; grid-tem
 #details button.quiet { color: var(--muted); }
 .mark-note { flex: 1 1 150px; min-width: 120px; }
 .ev-verdict .mark-note { flex: 0 1 120px; width: 120px; min-width: 100px; }
-button.tw { padding: 0 2px; border: 0; background: transparent; color: var(--accent); font-size: var(--t-12); }
+button.tw { min-height: 24px; padding: 0 2px; border: 0; background: transparent; color: var(--accent); font-size: var(--t-12); }
 button.tw:hover { text-decoration: underline; }
-/* The selected events and their marks, above the buttons that mark them all */
-.selection-list { max-height: 7.5em; overflow-y: auto; margin: 2px 0 4px; padding: 0; list-style: none;
+/* The suggested tags toggle's arrow overlaps 3 px on each side of its 16 px cell and takes 10 px of the line, so the
+   toggle doesn't widen the verdict column. */
+button.tw > [aria-hidden] { margin: 0 -3px; }
+/* The listed events with their ticks and marks, in the Event page header's third row, under the buttons that mark the
+   ticked ones: a caption, then a bordered box of 8 rows (event_page.js's LIST_ROWS) that scrolls for the rest. Each row
+   is 1.5em tall, so the box's height is a count of rows. The row of the event on the page is highlighted. */
+.sel-caption { display: flex; flex-wrap: wrap; align-items: center; gap: 2px var(--s2); margin-top: 6px; }
+.sel-caption .find input[type=search] { width: 200px; }
+.selection-list { max-height: calc(8 * 1.5em + 6px); overflow-y: auto; margin: 2px 0 4px; padding: 2px 0; list-style: none;
+                  border: 1px solid var(--line); border-radius: 4px; background: var(--panel-2);
                   font: var(--t-12)/1.5 var(--mono); font-variant-numeric: tabular-nums; }
-.selection-list li { display: flex; gap: 8px; align-items: center; }
+.selection-list li { display: flex; gap: 8px; align-items: center; height: 1.5em; padding: 0 6px; cursor: pointer; }
+.selection-list li:hover .sel-text { text-decoration: underline; }
+.selection-list li.on-page { background: var(--pressed-bg); box-shadow: inset 3px 0 0 var(--accent); }
+.selection-list li.find-out { display: none; }
+.selection-list input { flex: none; width: 14px; height: 14px; margin: 0; }
 .selection-list .sel-text { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .mark-note-text { overflow-wrap: anywhere; }
 .ev-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 1.35fr); }
@@ -243,8 +287,14 @@ button.tw:hover { text-decoration: underline; }
 .ev-facts dd:hover { background: var(--panel-2); }
 /* Tier 3 of the page: Record and source, Raw fields, and History fold, closed until opened, and the browser remembers it */
 details.fold { margin-top: 12px; }
-details.fold summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: var(--t-11); font-weight: 600;
-                       text-transform: uppercase; letter-spacing: .05em; }   /* only the label toggles, not the whole row */
+details.fold summary { display: flex; align-items: center; position: relative; width: fit-content; min-height: 24px;
+                       padding-left: 12px; list-style: none; cursor: pointer; color: var(--muted); font-size: var(--t-11);
+                       font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }   /* only the label toggles, not the whole row */
+/* The arrow replaces the browser's marker, in a 16 px cell at the summary's start that reaches 4 px into the column's
+   padding, so the label stays put. It is out of the flow, so a text decoration on the summary doesn't reach it. */
+details.fold > summary::before { content: "\25B8"; content: "\25B8" / ""; position: absolute; top: 0; left: -4px;
+                                 line-height: 24px; }
+details.fold[open] > summary::before { content: "\25BE"; content: "\25BE" / ""; }
 details.fold dl, details.fold .ev-history { margin-top: 4px; }
 .raw-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
 /* A list's heading, count line, and buttons stay at the top of their panel while the rows scroll. A panel too
@@ -291,7 +341,9 @@ details.fold dl, details.fold .ev-history { margin-top: 4px; }
 .pv-broad { color: var(--suspicious-text); }
 .pv-side { display: flex; justify-content: flex-end; align-items: baseline; gap: 4px; text-align: right; font-variant-numeric: tabular-nums;
            white-space: nowrap; }
-.pv .pv-tw { padding: 0 2px; font-size: var(--t-12); line-height: 20px; }
+/* Centered, so the count's place doesn't follow the glyph's baseline. The square reaches into the row's padding, so
+   the line keeps its 20 px. */
+.pv .pv-tw { align-self: center; margin-block: -2px; }
 /* The fold: a folded row hides its reason, flags, and caveat, and keeps Broad and caveat as words beside its title.
    The section's tick sets the default, and a row's own arrow overrides it with .folded or .unfolded. */
 .pv-short { display: none; }
@@ -455,6 +507,7 @@ button > .count.pending, button > .count.review { border: 1px solid var(--suspic
 /* Review one by one: the bar over the Event page while a queue is being reviewed */
 .review-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s2); padding: var(--s1) var(--s3);
               background: var(--panel-2); border-bottom: 1px solid var(--line); }
+.review-bar strong { min-width: 0; overflow-wrap: anywhere; }   /* a long group name wraps inside the bar */
 .review-bar .mark-note { flex: 0 1 180px; min-width: 100px; }
 .review-bar .keys { margin-left: auto; font-size: var(--t-12); }
 #details[data-page="event"] > #detailsBody > .review-bar { flex: none; }
@@ -568,16 +621,37 @@ button > .count.pending, button > .count.review { border: 1px solid var(--suspic
 .find input[type=search] { width: 230px; }
 .find .find-words, .find .find-ticks { color: var(--muted); font-variant-numeric: tabular-nums; }
 .find-foot { margin: 6px 0 0; }
+.list-hint { order: 1; flex: 1 0 100%; }   /* a line of its own, under the rest of the list's head */
 #details .related ul.rows li.find-out, #details ul.rows.worklist li.find-out, #details ul.sg-events li.find-out,
 #details ul.badged li.find-out { display: none; }
 .sg-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
-.sg-head button.twisty { padding: 0 4px; border: 0; background: transparent; color: var(--accent); }
+.sg-head button.twisty { margin-left: -5px; }   /* the square reaches into the panel's padding, so the group's name stays put */
+.sg-head strong { display: block; overflow-wrap: anywhere; }   /* a long rule title wraps inside its button in the head */
+#details h2.sg-name { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; overflow-wrap: anywhere; }   /* and on a group's own page */
+#details h2.sg-name > span:first-child { min-width: 0; }
+/* A group's ticks, set apart from the buttons that cover the whole group. Each button holds its label and its longest label,
+   hidden, in one grid cell, and Accept N ticked and Reject N ticked hide without giving up their room, so with no find on, a
+   tick or the select button doesn't wrap the head and move a row under the pointer. */
+.sg-ticks { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding-left: 10px; border-left: 1px solid var(--line); }
+.sg-ticks button { display: inline-grid; justify-items: center; font-variant-numeric: tabular-nums; }
+.sg-ticks button > span { grid-area: 1 / 1; }
+.sg-ticks button > .sg-room, .sg-ticks button.none-ticked { visibility: hidden; }
 ul.sg-events { margin: 4px 0 0; padding-left: 22px; }
 ul.sg-events li { display: flex; gap: 6px; align-items: center; padding: 1px 0; cursor: pointer;
                   font: var(--t-12) var(--mono); font-variant-numeric: tabular-nums; }
 ul.sg-events li:hover .sg-text { text-decoration: underline; }
 ul.sg-events .sg-text { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 ul.sg-events li.sg-more { cursor: default; font-family: inherit; }
+/* A pending row's tick fills the list's left padding and the row's height, so a click just off the box ticks, and the row's
+   6 px gap after it is taken back, so the badge and the text start where they would with no tick. */
+ul.sg-events .sg-tick { flex: none; align-self: stretch; display: flex; align-items: center; width: 22px; margin: 0 -6px 0 -22px;
+                        cursor: default; }
+ul.sg-events .sg-tick input { margin: 0; }
+/* A row decided on its own or by its tick: dimmed, with its decision in words. It stays as tall as a row with buttons, so the
+   rows under it don't move, and its text starts where a pending row's does, after the 16 px badge and the row's 6 px gap. */
+ul.sg-events li.sg-decided { min-height: 22px; color: var(--muted); }
+ul.sg-events li.sg-decided .sg-text { margin-left: 22px; }
+ul.sg-events .sg-decision { flex: none; font-family: system-ui, sans-serif; }
 
 /* Filter panel and filters. The side panels belong to the Timeline, so each opens with its
    band, which stays at the top while the panel scrolls, and carries the Timeline's edge. */
@@ -590,20 +664,19 @@ ul.sg-events li.sg-more { cursor: default; font-family: inherit; }
                   color: var(--muted); }
 /* Each section of the View panel folds from its heading. The heading is a button that reads as the heading, with an
    arrow, and, when folded, how many of the section's values are on. */
-#viewPanel h3 button.fold { display: flex; align-items: baseline; gap: 6px; width: 100%; padding: 2px 0; border: 0; background: transparent;
-                            color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; }
-#viewPanel h3 button.fold:hover { color: var(--fg); }
-#viewPanel .fold-arrow { flex: none; width: 10px; }
+#viewPanel h3 button.fold { display: flex; align-items: center; gap: 4px; width: 100%; min-height: 24px; padding: 2px 0; border: 0;
+                            background: transparent; color: inherit; font: inherit; letter-spacing: inherit; text-transform: inherit;
+                            text-align: left; }
 #viewPanel .fold-count { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; font-variant-numeric: tabular-nums; }
 .fchips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; }
 .fchip { display: inline-flex; align-items: center; gap: 2px; padding: 0 0 0 7px; border: 1px solid var(--suspicious-text);
          border-radius: 9px; color: var(--suspicious-text); }
 .fchip button { padding: 0 6px; border: 0; background: transparent; color: inherit; line-height: 1.3; }
-.frow { display: grid; grid-template-columns: 14px 16px minmax(0, 1fr) auto; gap: 4px; align-items: center; padding: 1px 0; }
+.frow { display: grid; grid-template-columns: 14px 16px minmax(0, 1fr) auto; gap: 4px; align-items: center; min-height: 24px; }
 .frow.info { color: var(--muted); }
 .frow .name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .frow .n, .menu-check .n { color: var(--muted); font-variant-numeric: tabular-nums; }
-.frow button.tw { width: 14px; padding: 0; border: 0; background: transparent; color: var(--accent); }
+.frow button.tw { margin-left: -6px; }   /* the square reaches into the indent and the gap, so the boxes and names stay put */
 .frow input { margin: 0; }
 .frow.d1 { padding-left: 14px; } .frow.d2 { padding-left: 28px; } .frow.d3 { padding-left: 42px; }
 #fpFind { width: 100%; margin: 2px 0 4px; }
@@ -837,14 +910,16 @@ ul.help-examples { margin: 4px 0; padding-left: 18px; }
 .tools-job { margin: 6px 0; padding: 6px 10px; border: 1px solid var(--d5); border-radius: 4px; }
 .tools-job.failed { border-color: var(--malicious-text); }
 .tools-job ul, ul.tools-unread, ul.tools-others { margin: 4px 0; padding-left: 18px; }
-ul.tools-unidentified { font: var(--t-12) var(--mono); }
+ul.tools-unidentified, ul.tools-images { font: var(--t-12) var(--mono); }
+ul.tools-images { overflow-wrap: anywhere; }
 /* A tool's pin: its badge under the version, the fold of pinned files under its row, and the manifest's line */
 .pin-line { display: block; margin-top: 2px; font-size: var(--t-12); white-space: nowrap; }
 .pin-badge { display: inline-block; padding: 0 6px; border: 1px solid currentColor; border-radius: 3px; font-weight: 600; }
 .pin-badge.ok { color: var(--authorized-text); }
 .pin-badge.warn { color: var(--suspicious-text); }
 .pin-badge.muted { color: var(--muted); font-weight: 400; }
-.pin-line button.linklike::after { content: "\25B8"; content: "\25B8" / ""; margin-left: 4px; font-size: 0.75em; }
+.pin-line button.linklike { min-height: 24px; }
+.pin-line button.linklike::after { content: "\25B8"; content: "\25B8" / ""; margin-left: 2px; }
 .pin-line button.linklike[aria-expanded="true"]::after { content: "\25BE"; content: "\25BE" / ""; }
 #details .tools-table tr.pin-fold td { padding: 2px 14px 8px 0; border-top: 0; white-space: normal; color: var(--muted); }
 #details .tools-table .pin-table { width: auto; min-width: 60%; margin: 4px 0; }
@@ -927,7 +1002,7 @@ body.start-page #status { margin-left: auto; }
 /* The Case panel grouped by job: the case and its state, the path, and the Case menu */
 /* A long case name and state line ellipsize (the whole text is in their hovers) so the Case panel keeps one row from 1280 px
    up; the stage had paid 27 to 33 px of lanes for a second row */
-#caseId { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; max-width: 220px; }
+#caseId { display: flex; flex-direction: column; line-height: 1.25; min-width: 0; max-width: 190px; }
 #caseId strong { font-size: var(--t-14); }
 #caseId strong, #caseState { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #caseState { color: var(--muted); font-size: 11.5px; }
@@ -1047,4 +1122,4 @@ code.journal-head { font-size: var(--t-12); }
 @media (max-width: 960px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
 /* The Tools page's runs that failed or loaded nothing, which the overview's Gaps link to */
 #details ul.tools-gaps { margin: 4px 0; padding-left: 18px; }
-#details ul.tools-gaps li.flash, #details ul.tools-unidentified.flash { background: color-mix(in srgb, var(--suspicious-text) 20%, transparent); }
+#details ul.tools-gaps li.flash, #details ul.tools-unidentified.flash, #details ul.tools-images.flash { background: color-mix(in srgb, var(--suspicious-text) 20%, transparent); }

@@ -344,6 +344,32 @@ def test_a_hash_taken_while_the_cache_was_dropped_or_cleared_is_not_kept(tmp_pat
     assert len(cache) == 1   # a hash taken with no change in between is kept
 
 
+@pytest.mark.parametrize("later", ["hash", "pin"])
+def test_a_slow_hash_does_not_replace_files_hashed_or_pinned_after_it_began(tmp_path, monkeypatch, later):
+    """Two pages hash one tool at once: while the first hashes the files as they were, the tool is updated, and the
+    second page hashes the new files, or the analyst pins them. The first hash, finishing last, is returned to its
+    caller, and the cache keeps the newer files."""
+    tool = evtx(tmp_path)
+    cache = tools_manifest.PinCache()
+    real = tools_manifest._take
+
+    def take_then_update(found):
+        taken = real(found)
+        monkeypatch.setattr(tools_manifest, "_take", real)
+        (found.executable.parent / "Maps" / "c.map").write_bytes(b"c\n")
+        if later == "hash":
+            cache.get(found)
+        else:
+            cache.put(found, take_pin(found))
+        return taken
+
+    monkeypatch.setattr(tools_manifest, "_take", take_then_update)
+    old = cache.get(tool)
+    now = take_pin(tool).listing
+    assert old.listing != now and "c.map" in now.folders["Maps/"]
+    assert cache.get(tool).listing == now
+
+
 ENTRY = {"executable": "EvtxECmd.exe", "files": {"EvtxECmd.exe": "ab" * 32}, "folders": {}, "links": [],
          "pinned_by": "0.3.0+c022c45", "pinned_utc": "2026-10-27T16:40:00Z", "rules": "", "version": "1.5.2.0"}
 
@@ -426,6 +452,17 @@ def test_the_reader_reads_what_a_pin_wrote_and_none_when_there_is_no_file(tmp_pa
     read = read_manifest(path)
     assert read.path == path and read.sha256 == sha(path.read_bytes())
     assert read.tools == json.loads(path.read_text(encoding="utf-8"))["tools"]
+
+
+def test_the_reader_reads_a_manifest_saved_with_a_byte_order_mark_and_hashes_its_bytes_as_they_are(tmp_path):
+    """Windows PowerShell 5.1's Set-Content -Encoding utf8 and older Notepad write a byte order mark at the start."""
+    tool = evtx(tmp_path)
+    path = pinned(tmp_path, tool)
+    pins = entries(tmp_path)
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    read = read_manifest(path)
+    assert read.tools == pins and read.sha256 == sha(path.read_bytes())
+    assert checked(tmp_path, tool)["result"] == "matches"
 
 
 def test_the_check_says_matches_for_files_equal_to_the_pin(tmp_path):

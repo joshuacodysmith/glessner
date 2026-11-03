@@ -6,14 +6,17 @@ import { button, decide, loadDetails, pageAction } from './event_page.js';
 // ---------- Review one by one: a source's pending suggestions, one Event page at a time ----------
 // The queue is the set To investigate counted when it loaded, in time order. The Event page of an event in the queue
 // draws a review bar (reviewBar): where the analyst is ("hayabusa: 3 of 5"), Accept as the suggested mark, Reject with
-// its note, Next, and Stop. The keys A, R, and N do the same from anywhere on the page but a field.
+// its note, Next, and Stop. The keys A, R, and N do the same from anywhere on the page but a field. A review of one group of
+// the Suggestions page walks the events that group counted, and its bar names the group.
 
-let review = null;   // { source, value, queue: [uid], at: index }
+let review = null;   // { source, value, queue: [uid], at: index, group }
 let keysBound = false;
 
-export function startReview(source, value, queue) {
+// `group`, for a review of one Suggestions group: `key`, its name; `place`, its page as showSuggestions takes it; and
+// `answered()`, called as each decision answers. Null for a review of a whole source.
+export function startReview(source, value, queue, group = null) {
   if (!queue.length) { setStatus(`Nothing is pending from ${source}.`); return; }
-  review = { source, value, queue: [...queue], at: 0 };
+  review = { source, value, queue: [...queue], at: 0, group };
   bindKeys();
   openAt(0);
 }
@@ -23,6 +26,10 @@ export const reviewing = () => review;
 export function stopReview() {
   review = null;
 }
+
+// The review of a group whose queue holds this event, or null. Its Event pages take one place in Back's history, so Back
+// from any of them returns to the group's page however long the queue, and a reload lands on that page.
+export const groupReviewOf = (uid) => (review?.group && review.queue.includes(uid) ? review : null);
 
 function openAt(i) {
   review.at = i;
@@ -53,16 +60,19 @@ export function reviewBar(ev, uid) {
   // The review moves on once the decision answers, unless a page was asked for meanwhile: that page keeps the panel, and
   // the review stays on this event
   const act = async (decision) => {
+    const { group } = review;
     const done = pageAction(`event:${uid}`);
     const res = await decide(decision, review.source, [uid], { note: note.value, fromEvent: false });
+    if (res) group?.answered();
     if (res && done(false)) next();
   };
   const stop = button('Stop reviewing', () => { stopReview(); loadDetails(uid); }, { class: 'linklike', 'data-key': 'stop' });
-  const where = el('strong', {}, `${review.source}: ${i + 1} of ${n}`);
+  const whose = review.group ? `${review.group.key} (${review.source})` : review.source;
+  const where = el('strong', {}, `${whose}: ${i + 1} of ${n}`);
   if (review.done && i === n - 1) {
     return el('div', { class: 'review-bar', role: 'region', 'aria-label': 'Review one by one' },
-      el('strong', {}, `${review.source}: ${plural(n, 'event')} reviewed`),
-      el('span', { class: 'muted' }, 'That was the last of the set To investigate counted.'), stop);
+      el('strong', {}, `${whose}: ${plural(n, 'event')} reviewed`),
+      el('span', { class: 'muted' }, `That was the last of the set ${review.group ? "the group's page" : 'To investigate'} counted.`), stop);
   }
   const controls = pending
     ? [button(`Accept as ${markWord(review.value)}`, () => act('accept'), { class: `primary mark-${String(review.value).toLowerCase()}`, 'data-key': 'a' }),

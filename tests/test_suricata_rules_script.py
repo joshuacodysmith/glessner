@@ -1,6 +1,6 @@
 """scripts/suricata_rules.py builds the rule file for Suricata runs from an unpacked ET Open rule set. It checks the set
-for everything it copies before it writes, and replaces the rule file last, so a set it can't use leaves the old rules in
-force."""
+for everything it copies before it writes, and replaces the version file only after the rule file, so a set it can't use
+leaves the old rules in force with the version file naming them."""
 
 import importlib.util
 from pathlib import Path
@@ -36,11 +36,13 @@ def et_open(tmp_path, classification=True, version="11310"):
 
 
 def suricata_with_old_rules(tmp_path):
-    """A Suricata folder whose rules/ already holds a rule file and a classification.config from an earlier build."""
+    """A Suricata folder whose rules/ already holds a rule file, a classification.config, and a version file from an
+    earlier build."""
     out = tmp_path / "suricata" / "rules"
     out.mkdir(parents=True)
     (out / "suricata.rules").write_text("old", encoding="utf-8")
     (out / "classification.config").write_text("old classes", encoding="utf-8")
+    (out / "et-open-version.txt").write_text("ET Open 11000\n", encoding="utf-8")
     return tmp_path / "suricata"
 
 
@@ -52,7 +54,8 @@ def test_a_rule_set_without_classification_config_is_refused_before_anything_is_
     out = suricata / "rules"
     assert (out / "suricata.rules").read_text(encoding="utf-8") == "old"
     assert (out / "classification.config").read_text(encoding="utf-8") == "old classes"
-    assert sorted(p.name for p in out.iterdir()) == ["classification.config", "suricata.rules"]
+    assert (out / "et-open-version.txt").read_text(encoding="utf-8") == "ET Open 11000\n"
+    assert sorted(p.name for p in out.iterdir()) == ["classification.config", "et-open-version.txt", "suricata.rules"]
 
 
 def test_a_refused_rule_set_creates_no_rules_folder(tmp_path):
@@ -92,10 +95,11 @@ def test_a_folder_without_rule_files_is_refused(tmp_path, capsys):
     assert not (suricata / "rules").exists()
 
 
-def version_file_is_a_folder(et, suricata):
-    """The version file can't be written when a folder has its name, which stops the build after the new rules are
+def version_txt_is_a_folder(et, suricata):
+    """The set's version.txt can't be read when a folder has its name, which stops the build after the new rules are
     written but before they replace the old ones."""
-    (suricata / "rules" / "et-open-version.txt").mkdir()
+    (et / "version.txt").unlink()
+    (et / "version.txt").mkdir()
 
 
 def rule_file_is_a_folder(et, suricata):
@@ -104,14 +108,14 @@ def rule_file_is_a_folder(et, suricata):
 
 
 def classification_config_is_a_folder(et, suricata):
-    """The copy of classification.config can't replace a folder of that name, which stops the build with both
-    temporary files written."""
+    """The copy of classification.config can't replace a folder of that name, which stops the build with every
+    temporary file written."""
     config = suricata / "rules" / "classification.config"
     config.unlink()
     config.mkdir()
 
 
-@pytest.mark.parametrize("stop", [version_file_is_a_folder, rule_file_is_a_folder, classification_config_is_a_folder])
+@pytest.mark.parametrize("stop", [version_txt_is_a_folder, rule_file_is_a_folder, classification_config_is_a_folder])
 def test_a_failure_partway_leaves_the_old_rule_file_in_force_and_no_temporary_file(tmp_path, stop):
     et = et_open(tmp_path)
     suricata = suricata_with_old_rules(tmp_path)
@@ -120,4 +124,24 @@ def test_a_failure_partway_leaves_the_old_rule_file_in_force_and_no_temporary_fi
         script().main(et, suricata)
     out = suricata / "rules"
     assert (out / "suricata.rules").read_text(encoding="utf-8") == "old"
+    assert (out / "et-open-version.txt").read_text(encoding="utf-8") == "ET Open 11000\n"
+    assert sorted(p.name for p in out.glob("*.tmp")) == []
+
+
+def test_a_rule_file_that_cant_be_replaced_leaves_the_version_file_naming_the_old_rules(tmp_path, monkeypatch):
+    et = et_open(tmp_path)
+    suricata = suricata_with_old_rules(tmp_path)
+    replace = Path.replace
+
+    def refuse_the_rule_file(self, target):
+        if Path(target).name == "suricata.rules":
+            raise PermissionError(f"{target} is in use")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", refuse_the_rule_file)
+    with pytest.raises(PermissionError):
+        script().main(et, suricata)
+    out = suricata / "rules"
+    assert (out / "suricata.rules").read_text(encoding="utf-8") == "old"
+    assert (out / "et-open-version.txt").read_text(encoding="utf-8") == "ET Open 11000\n"
     assert sorted(p.name for p in out.glob("*.tmp")) == []

@@ -209,9 +209,13 @@ export function buildFilterPanel() {
 
 // A row of the panel. `shown` is null while the filter's counts are still to come: the row's count reads "…".
 export function filterRow(p, depth, label, shown, total, { node = '', title = '', info = false } = {}) {
-  const open = node && (S.fpOpen.has(node) || !!S.fpQuery);
+  // The rows an arrow opens are drawn into the evidence types' list, for a type, or the hosts' tree. The file find opens
+  // every row of the tree; a type's runs show only when its arrow opens them.
+  const type = node.startsWith('t:');
+  const open = node && (S.fpOpen.has(node) || (!type && !!S.fpQuery));
   const tw = node ? button(open ? '▾' : '▸', () => { S.fpOpen.has(node) ? S.fpOpen.delete(node) : S.fpOpen.add(node); renderFilterPanel(); },
-                           { class: 'tw', 'aria-label': `Show or hide what is in ${label}` }) : el('span');
+                           { class: 'tw', 'aria-label': `Show or hide what is in ${label}`, 'aria-expanded': String(open),
+                             'aria-controls': type ? 'fpTypes' : 'fpTree' }) : el('span');
   const counted = shown != null;
   const hidden = p && counted && shown < total;
   const waiting = [title, 'Counting what the filter shows.'].filter(Boolean).join('. ');

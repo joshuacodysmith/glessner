@@ -1,4 +1,4 @@
-import { api, el } from './core.js';
+import { api, el, showControls } from './core.js';
 
 // ---------- Enterprise ATT&CK's techniques, for a finding's ATT&CK field and the tag picker ----------
 // A box that lists Enterprise ATT&CK's techniques as the analyst types an ID or words of a name. Only a listed technique can
@@ -33,7 +33,7 @@ function attackBox({ label, placeholder, taken, already, onPick, onLoad = () => 
   const more = el('div', { class: 'attack-more muted', hidden: '' });   // past SHOWN matches, at the list's foot
   const pop = el('div', { class: 'attack-pop', hidden: '' }, box, more);
   const hint = el('div', { class: 'attack-hint muted', 'aria-live': 'polite' }, `${HINT}.`);
-  const say = (text) => { hint.textContent = text; };
+  const say = (text) => { hint.textContent = showControls(text); };   // a server fault's text can name an evidence path
   const resting = () => say(version ? `${HINT} (Enterprise ATT&CK v${version}).` : `${HINT}.`);
 
   // An ID, with or without its T, matches from its start; words match a name in any order. ID matches come first.

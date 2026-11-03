@@ -93,6 +93,9 @@ export const S = {
   laneNames: {},   // lane labels by group-by key and lane key, where they differ, such as a user lane's spelling
   data: null, selected: new Set(), focus: null, related: new Set(), index: [], linkSegs: [],
   windowLinks: [],   // time-window relation: [{uid, gap_s}] around S.focus, drawn dashed
+  // The Event page's selection list: the events it lists, the Set in `selected` whose ticks it shows, its find text and
+  // scroll place, and the verdict zone's note (event_page.selectionListing)
+  listed: null,
   timer: null, drag: null, linkNote: '', pivotResult: null,
   // The last draw's logon links drawn, those whose ends fell in one folded group, and those whose source host had no lane
   linksDrawn: 0, linksFolded: 0, linksSkipped: 0,
@@ -124,6 +127,15 @@ export const S = {
   // The find boxes' text by list name, for the Details page on screen (pages.listFind): setPage starts it
   // again when the page's key changes, so a redraw keeps a find and a new page starts empty
   finds: { key: null, lists: new Map() },
+  // Whether each Suggestions page group is open, by its name (group-by and key), for the Details page on screen
+  // (suggestions.js): as the page first drew it, or as its arrow last set it. It starts again when the page's key changes.
+  folds: { key: null, open: new Map() },
+  // The rows of the Suggestions page on screen decided one at a time or by their ticks, by event ID (suggestions.js). They
+  // stay on the page through its redraws, and it starts again when the page's key changes.
+  decided: { key: null, rows: new Map() },
+  // The ticked rows of the Suggestions page on screen, by group's key, each a Set of event IDs, under the grouping they were
+  // ticked in (suggestions.js). They stay through its redraws, and start again when the page's key or the grouping changes.
+  ticks: { key: null, groupBy: null, groups: new Map() },
 };
 window.__timings = [];
 
@@ -362,7 +374,7 @@ export const windowText = (view = S.view) => `${fmtMs(view.start)} to ${fmtMs(vi
 // The status line's text, with its bidi controls shown, and the same as its hover, for a line cut short
 export function setStatus(text) {
   const s = $('status'), shown = showControls(text ?? '');
-  s.textContent = shown;
+  s.firstElementChild.textContent = shown;
   s.title = shown;
 }
 // The status line: the last action and the server's time for it, then the view's notes after " | ".
@@ -417,6 +429,15 @@ export const cut = (text, n) => (text.length > n ? `${text.slice(0, n)}…` : te
 export const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 // A sentence that ends in one period: text that already ends in one, as a note or a reason can, takes no second.
 export const sentence = (text) => (text.endsWith('.') ? text : `${text}.`);
+// Names as a list in words: "A", "A and B", "A, B, and C". With `cap`, the first `cap` are named and the rest counted:
+// "A, B, C, and 2 more".
+export function listWords(names, { cap = Infinity } = {}) {
+  const parts = names.length > cap ? [...names.slice(0, cap), `${names.length - cap} more`] : names;
+  return parts.length < 3 ? parts.join(' and ') : `${parts.slice(0, -1).join(', ')}, and ${parts.at(-1)}`;
+}
+// A table's entry for a key read from the evidence or the server, which may name a property every object has, such as
+// constructor; undefined when the table doesn't hold the key itself, or there is no table.
+export const lookup = (table, key) => (table && Object.hasOwn(table, key) ? table[key] : undefined);
 // A list row's event code, before its message. An event log message starts with its event ID, so the code isn't
 // written twice, as "4624 4624 Successful logon".
 export const codePrefix = (e) => (e.code && !String(e.msg ?? '').startsWith(`${e.code} `) ? `${e.code}  ` : '');

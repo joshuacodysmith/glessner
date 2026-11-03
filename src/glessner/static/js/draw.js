@@ -1,5 +1,5 @@
 import { clockTime, pairKeys, pairLabel } from './clock.js';
-import { $, cssVar, fmtGap, MARKS, OUTSIDE_GROUP, plural, ROW_H, S, STEPS_MS, windowText } from './core.js';
+import { $, cssVar, fmtGap, listWords, MARKS, OUTSIDE_GROUP, plural, ROW_H, S, STEPS_MS, windowText } from './core.js';
 import { rowOfKeys, sourceRow } from './lanes.js';
 import { renderWindow } from './state_line.js';
 import { fmtOffset } from './zones.js';
@@ -186,16 +186,10 @@ export function drawLinks(ctx, x, links, colors) {
   const notes = [];
   if (S.linksFolded) notes.push("Logon links inside a folded group aren't drawn; open the group to see them.");
   if (laneless.size) {
-    notes.push(`Logon links from ${hostList([...laneless].sort())} aren't drawn: no lane holds ` +
+    notes.push(`Logon links from ${listWords([...laneless].sort(), { cap: 3 })} aren't drawn: no lane holds ` +
                `${laneless.size === 1 ? 'its' : 'their'} events under the current Sources and View.`);
   }
   S.linkNote = notes.join(' ');
-}
-
-// Host names as a list in words, the first three named: "A", "A and B", "A, B, and C", "A, B, C, and 2 more".
-function hostList(names) {
-  const parts = names.length > 3 ? [...names.slice(0, 3), `${names.length - 3} more`] : names;
-  return parts.length < 3 ? parts.join(' and ') : `${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}`;
 }
 
 // The focused event's pair: the same moment on a host's clock and in the capture, as a

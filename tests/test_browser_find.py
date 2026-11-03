@@ -5,8 +5,10 @@ find. They drive the installed Microsoft Edge through Playwright, as test_browse
 
 import pytest
 from conftest import DC_LOG, SEC, T0, logon
+from test_browser_frame import no_tool_scan
 from test_browser_investigate import COUNTED, INVESTIGATE, open_worklist, uid_at
 from test_browser_smoke import browser, event_point, served_page  # noqa: F401
+from test_overview import overview_case  # noqa: F401
 from test_pivots import load_events
 
 from glessner.server import api_mark, api_rule
@@ -209,7 +211,8 @@ def test_the_find_on_a_pivot_list_is_kept_through_a_mark_and_the_next_pivot_star
 
 def test_each_suggestions_group_has_a_find_kept_through_a_decision(browser, synthetic_case):  # noqa: F811
     """A rule that suggests every 4624: its group's head has the box, the find narrows the group's rows, and an Accept on a
-    shown row refreshes the page with the find kept."""
+    shown row refreshes the page with the find kept. The accepted row stays, dimmed, while it holds the find's words, and
+    the find's counts, like the group's, then cover the rows still pending."""
     def rule(app):
         api_rule(app, {"op": "add", "text": "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"})
 
@@ -232,11 +235,17 @@ def test_each_suggestions_group_has_a_find_kept_through_a_decision(browser, synt
         assert group.locator(".sg-head .muted").first.inner_text() == f"{n} pending"   # the group's count never changes
         with p.expect_response("**/api/suggestion"):
             group.locator(f".sg-events {rows}:not(.find-out)").first.get_by_role("button", name="Accept").click()
-        p.wait_for_function(f"() => document.querySelectorAll('#details .sg-group .sg-events {rows}').length === {total - 1}")
+        p.wait_for_selector("#details .sg-group .sg-events li.sg-decided")
         group = p.locator("#details .sg-group").first
-        assert group.locator(f".sg-events {rows}").count() == n - 1
+        assert p.locator(f"#details .sg-group .sg-events {rows}").count() == total
+        assert group.locator(f".sg-events {rows}").count() == n
         assert group.locator(".sg-head .find input").input_value() == "desktop"
-        assert group.locator(f".sg-events {rows}:not(.find-out)").count() == on_desktop - 1
+        assert group.locator(f".sg-events {rows}:not(.find-out)").count() == on_desktop
+        assert group.locator(f".sg-events {rows}:not(.find-out):not(.sg-decided)").count() == on_desktop - 1
+        assert group.locator(".find-words").inner_text() == f"{on_desktop - 1} of {n - 1} rows match"
+        box = group.locator(".sg-head .find input")
+        box.fill("no such row")
+        assert group.locator(f".sg-events {rows}:not(.find-out)").count() == 0   # a decided row is found like any other
 
 
 def test_the_pile_list_has_a_find(browser, synthetic_case):  # noqa: F811
@@ -273,3 +282,28 @@ def test_the_show_them_list_has_a_find(browser, synthetic_case):  # noqa: F811
         assert p.locator(scope).get_by_role("button", name="New finding from the 1 ticked").count() == 1
         assert find_box(p, scope).input_value() == "desktop" and shown_rows(p, scope).count() == 1
         assert p.locator(scope).get_by_role("button", name="Unselect the 1 shown").count() == 1
+
+
+def test_the_list_an_overview_count_opens_has_a_find(browser, overview_case):  # noqa: F811
+    """A host's event count on the Case overview lists its events with the box in the list's head: the find narrows the
+    rows and marks the words while the heading's count stays, Select the 2 shown ticks those rows only, and the find is
+    kept through the mark that draws the list again."""
+    for p in served_page(browser, overview_case, setup=no_tool_scan):
+        p.locator("#tabOverview").click()
+        p.locator("#ovHosts tr[data-host='DESKTOP'] td.num").get_by_role("button").click()
+        scope = "#details[data-page='opened']"
+        p.wait_for_selector(f"{scope} li.rel-row")
+        n = p.locator(f"{scope} li.rel-row").count()
+        heading = p.locator(f"{scope} .sticky-head strong").inner_text()
+        box = find_box(p, scope)
+        assert box.get_attribute("placeholder") == "Find in this list"
+        box.fill("4624")
+        assert shown_rows(p, scope).count() == 2 < n
+        assert p.locator(f"{scope} .find-words").inner_text() == f"2 of {n} rows match"
+        assert set(marks_in(p, scope)) == {"4624"}
+        assert p.locator(f"{scope} .sticky-head strong").inner_text() == heading
+        p.locator(scope).get_by_role("button", name="Select the 2 shown").click()
+        p.locator(scope).get_by_role("button", name="Mark 2 Suspicious").click()
+        p.wait_for_function(f"() => [...document.querySelectorAll(\"{scope} li.rel-row:not(.find-out) .badge\")]"
+                            ".map((b) => b.textContent).join() === 'S,S'")
+        assert find_box(p, scope).input_value() == "4624" and shown_rows(p, scope).count() == 2

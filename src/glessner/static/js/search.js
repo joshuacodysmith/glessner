@@ -80,6 +80,14 @@ export function searchTerm(field, value) {
 function typeSearch(q) { S.trail = []; S.trailAt = -1; showSearch(q); }
 function run(q) { $('search').value = q; typeSearch(q); }
 export const typedSearch = run;   // for a link elsewhere that asks for a search, such as the overview's rule titles
+const MAX_QUERY = 500;   // the longest search, as the server's MAX_QUERY
+// The search for the events one Hayabusa rule hit, with `rest`, any other terms it carries, or null where rule:"..." can't be that
+// search: a title holding a quote can't be written, a * in one is a wildcard that finds other rules too, and the server refuses a
+// search past the longest.
+export function ruleTerm(title, rest = '') {
+  const query = `rule:"${title}"${rest && ` ${rest}`}`;
+  return /["*]/.test(title) || query.length > MAX_QUERY ? null : query;
+}
 // Runs a search for a next pivot that is one (the Event page), which is a step of the trail
 export function runSearch(q) { $('search').value = q; showSearch(q); }
 

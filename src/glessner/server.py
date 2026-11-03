@@ -75,6 +75,7 @@ from .export import (
     write_report,
 )
 from .filters import FilterStore, condition, data_values, describe, normalize, normalize_pred, pred_sql, searches
+from .identify import DISK_IMAGE
 from .imports import (
     FORMATS,
     ROLES,
@@ -108,6 +109,7 @@ from .journal import (
     Check,
     Journal,
     JournalError,
+    analyst,
     rekey_map,
     renamed,
     side_stamp,
@@ -134,6 +136,7 @@ from .queries import (
     account_names,
     case_range,
     categories,
+    decided_states,
     event_details,
     event_keys,
     event_pairs,
@@ -148,6 +151,7 @@ from .queries import (
     pending_for_source,
     pending_group_uids,
     pending_source_events,
+    pending_sources,
     related,
     shown_counts,
     sources,
@@ -158,7 +162,7 @@ from .queries import (
 from .relations import outside_sources
 from .rules import BUILTIN_RULES, RuleError
 from .rules import parse as parse_rule
-from .runner import IMPORT, RunError, read_run, read_runs
+from .runner import RunError, read_run, read_runs, tool_names
 from .search import (
     Term,
     by_name,
@@ -184,7 +188,6 @@ from .splits import apply_layout, intake_folders, kept_keys, kept_list, machines
 from .start import browse, check, forget_missing, load_recent, remember, start_copy, start_new_case, start_open_case
 from .tags import TACTICS, TagError, normalize_tag, tactic_order, tag_kind, tag_label
 from .timezones import validate_axes, zone_names
-from .tool_outputs import KINDS
 from .toolbox import close_interrupted, everything_ready, overview, run_gaps, start_all_job, start_load_job
 from .toolbox import start_job as start_tool_job
 from .tools import detect, load_registry
@@ -1031,13 +1034,12 @@ def api_case_state(app: App, query: dict) -> dict:
 
 @functools.cache
 def page_names() -> dict[str, dict[str, str]]:
-    """What the page calls each tool and each kind of event, by ID: the registry's tools, the makers
-    of output found in the evidence, and the import; the parsers' artifacts and the import presets'. The page shows an
-    ID that none names, such as a custom import's artifact, as it is."""
-    tools = {k.tool: k.maker for k in KINDS if k.maker} | {s.id: s.name for s in load_registry().values()}
+    """What the page calls each tool and each kind of event, by ID: the tools as the report names them (tool_names), and
+    the parsers' artifacts and the import presets'. The page shows an ID that none names, such as a custom import's
+    artifact, as it is."""
     artifacts = {p["artifact"]: p["label"].split(" (")[0] for p in IMPORT_PRESETS.values()} | ARTIFACT_NAMES
     artifacts["text_log"] = "Text log"   # its preset's label names its lines' form
-    return {"tool_names": {**tools, IMPORT: "Import"}, "artifact_names": artifacts}
+    return {"tool_names": tool_names(load_registry()), "artifact_names": artifacts}
 
 
 def _filter_sql(app: App, query: dict) -> str:
@@ -1144,17 +1146,22 @@ def _technique(key: str) -> dict:
 
 
 def _event_uids(body: dict, *, empty: bool = False) -> list[str]:
-    """The events a mark, tag, follow-up, or tag decision names in `uids`, each once and in the order first named, so
-    the entry's targets and the count answered never repeat an event. QueryError unless `uids` is a list of at most
-    MAX_MARK_TARGETS event IDs (at least one unless `empty`), each a non-empty string. The string check comes before
-    the repeats are dropped, which needs hashable values."""
+    """The events a mark, tag, follow-up, or tag decision names in `uids`, each once (_each_once). QueryError unless
+    `uids` is a list of at most MAX_MARK_TARGETS event IDs (at least one unless `empty`), each a non-empty string."""
     uids = body.get("uids") or []
     if not isinstance(uids, list) or not (uids or empty) or len(uids) > MAX_MARK_TARGETS:
         raise QueryError(f"uids must be a list of at most {MAX_MARK_TARGETS} event IDs" if empty
                          else f"uids must be a list of 1 to {MAX_MARK_TARGETS} event IDs")
-    if not all(isinstance(uid, str) and uid for uid in uids):
-        raise QueryError("uids must be event IDs, each a non-empty string")
-    return list(dict.fromkeys(uids))
+    return _each_once(uids, "uids")
+
+
+def _each_once(ids: list, field: str) -> list[str]:
+    """The event IDs a request names in `field`, each once and in the order first named, so the entry's targets and the
+    count answered never repeat an event. QueryError unless each is a non-empty string. The string check comes before
+    the repeats are dropped, which needs hashable values."""
+    if not all(isinstance(uid, str) and uid for uid in ids):
+        raise QueryError(f"{field} must be event IDs, each a non-empty string")
+    return list(dict.fromkeys(ids))
 
 
 def api_tag(app: App, body: dict) -> dict:
@@ -1342,12 +1349,13 @@ def _mark_info(app: App, events: list[dict]) -> list[dict]:
     One lookup per row in the journal's state, never a walk over it: a mark journaled meanwhile changes the dict, and
     a walk over it can raise. The state is ahead of the table between a journal append and the table's
     rewrite, so a mark whose label is not the row's gives the row no detail, and its badge keeps its letter. Unreviewed
-    rows and pending suggestions have no mark to name. After an undo the entry is the undo's, as on the Event page."""
+    rows and pending suggestions have no mark to name. After an undo the entry is the undo's, as on the Event page.
+    `mark_who` names the mark's who as the audit trail does (journal.analyst)."""
     marks = app.journal.state.marks
     for e in events:
         m = marks.get(e["uid"])
         if m is not None and MARK_LABELS.get(m.value) == e["mark"]:
-            e["mark_who"], e["mark_at"] = m.who, m.at
+            e["mark_who"], e["mark_at"] = analyst(vars(m)), m.at
     return events
 
 
@@ -1465,6 +1473,15 @@ def _unplaced_message(state, seq: int, uid: str) -> str:
                     "counts it.")
 
 
+def _named_note(note: dict) -> dict:
+    """A note as the Event page lists it: a copy whose `who`, and its retraction's, read as the audit trail names them
+    (journal.analyst). The journal's state keeps them as written."""
+    named = {**note, "who": analyst(note)}
+    if retracted := note.get("retracted"):
+        named["retracted"] = {**retracted, "who": analyst(retracted)}
+    return named
+
+
 def api_event(app: App, query: dict) -> dict:
     """An event's page. An earlier ID that a case format upgrade changed, such as one pasted from an export made before
     it, opens the event it names now, which says so; it resolves when the journal named it, as only those IDs are in the
@@ -1489,7 +1506,7 @@ def api_event(app: App, query: dict) -> dict:
     # Entries made before an upgrade under an ID it couldn't place on one event, which may have meant this one
     details["unplaced"] = [{"seq": u["seq"], "id": u["id"], "others": len(u["candidates"]) - 1}
                            for u in unplaced(app.journal.state).get(uid, [])]
-    details["notes"] = app.journal.state.notes.get(uid, [])
+    details["notes"] = [_named_note(n) for n in app.journal.state.notes.get(uid, [])]
     state = app.journal.state
     details["followup"] = state.followed.get(uid)   # Followed up: {seq, at, who}, kept when the mark changes
     # A rejected suggestion's note, by source
@@ -1502,7 +1519,7 @@ def api_event(app: App, query: dict) -> dict:
                            if not f["retired"] and uid in f["targets"]]
     mark = app.journal.state.marks.get(uid)   # who set the current mark, and when; Unreviewed has no entry
     if mark:
-        details["mark"].update(who=mark.who, at=mark.at)
+        details["mark"].update(who=analyst(vars(mark)), at=mark.at)
     details["tags"], details["tag_suggestions"] = _event_tags(app, uid)
     # The page's additions to the event: a fault in either is shown in its place, and never hides the event
     try:
@@ -1949,14 +1966,46 @@ def api_suggestion(app: App, body: dict) -> dict:
 
     A group action the analyst confirmed names the exact events the page counted in `uids` and the count its
     confirm stated in `confirmed: {count}`. The server acts on those alone, skips any no longer pending, answers how
-    many it skipped, and records `confirmed: {count, skipped}` on the entry."""
+    many it skipped, and records `confirmed: {count, skipped}` on the entry. A decision on hand-picked events that asked
+    nothing names them in `uids` with `pending_only: true`, and is held to the same: the entry's targets are the events
+    still pending.
+
+    The answer says what the decision did, for the status line: `changed` and `skipped`, an accept's `accepted`, how many
+    events it marked with each value, and a reject's `marked`, how many of its events carry a mark, which it doesn't
+    change."""
     decision, source = body.get("decision"), body.get("source")
     if decision not in ("accept", "reject", "restore") or not source:
         raise QueryError("decision must be accept, reject, or restore, with a source")
     confirmed = _confirmed(body)
     with app.lock:
-        changed, skipped = _decide(app, body, decision, source, confirmed)
-    return {"changed": changed, "skipped": skipped, **_rules_payload(app)}
+        answer = _decide(app, body, decision, source, confirmed)
+    return {**answer, **_rules_payload(app)}
+
+
+def api_reject_ticked(app: App, body: dict) -> dict:
+    """Reject every pending suggestion of the events a ticked list names in `uids`, whichever sources suggest them. The
+    sources are found, and the decisions journaled, under the lock, so an event marked or rejected meanwhile is skipped.
+    Each source gets one entry listing its events, as a reject from the source's own page does. `note` is kept with each
+    rejection. With `confirmed: {count}`, each entry records the count the confirm stated and how many events the request
+    skipped, both of the whole request: a skipped event has no pending source to count under. Answers how many events it
+    decided (`changed`), how many it skipped, and the sources' names."""
+    uids = _event_uids(body)
+    confirmed = _confirmed(body)
+    note = str(body.get("note") or "").strip()
+    with app.lock:
+        by_source = pending_sources(app.reader(), uids)
+        decided = {uid for targets in by_source.values() for uid in targets}
+        skipped = len(uids) - len(decided)
+        consent = {"confirmed": {"count": confirmed, "skipped": skipped}} if confirmed is not None else {}
+        try:
+            for source, targets in by_source.items():
+                app.journal.append("suggestion_decision", targets=targets, source=source, decision="rejected",
+                                   **({"note": note} if note else {}), **consent)
+        finally:
+            # An entry can fail after an earlier source's is on record: that rejection shows, and another try won't repeat it
+            if by_source:
+                app.refresh_suggestions()
+    return {"changed": len(decided), "skipped": skipped, "sources": list(by_source)}
 
 
 def _confirmed(body: dict) -> int | None:
@@ -1973,9 +2022,15 @@ def _confirmed(body: dict) -> int | None:
     return count
 
 
-def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | None = None) -> tuple[int, int]:
-    """api_suggestion's work, under the lock: how many events it decided, and how many of a confirmed request's events
-    it skipped as no longer pending."""
+def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | None = None) -> dict:
+    """api_suggestion's work, under the lock, and what it answers: how many events it decided, how many of a confirmed or
+    `pending_only` request's events it skipped as no longer pending, and what api_suggestion says an accept or a reject
+    adds. The events are a group's, or those `uids` names, each once (_each_once); an unconfirmed reject or accept that
+    names neither covers every pending suggestion of the source. An unconfirmed `uids` must name at least one event, so
+    only a request without `uids` covers them all."""
+    pending_only = body.get("pending_only") is True
+    if pending_only and not isinstance(body.get("uids"), list):
+        raise QueryError("a pending_only decision names the events it covers in uids")
     uids = body.get("uids")
     if "group" in body:   # a whole group from the Suggestions page, which lists only a group's first events
         try:
@@ -1983,15 +2038,24 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
         except ValueError as exc:
             raise QueryError(str(exc)) from exc
         if not uids:
-            return 0, 0
+            return {"changed": 0, "skipped": 0}
+    elif uids is not None:
+        if not isinstance(uids, list):
+            raise QueryError("uids must be a list of event IDs")
+        if not uids and confirmed is None:   # a confirmed empty list decides nothing
+            raise QueryError("uids must name at least one event")
+        uids = _each_once(uids, "uids")
     pending = pending_for_source(app.reader(), source)
     still = {u for group in pending.values() for u in group}
     skipped = 0
-    if confirmed is not None and decision != "restore":   # a confirmed action covers its counted events that are still pending
+    # A confirmed or pending_only action covers its named events that are still pending, even when that leaves none
+    only_named = (confirmed is not None or pending_only) and decision != "restore"
+    if only_named:
         asked = list(uids)
         uids = [u for u in asked if u in still]
         skipped = len(asked) - len(uids)
     consent = {"confirmed": {"count": confirmed, "skipped": skipped}} if confirmed is not None else {}
+    said: dict = {}
     if decision == "restore":
         targets = list(uids or [])
         if not targets:
@@ -1999,14 +2063,15 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
         _check_decision_size(body, uids, targets, "Restoring", "restore")
         app.journal.append("suggestion_decision", targets=targets, source=source, decision="restored", **consent)
     elif decision == "reject":
-        targets = list(uids) if uids or confirmed is not None else [u for group in pending.values() for u in group]
+        targets = list(uids) if uids or only_named else [u for group in pending.values() for u in group]
         note = str(body.get("note") or "").strip()   # a Reject's note, which the trail and the Event page show
         _check_decision_size(body, uids, targets, "Rejecting", "reject")
         if targets:
             app.journal.append("suggestion_decision", targets=targets, source=source, decision="rejected",
                                **({"note": note} if note else {}), **consent)
+        said["marked"] = sum(uid in app.journal.state.marks for uid in targets)
     else:
-        wanted = set(uids) if uids or confirmed is not None else None
+        wanted = set(uids) if uids or only_named else None
         chosen = {value: [u for u in group if wanted is None or u in wanted] for value, group in pending.items()}
         total = sum(map(len, chosen.values()))
         if total > MAX_MARK_TARGETS:   # as a mark is capped; each accept is a mark
@@ -2022,8 +2087,9 @@ def _decide(app: App, body: dict, decision: str, source: str, confirmed: int | N
                 app.journal.append("mark", targets=group, value=value, note=note, **consent)
                 app.rewrite(marks=group)
                 targets += group
+                said.setdefault("accepted", {})[value] = len(group)
     app.refresh_suggestions()
-    return len(targets), skipped
+    return {"changed": len(targets), "skipped": skipped, **said}
 
 
 def _fewer(body: dict, uids, verb: str) -> str:
@@ -2108,13 +2174,16 @@ PENDING_LIMIT_MAX = 5_000   # the most events a group lists when the page asks t
 
 def api_pending(app: App, query: dict) -> dict:
     """One source's pending suggestions in groups. `limit` lists more than the first 200 of each group, up to
-    PENDING_LIMIT_MAX, for the page's "Show all N first"."""
+    PENDING_LIMIT_MAX, for the page's "Show all N first". `decided` names the events the page keeps as decided, up to
+    LISTED_EVENTS, and the answer gives each one's current state, since other pages can change it."""
     source = _one(query, "source")
     # The built-in sources group by rule: Hayabusa rules, and the signatures of Suricata's and imported fast alerts
     default = "rule" if source in BUILTIN_SOURCES else "account"
     limit = min(max(int(_one(query, "limit", str(PENDING_LIMIT))), 1), PENDING_LIMIT_MAX)
+    con = app.reader()
     try:
-        return pending_events(app.reader(), source, _one(query, "group_by", default), limit)
+        return {**pending_events(con, source, _one(query, "group_by", default), limit),
+                "decided": decided_states(con, source, query.get("decided", [])[:LISTED_EVENTS])}
     except ValueError as exc:
         raise QueryError(str(exc)) from exc
 
@@ -2168,7 +2237,8 @@ def api_overview(app: App, query: dict) -> dict:
             app.reader(), identity=app.identity, state=app.journal.state, report=app.suggestion_report,
             journal_path=app.journal.path, runs=runs, specs=specs, run_gaps=run_gaps(runs, specs),
             manifest=read_manifest(case) if case.manifest_path.exists() else [],
-            unidentified=sum(1 for e in entries if e.artifact is None and not e.error), orphans=app.orphans,
+            unidentified=sum(1 for e in entries if e.artifact is None and not e.error),
+            disk_images=sum(1 for e in entries if e.artifact == DISK_IMAGE and not e.error), orphans=app.orphans,
             checks=evidence_checks(case), tool_names=names["tool_names"], artifact_names=names["artifact_names"],
             build=build_id(), alignment=alignment(list(app.identity.hosts.values())), journal=_journal_row(app))
         app.overview_cache = cached = (key, result)
@@ -2443,7 +2513,7 @@ def api_finding(app: App, body: dict) -> dict:
             payload["finding"] = fid
         payload.update({k: body[k] for k in FINDING_KEYS if k in body and k != "confirmed"})
         if isinstance(payload.get("targets"), list):   # each event once, as replay keeps them
-            payload["targets"] = list(dict.fromkeys(payload["targets"]))
+            payload["targets"] = _each_once(payload["targets"], "targets")
         if op == "add":
             payload.setdefault("targets", [])
         entry = app.journal.append("finding", **payload)
@@ -2730,7 +2800,8 @@ GET_ROUTES = {"/api/meta": api_meta, "/api/lanes": api_lanes, "/api/view": api_v
               "/api/exports_page": api_exports_page,
               "/api/shown_counts": api_shown_counts, "/api/case_state": api_case_state}
 POST_ROUTES = {"/api/mark": api_mark, "/api/note": api_note, "/api/host": api_host, "/api/rule": api_rule,
-               "/api/suggestion": api_suggestion, "/api/export": api_export, "/api/report": api_report,
+               "/api/suggestion": api_suggestion, "/api/reject_ticked": api_reject_ticked,
+               "/api/export": api_export, "/api/report": api_report,
                "/api/indicators": api_indicators,
                "/api/setting": api_setting, "/api/filter": api_filter, "/api/tag": api_tag,
                "/api/tag_suggestion": api_tag_suggestion, "/api/undo": api_undo, "/api/note_retract": api_note_retract,

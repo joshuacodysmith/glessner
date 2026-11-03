@@ -4,9 +4,10 @@ marks, decisions, clock, runs, and log clears are known, so every figure is chec
 import json
 from dataclasses import asdict
 
+import duckdb
 import pytest
 from chain_fixtures import AT, MARKS, UID, chained, note, unchained
-from conftest import DC_LOG, FAST_ALERTS, SEC, T0, WS_LOG, logon, registry
+from conftest import DC_LOG, FAST_ALERTS, SEC, T0, WS_LOG, e01_digest, e01_hash, e01_segment, file_sha256, logon, registry
 from test_clock import AHEAD, accepted, flow
 from test_splits import lab_case, split
 
@@ -18,8 +19,8 @@ from glessner.export import _md
 from glessner.heads import forget
 from glessner.identity import HostIdentity
 from glessner.intake import add_new, intake, verify
-from glessner.journal import SYSTEM, entries, replay
-from glessner.overview import _clock_text, _last_action
+from glessner.journal import SYSTEM, entries, last_action, replay
+from glessner.overview import _clock_text
 from glessner.parsers.autoruns import BUILT
 from glessner.queries import investigate
 from glessner.runner import RUN_FILE, RunRecord, _write_record
@@ -35,6 +36,7 @@ from glessner.server import (
     api_mark,
     api_overview,
     api_report,
+    api_selected,
     api_shown_counts,
 )
 
@@ -323,6 +325,47 @@ def test_the_case_state_keeps_a_mismatch_until_a_full_re_hash_matches(overview_c
         app.con.close()
 
 
+def test_disk_images_leave_the_unidentified_counts(synthetic_case):
+    """A disk image is neither unidentified nor evidence some tool could read: intake's summary, the Tools page, and the
+    Case overview's gaps count it apart, and the Tools page lists each one with its format and any note on it."""
+    from glessner.toolbox import overview as tools_overview
+    from glessner.tools import load_registry
+
+    ev = synthetic_case.evidence
+    (ev / "DC01" / "unknown.bin").write_bytes(b"\x01\x02 nothing known")
+    md5, sha1 = bytes(range(16)), bytes(range(20))
+    (ev / "DC01" / "dc01.E01").write_bytes(e01_segment((b"sectors", b"\xaa" * 8), e01_digest(md5, sha1), e01_hash(md5),
+                                                       (b"done", b"")))
+    refs = bytearray(4096)
+    refs[3:11] = b"ReFS\x00\x00\x00\x00"
+    (ev / "DESKTOP" / "Winserpart.001").write_bytes(bytes(refs))
+    summary = intake(synthetic_case)
+    assert summary.by_artifact == {"disk_image": 2, "unidentified": 1}
+    assert summary.unidentified == ["DC01/unknown.bin"]
+    tools = tools_overview(synthetic_case, load_registry(), {})
+    assert (tools["unidentified"], tools["disk_images"], tools["unread"]) == (1, 2, [])
+    assert tools["disk_images_sample"] == [
+        {"path": "DC01/dc01.E01", "format": "E01 segment 1", "note": "", "sha256": file_sha256(ev / "DC01" / "dc01.E01"),
+         "stored_md5": md5.hex(), "stored_sha1": sha1.hex()},
+        {"path": "DESKTOP/Winserpart.001", "format": "raw image, ReFS volume",
+         "note": "A ReFS volume's extracted files hold no $MFT or $J for the file system tools.",
+         "sha256": file_sha256(ev / "DESKTOP" / "Winserpart.001"), "stored_md5": "", "stored_sha1": ""}]
+    with (ev / "DC01" / "dc01.E01").open("ab") as image:
+        image.write(b"grown")
+    grown = tools_overview(synthetic_case, load_registry(), {})["disk_images_sample"][0]
+    assert (grown["sha256"], grown["stored_md5"], grown["stored_sha1"]) == (tools["disk_images_sample"][0]["sha256"], "", "")
+    (ev / "DC01" / "dc01.E01").unlink()
+    gone = tools_overview(synthetic_case, load_registry(), {})["disk_images_sample"][0]
+    assert (gone["path"], gone["sha256"], gone["stored_md5"], gone["stored_sha1"]) == (
+        "DC01/dc01.E01", tools["disk_images_sample"][0]["sha256"], "", "")
+    app = App(synthetic_case)
+    try:
+        gaps = api_overview(app, {})["gaps"]
+        assert (gaps["unidentified"], gaps["disk_images"]) == (1, 2)
+    finally:
+        app.con.close()
+
+
 def test_files_intake_could_not_read_are_a_gap_and_no_hashed_file(synthetic_case, monkeypatch):
     """Intake keeps a file it could not read with its error and no hash. It isn't an evidence file
     "hashed at intake", and the Gaps list it with the error."""
@@ -559,7 +602,7 @@ def test_your_last_action_reads_a_line_that_repeats_prev_as_the_shared_reader_do
     for n, (name, (data, target, text)) in enumerate(cases.items()):
         path = tmp_path / f"{n}.jsonl"
         path.write_bytes(data)
-        last = _last_action(path)
+        last = last_action(path)
         assert (last["target"], last["text"]) == (target, text), name
         given = [e for e in entries(path) if e.get("action") == "note"]
         assert (given[-1]["target"], given[-1]["text"]) == (target, text), name   # the shared reader agrees
@@ -585,6 +628,37 @@ def test_the_overview_and_the_audit_trail_read_a_who_under_the_seal_that_is_not_
         assert listed in shown["analysts"] and all(isinstance(name, str) for name in shown["analysts"])
         assert [r["seq"] for r in api_audit(app, {"who": [listed]})["rows"]] == [1]
         assert f"UTC, {_md(listed)}:" in markdown(entries(app.journal.path), "Test", {})
+    finally:
+        app.con.close()
+
+
+@pytest.mark.parametrize(("who", "listed"), [(["cody", "ann"], '["cody", "ann"]'), ({"by": "cody"}, '{"by": "cody"}'),
+                                              (5, "5"), (None, "null")], ids=["list", "object", "number", "null"])
+def test_the_event_page_and_a_listed_row_read_a_who_under_the_seal_that_is_not_a_string(overview_case, who, listed):
+    """A mark, a note, and the note's retraction on lines under the seal can each hold a who that is not a string. The
+    Event page names each as the audit trail does, by its JSON text, and so does a listed row's mark_who, which the
+    review-state badge's hover reads. The journal's state keeps the who as written."""
+    folder = overview_case.folder
+    con = duckdb.connect(str(overview_case.db_path), read_only=True)
+    try:
+        uid = con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' ORDER BY ts_us LIMIT 1").fetchone()[0]
+    finally:
+        con.close()
+    under_seal = [{"seq": 1, "at": AT, "who": who, "action": "mark", "targets": [uid], "value": "suspicious", "note": ""},
+                  {**note(2, uid=uid), "who": who},
+                  {"seq": 3, "at": AT, "who": who, "action": "note_retract", "target": uid, "note_seq": 2}]
+    (folder / "journal.jsonl").write_bytes(chained([], before=unchained(*under_seal)))
+    forget(folder)
+    app = App(overview_case)
+    try:
+        event = api_event(app, {"uid": [uid]})["event"]
+        assert (event["mark"]["label"], event["mark"]["who"]) == ("Suspicious", listed)
+        (shown,) = event["notes"]
+        assert (shown["seq"], shown["who"], shown["retracted"]["who"]) == (2, listed, listed)
+        (row,) = api_selected(app, {"uid": [uid]})["events"]
+        assert (row["mark"], row["mark_who"]) == ("Suspicious", listed)
+        kept = app.journal.state.notes[uid][0]
+        assert (kept["who"], kept["retracted"]["who"], app.journal.state.marks[uid].who) == (who, who, who)
     finally:
         app.con.close()
 

@@ -1,5 +1,5 @@
 import { clockBadges } from './clock.js';
-import { $, api, el, KEY_LABEL, LANE_FOLDS_CASES, LANE_FOLDS_KEY, MARK_ORDER, OUTSIDE_GROUP, S, showControls } from './core.js';
+import { $, api, el, KEY_LABEL, LANE_FOLDS_CASES, LANE_FOLDS_KEY, lookup, MARK_ORDER, OUTSIDE_GROUP, S, showControls } from './core.js';
 import { refreshViewStatus } from './data.js';
 import { refreshDivider } from './dividers.js';
 import { draw } from './draw.js';
@@ -38,8 +38,7 @@ export function buildTree() {
       if (!node) {
         // A user lane keys on the account's lower-case name and shows its usual spelling. A key is evidence text, so
         // the names are read as own properties: a user named constructor would otherwise read Object's.
-        const names = S.laneNames[S.groupby[d]] || {};
-        const label = Object.hasOwn(names, keys[d]) ? names[keys[d]] : String(keys[d]);
+        const label = lookup(S.laneNames[S.groupby[d]], keys[d]) ?? String(keys[d]);
         node = { id, label, depth: d, children: [], count: 0, keys, key: S.groupby[d] };
         nodes.set(id, node);
         parent.children.push(node);

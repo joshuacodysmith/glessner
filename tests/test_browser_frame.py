@@ -5,15 +5,16 @@ They run as test_browser_smoke.py's do, on the installed Edge, and are skipped w
 import json
 
 import pytest
-from conftest import DC_LOG
+from conftest import DC_LOG, SEC, T0, WS_LOG
 from test_browser_smoke import browser, case_menu, clock_page, filtered_view, served_page, to_timeline, view  # noqa: F401
 from test_manifest_record import copy_naming_reasons
-from test_overview import FILES, app_with_work, evidence_log, held_open, overview_case, rewrite_record, run_record  # noqa: F401
+from test_overview import FILES, app_with_work, evidence_log, held_open, hit, overview_case, rewrite_record, run_record  # noqa: F401
 
 from glessner import intake as intake_module
-from glessner.events import connect
+from glessner.events import connect, load
 from glessner.intake import add_new, intake, verify
 from glessner.journal import unvouched_words
+from glessner.search import MAX_QUERY
 from glessner.tools import load_registry
 
 pytestmark = pytest.mark.browser
@@ -303,6 +304,20 @@ def test_a_lead_s_rule_titles_open_the_events_the_rule_hit_on_its_host(browser, 
         assert p.locator("#detailsBand .title").inner_text() == 'Search: rule:"Critical rule" host:DC01'
         assert p.locator("#details li.rel-row").count() == 1
         assert "Hayabusa rule" in p.locator("#details .reach").first.inner_text()
+
+
+def test_a_rule_title_a_search_can_t_name_alone_stays_text(browser, overview_case):  # noqa: F811
+    """A * in a title is a wildcard that finds other rules too, and a title can fit a search alone but not with the lead's host.
+    Each reads as text beside the title that links."""
+    too_long = "y" * (MAX_QUERY - len('rule:"" host:DESKTOP') + 1)
+    hits = [hit(201, title, "medium", source=WS_LOG, ts=T0 + 874 * SEC) for title in ("Wild * rule", too_long)]
+    load(overview_case.db_path, hits, host="DESKTOP", tool="hayabusa", tool_version="3.6.0", run_id="r13", replaces_sources=[],
+         staging_dir=overview_case.folder)
+    for p in served_page(browser, overview_case, tab="overview", setup=no_tool_scan):
+        p.wait_for_selector("#ovLeads .ov-lead")
+        why = p.locator("#ovLeads .ov-lead").filter(has_text="Medium rule").locator(".why")
+        assert why.locator("button").all_inner_texts() == ["Medium rule"]
+        assert "Wild * rule" in why.inner_text() and too_long in why.inner_text()
 
 
 def test_a_lead_or_a_number_says_how_many_of_its_events_the_sources_hide(browser, overview_case):  # noqa: F811

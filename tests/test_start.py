@@ -2,8 +2,10 @@
 
 import getpass
 import json
+import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from conftest import junction
@@ -14,7 +16,7 @@ from glessner import start
 from glessner.case import create_case, open_case
 from glessner.intake import intake
 from glessner.server import serve_start
-from glessner.start import browse, check, load_recent, remember, start_copy
+from glessner.start import browse, check, images_text, load_recent, remember, start_copy
 from glessner.tools import _executables_under, find_dotnet, load_registry
 
 
@@ -33,7 +35,8 @@ def test_check_describes_the_chosen_folders(tmp_path):
     (tmp_path / "tools").mkdir()
     out = check(str(ev), str(tmp_path / "cases" / "new"), str(tmp_path / "tools"))
     assert out["evidence"] == {"ok": True, "files": 3, "bytes": out["evidence"]["bytes"], "partial": False,
-                               "hosts": ["DC01", "WS01"], "root_files": 1, "message": "", "warning": "", "links": []}
+                               "hosts": ["DC01", "WS01"], "root_files": 1, "message": "", "warning": "", "links": [],
+                               "images": ""}
     assert out["case_folder"] == {"ok": True, "message": "A new folder."}
     builtin = sum(1 for s in load_registry().values() if s.builtin)
     assert out["tools"]["ok"] and out["tools"]["found"] == builtin >= 1   # the built-in reader counts
@@ -156,6 +159,55 @@ def test_copies_warning_gives_up_in_time(tmp_path, monkeypatch):
     assert out["warning"] == "" and out["files"] == 1 and not out["partial"]
 
 
+def folder_link(kind, path, target):
+    """A directory junction or a directory symbolic link at `path` that points to `target`."""
+    if kind == "junction":
+        junction(path, target)
+        return
+    try:
+        path.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("this account can't create symbolic links")
+
+
+def opened_paths(monkeypatch):
+    """The paths os.scandir, os.stat, and os.path.isdir are called with from now on, in lower case on Windows and without
+    the extended-length prefix. A stat that doesn't follow links isn't counted."""
+    opened = []
+
+    def recorded(real):
+        def call(path, *args, **kwargs):
+            if kwargs.get("follow_symlinks", True):
+                opened.append(os.path.normcase(os.fspath(path)).removeprefix("\\\\?\\"))
+            return real(path, *args, **kwargs)
+        return call
+
+    for module, name in ((os, "scandir"), (os, "stat"), (os.path, "isdir")):
+        monkeypatch.setattr(module, name, recorded(getattr(module, name)))
+    return opened
+
+
+@pytest.mark.parametrize("kind", ["junction", "symbolic link"])
+def test_the_evidence_check_opens_nothing_through_a_link(tmp_path, monkeypatch, kind):
+    """A symbolic link can name a share, which a check that followed it would open. Two copies of a KAPE collection
+    whose drive-letter folders hold Windows and Users only as links, and a third copy whose host folder is a link, draw
+    no copies warning, and the check lists and stats nothing through a link."""
+    outside = folders(tmp_path / "outside", "Windows", "Users", "DC01/C/Windows")
+    ev = folders(tmp_path / "evidence", "kape/DC01/C", "kape_rerun/DC01/C", "triage")
+    (ev / "kape" / "DC01" / "C" / "notes.txt").write_text("a file to count")
+    links = {ev / "kape" / "DC01" / "C" / "Windows": outside / "Windows",
+             ev / "kape_rerun" / "DC01" / "C" / "Users": outside / "Users", ev / "triage" / "DC01": outside / "DC01"}
+    for path, target in links.items():
+        folder_link(kind, path, target)
+    opened = opened_paths(monkeypatch)
+    out = check(str(ev))["evidence"]
+    monkeypatch.undo()
+    assert (out["files"], out["warning"]) == (1, "")
+    assert len(out["links"]) == 3
+    prefixes = [os.path.normcase(os.fspath(path)) for path in links]
+    assert [p for p in opened if any(p == link or p.startswith(link + os.sep) for link in prefixes)] == []
+
+
 def test_the_count_stops_in_time_in_a_run_of_folders_with_no_files(tmp_path, monkeypatch):
     """The count's time limit is checked after each folder as well as each file, so a long run of folders that hold no
     files still stops in time: here, at the evidence folder itself, before the 50 empty folders and the file after
@@ -170,6 +222,132 @@ def test_the_count_stops_in_time_in_a_run_of_folders_with_no_files(tmp_path, mon
     assert (out["files"], out["partial"]) == (0, True)
     assert out["message"] == ("The count stopped at its time limit before it reached a file, so the folder may still "
                               "hold files.")
+
+
+def refs_volume() -> bytes:
+    data = bytearray(4096)
+    data[3:11] = b"ReFS\x00\x00\x00\x00"
+    return bytes(data)
+
+
+def ewf_segment(number: int) -> bytes:
+    return b"EVF\x09\x0d\x0a\xff\x00\x01" + number.to_bytes(2, "little") + b"\x00" * 64
+
+
+def test_the_evidence_check_names_a_disk_image_and_the_step_before_a_case(tmp_path):
+    """An evidence folder that holds a disk image passes the check, with a warning under it that names the image and its
+    format, says Glessner doesn't read it, and gives the step that comes first, with the ReFS note for a ReFS volume."""
+    ev = tmp_path / "winserpart"
+    ev.mkdir()
+    (ev / "Winserpart.001").write_bytes(refs_volume())
+    out = check(str(ev))["evidence"]
+    assert (out["ok"], out["files"]) == (True, 1)
+    assert out["images"] == (
+        "Winserpart.001 (raw image, ReFS volume) is a disk image, which Glessner doesn't read. Mount or extract it first, "
+        "and choose the extracted folder. A ReFS volume's extracted files hold no $MFT or $J for the file system tools.")
+
+
+def test_the_evidence_check_names_the_first_disk_images_and_counts_the_rest(tmp_path):
+    """Each image counts once, by its first file: an EWF or SMART image's later segments, and a hive with an image's
+    name, aren't images of their own."""
+    ev = evidence_folder(tmp_path)
+    for name in ("RM1/rm1.E01", "RM2/rm2.E01", "RM3/rm3.E01", "PC/pc.E01", "USB/usb.s01"):
+        (ev / name).parent.mkdir(exist_ok=True)
+        (ev / name).write_bytes(ewf_segment(1))
+    (ev / "PC" / "pc.E02").write_bytes(ewf_segment(2))
+    (ev / "USB" / "usb.s02").write_bytes(ewf_segment(2))
+    (ev / "DC01" / "SYSTEM.img").write_bytes(b"regf" + b"\x00" * 100)
+    assert check(str(ev))["evidence"]["images"] == (
+        "5 disk images, which Glessner doesn't read: PC/pc.E01 (E01 segment 1), RM1/rm1.E01 (E01 segment 1), "
+        "RM2/rm2.E01 (E01 segment 1), and 2 more. Mount or extract each one first, and choose the extracted folder.")
+
+
+def test_a_split_vmdk_counts_once_by_its_descriptor(tmp_path):
+    """A split VMDK's descriptor names its extents, <name>-s001.vmdk on, so the descriptor is the image and each
+    extent, a sparse extent with a .vmdk name, isn't an image of its own. A one-file sparse VMDK still counts."""
+    ev = tmp_path / "evidence"
+    for host in ("VM", "VM2"):
+        (ev / host).mkdir(parents=True)
+    (ev / "VM" / "disk.vmdk").write_bytes(b'# Disk DescriptorFile\nversion=1\ncreateType="twoGbMaxExtentSparse"\n'
+                                          b'RW 4192256 SPARSE "disk-s001.vmdk"\nRW 4192256 SPARSE "disk-s002.vmdk"\n'
+                                          b'RW 4192256 SPARSE "disk-s003.vmdk"\nRW 4192256 SPARSE "disk-s1000.vmdk"\n')
+    for name in ("disk-s001.vmdk", "disk-s002.vmdk", "disk-s003.vmdk", "disk-s1000.vmdk"):
+        (ev / "VM" / name).write_bytes(b"KDMV\x01\x00\x00\x00" + b"\x00" * 600)
+    (ev / "VM2" / "whole.vmdk").write_bytes(b"KDMV\x01\x00\x00\x00" + b"\x00" * 600)
+    out = check(str(ev))["evidence"]
+    assert out["files"] == 6
+    assert out["images"] == (
+        "2 disk images, which Glessner doesn't read: VM/disk.vmdk (VMDK descriptor) and VM2/whole.vmdk (VMDK sparse "
+        "extent). Mount or extract each one first, and choose the extracted folder.")
+
+
+def test_the_images_text_gives_each_note_once():
+    """Images of one format share its note, which follows the step once."""
+    images = [("B/two.001", "raw image, ReFS volume"), ("USB/usb.L01", "L01 segment 1"),
+              ("A/one.001", "raw image, ReFS volume"), ("USB2/usb2.L01", "L01 segment 1")]
+    assert images_text(images) == (
+        "4 disk images, which Glessner doesn't read: A/one.001 (raw image, ReFS volume), B/two.001 (raw image, ReFS "
+        "volume), USB/usb.L01 (L01 segment 1), and 1 more. Mount or extract each one first, and choose the extracted "
+        "folder. A ReFS volume's extracted files hold no $MFT or $J for the file system tools. An L01 image holds files, "
+        "not a volume: export its files first.")
+
+
+def test_a_count_that_stops_in_time_gives_the_images_as_at_least(tmp_path, monkeypatch):
+    """A count that stops at its time limit may have missed images, so it gives the number it found as at least that
+    many, even for one."""
+    ev = tmp_path / "evidence"
+    for host in ("A", "B"):
+        (ev / host).mkdir(parents=True)
+        (ev / host / f"{host.lower()}.001").write_bytes(refs_volume())
+    now = [0.0]
+    monkeypatch.setattr(start, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    real = start.identify_file
+
+    def read_past_the_limit(path):
+        now[0] += start.CHECK_SECONDS + 1
+        return real(path)
+
+    monkeypatch.setattr(start, "identify_file", read_past_the_limit)
+    out = check(str(ev))["evidence"]
+    assert (out["files"], out["partial"]) == (1, True)
+    assert out["images"] == (
+        "At least 1 disk image, which Glessner doesn't read: A/a.001 (raw image, ReFS volume). Mount or extract each one "
+        "first, and choose the extracted folder. A ReFS volume's extracted files hold no $MFT or $J for the file system "
+        "tools.")
+    assert images_text([("A/a.E01", "E01 segment 1"), ("B/b.E01", "E01 segment 1")], partial=True) == (
+        "At least 2 disk images, which Glessner doesn't read: A/a.E01 (E01 segment 1) and B/b.E01 (E01 segment 1). Mount "
+        "or extract each one first, and choose the extracted folder.")
+
+
+def test_the_evidence_check_reads_no_file_without_an_image_name(tmp_path, monkeypatch):
+    """The check reads a file's first bytes only when its name is an image's, so a folder of collected files costs no
+    reads."""
+    ev = evidence_folder(tmp_path)
+    (ev / "DC01" / "volume.dd").write_bytes(b"\x00" * 1024)   # an image's name, but no boot sector
+    read = []
+    real = start.identify_file
+    monkeypatch.setattr(start, "identify_file", lambda path: read.append(path.name) or real(path))
+    assert check(str(ev))["evidence"]["images"] == ""
+    assert read == ["volume.dd"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="file attributes are Windows'")
+def test_the_evidence_check_leaves_a_cloud_placeholder_with_an_image_name_unread(tmp_path, monkeypatch):
+    """Reading a cloud placeholder would download it, so the check names no image it would have to read."""
+    import ctypes
+
+    offline = 0x1000 | 0x20   # FILE_ATTRIBUTE_OFFLINE with FILE_ATTRIBUTE_ARCHIVE
+    ev = tmp_path / "evidence"
+    ev.mkdir()
+    image = ev / "Winserpart.001"
+    image.write_bytes(refs_volume())
+    monkeypatch.setattr(start, "identify_file", lambda path: pytest.fail(f"{path} was read"))
+    try:
+        assert ctypes.windll.kernel32.SetFileAttributesW(str(image), offline)
+        out = check(str(ev))["evidence"]
+        assert (out["files"], out["images"]) == (1, "")
+    finally:
+        ctypes.windll.kernel32.SetFileAttributesW(str(image), 0x20)
 
 
 def test_browse_lists_folders_only(tmp_path):

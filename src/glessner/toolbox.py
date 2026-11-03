@@ -17,17 +17,20 @@ import json
 import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
 
 from .case import Case, CaseError
-from .identify import IMPORTABLE
+from .identify import DISK_IMAGE, E01_SEGMENT, IMPORTABLE, image_note, stored_hashes
 from .imports import MappingError, listed_as, loaded_as_output, run_import
-from .intake import current_entries
+from .intake import ManifestEntry, current_entries, placeholders_among
+from .long_paths import long_path
 from .parsers import LOCAL_TIME
 from .runner import (
+    COMPOSED,
     IMPORT,
     LEFT_OUT,
     NOT_CHECKED,
@@ -60,8 +63,10 @@ NOUNS = {   # what an artifact is called on the page, singular
     "registry:NTUSER": "NTUSER.DAT hive", "registry:USRCLASS": "UsrClass.dat hive", "registry:SOFTWARE": "SOFTWARE hive",
     "jumplist": "jump list", "recycle_bin": "Recycle Bin file", "srum": "SRUM database", "event_xml": "event XML file",
     "pcap": "capture file", "usnjrnl": "USN journal", "sqlite": "SQLite database", "sqlite_log": "SQLite log file",
-    "sqlite:ActivitiesCache": "Windows Timeline database",
+    "sqlite:ActivitiesCache": "Windows Timeline database", "console_log": "Eric Zimmerman console log",
 }
+# The app's files a run composes for a tool, by compose kind (tools.COMPOSE_KINDS), as the page names them
+ADDITIONS = {"batch_file": "Glessner additions", "maps_dir": "Glessner maps"}
 
 
 @dataclass(frozen=True)
@@ -129,9 +134,9 @@ def close_interrupted(case: Case) -> list[RunRecord]:
     moment is marked too, and its own final write replaces the mark. A run's record is read again just before its mark
     is written, and a run that has ended since is left as it is; one that ends in the instant between that read and the
     write can still have its final record replaced. Never raises: a record this build can't read (CaseError for one that
-    isn't an object, lacks a key, or has a key it doesn't know; ValueError for text that isn't JSON; TypeError for a
-    value of the wrong type, such as a run ID that isn't text), or one that can't be read or written (OSError), ends the
-    pass with the runs marked so far."""
+    doesn't parse as JSON, isn't an object, lacks a key, or has a key it doesn't know; ValueError for one that doesn't
+    parse when it is read again; TypeError for a value of the wrong type, such as a run ID that isn't text), or one that
+    can't be read or written (OSError), ends the pass with the runs marked so far."""
     closed = []
     try:
         for record in read_runs(case):
@@ -197,8 +202,8 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
     handled = lambda e: any(handles(t.spec, e.artifact, e.detail) or e.artifact in t.spec.copy_also
                             for t in detected.values())
     unread = Counter(f"{e.artifact}:{e.detail}" if e.artifact == "registry" else e.artifact
-                     for e in entries if e.artifact and e.artifact not in IMPORTABLE and e.artifact not in ("tool_output", "pcap")
-                     and not e.error and not handled(e))
+                     for e in entries if e.artifact and e.artifact not in IMPORTABLE
+                     and e.artifact not in ("tool_output", "pcap", DISK_IMAGE) and not e.error and not handled(e))
     # The files the Import page offers, so both pages count the same ones: text logs, and output in
     # local time, such as an Autoruns CSV, that no load from this page has read.
     loaded = loaded_as_output(case, runs)
@@ -209,21 +214,40 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             offered["text_log" if e.artifact in IMPORTABLE else detail] += 1
     # Each with intake's reason, where it gave one, such as a prefetch name without its signature
     unidentified = [{"path": e.path, "reason": e.detail} for e in entries if e.artifact is None and not e.error]
+    images = [e for e in entries if e.artifact == DISK_IMAGE and not e.error]
+    # Only an image's last segment holds its stored hashes, so those rows come first, ahead of the list's end
+    image_rows = sorted((_image_row(case, e) for e in images), key=lambda r: not (r["stored_md5"] or r["stored_sha1"]))
     return {"tools_folder": str(folder or ""), "found": len(detected), "total": len(specs), "tools": tools,
             "manifest": manifest,
             "outputs": found_outputs(case, specs, detected, entries, runs),
             "unread": [{"what": _noun(k, n)} for k, n in unread.most_common()],
             "to_import": [_noun(k, n) for k, n in offered.most_common()],
             "unidentified": len(unidentified), "unidentified_sample": unidentified[:50],
+            "disk_images": len(images), "disk_images_sample": image_rows[:50],
             "others": find_known(folder, load_known()), "gaps": run_gaps(runs, specs)}
+
+
+def _image_row(case: Case, entry: ManifestEntry) -> dict:
+    """A disk image file's row on the Tools page: its format, what to know about it beyond mounting or extracting it,
+    its SHA-256 from intake, and for an E01 segment the hashes it stores for its disk. It shows no stored hash for a
+    file that has gone, for a cloud placeholder, which reading would download, and for a file whose size differs from
+    intake's, since those hashes wouldn't belong with this SHA-256."""
+    md5 = sha1 = ""
+    if entry.detail.startswith(E01_SEGMENT) and not placeholders_among(case, [entry.path]):
+        path = long_path(case.evidence, entry.path)
+        with suppress(OSError):
+            if path.stat().st_size == entry.size:
+                md5, sha1 = stored_hashes(path)
+    return {"path": entry.path, "format": entry.detail, "note": image_note(entry.detail), "sha256": entry.sha256,
+            "stored_md5": md5, "stored_sha1": sha1}
 
 
 def _last_run(latest: dict[tuple, RunRecord], at: str, specs: dict[str, ToolSpec]) -> dict:
     """What a tool's held runs (runner.held_runs) hold, for its row on the Tools page: the rows they loaded, those
     without a time, and those skipped; the rule sets they used, in run order, and whether any run of a tool that names its
-    rule set made none to name (runner.RULES_NOT_RECORDED). `latest` is the newest of them that ran the tool, as its
-    run ID, host, time, tool check as recorded, and that check in words, or None for a tool whose runs are all loads
-    of output found in the evidence."""
+    rule set made none to name (runner.RULES_NOT_RECORDED); and the app's additions that any of them ran without
+    (_without_additions). `latest` is the newest of them that ran the tool, as its run ID, host, time, tool check as
+    recorded, and that check in words, or None for a tool whose runs are all loads of output found in the evidence."""
     records = list(latest.values())
     named = rule_sets(records, specs)
     ran = [r for r in records if not r.from_output]
@@ -233,8 +257,31 @@ def _last_run(latest: dict[tuple, RunRecord], at: str, specs: dict[str, ToolSpec
             "skipped": sum(r.rows_skipped or 0 for r in records),
             "rules": [text for text in named if text != RULES_NOT_RECORDED],
             "rules_unrecorded": RULES_NOT_RECORDED in named,
+            "without_additions": _without_additions(latest, specs),
             "latest": newest and {"run_id": newest.run_id, "host": newest.host, "at": newest.finished_utc,
                                   "check": newest.tool_check, "text": check_text(newest.tool_check)}}
+
+
+def _missing_additions(record: RunRecord, spec: ToolSpec) -> list[str]:
+    """The kinds of the tool's compose entries (tools.COMPOSE_KINDS) whose files a run of it doesn't hold in its outputs
+    (runner.COMPOSED), as a run made before the app composed them doesn't. [] for a load of output found in the
+    evidence, which the app didn't run."""
+    if record.from_output:
+        return []
+    paths = [str(output.get("path", "")) for output in record.outputs]
+    return [kind for kind in spec.compose
+            if not any(path == COMPOSED[kind] or path.startswith(f"{COMPOSED[kind]}/") for path in paths)]
+
+
+def _without_additions(latest: dict[tuple, RunRecord], specs: dict[str, ToolSpec]) -> dict | None:
+    """The app's additions that a tool's held runs ran without (_missing_additions), as `what`, such as "Glessner
+    additions", with the hosts of those runs; None when none did."""
+    missing = {(host, kind) for (host, _), record in latest.items() if record.tool in specs
+               for kind in _missing_additions(record, specs[record.tool])}
+    if not missing:
+        return None
+    kinds = sorted({kind for _, kind in missing})
+    return {"what": " and ".join(ADDITIONS[kind] for kind in kinds), "hosts": sorted({host for host, _ in missing})}
 
 
 def found_outputs(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],

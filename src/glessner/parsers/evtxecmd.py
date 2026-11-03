@@ -53,12 +53,34 @@ MAP_PACKAGE = "AuthenticationPackageName:"   # the part a 4624 map writes for th
 # it, as in "\u200e9/\u200e17/\u200e2020 9:43 AM". Elsewhere such marks can disguise a name, and the pages show them.
 DATE_MARKS = re.compile("[\u200e\u200f]")
 MARK = DATE_MARKS.pattern
-WORD = MARK + r"[^\W\d_]+"   # a weekday or a month
+# The date forms below are the ones Windows writes for the locales named, with a mark before each part. Only a weekday
+# or a month is any word; the words that join the parts are the few each form spells out.
+WORD = MARK + r"[^\W\d_]+(?:-[^\W\d_]+)?"   # a weekday or a month, such as quinta-feira
 DAY = MARK + r"\d{1,2}"
-NUMBERS = MARK + r"\d{1,4}[/.-]" + MARK + r"\d{1,2}[/.-]" + MARK + r"\d{1,4}"   # 9/17/2020, 17.09.2020, 2020-09-17
-WORDS = f"(?:{WORD},? )?(?:{DAY}\\.? {WORD}|{WORD} {DAY}),? {MARK}" + r"\d{4}"   # Wednesday, September 2, 2020
-TIME = r"(?:,? \d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?: ?[AaPp]\.?[Mm]\.?)?)?"
-MARKED_DATE = re.compile(f"(?:{NUMBERS}|{WORDS}){TIME}")   # a mark before each part of the date, none in the time
+YEAR = MARK + r"\d{4}"
+DOT_OR_SLASH = r"(?:[/-]|\. ?)"
+# What can end a date after its last number: a dot, as after hr-HR's year and hu-HU's day, or bg-BG's abbreviation
+# for year (Cyrillic ge and a dot)
+DATE_END = f"(?:\\.| {MARK}\u0433\\.)?"
+# 9/17/2020, 17.09.2020, 2020-09-17, 17.9.2020. (hr-HR), 17. 9. 2020 (sk-SK), 2020. 09. 17. (hu-HU)
+NUMBERS = MARK + r"\d{1,4}" + DOT_OR_SLASH + MARK + r"\d{1,2}" + DOT_OR_SLASH + MARK + r"\d{1,4}" + DATE_END
+# Wednesday, September 2, 2020 (en-US), jeudi 17 septembre 2020 (fr-FR), 17. rujna 2020. (hr-HR)
+WORDS = f"(?:{WORD},? )?(?:{DAY}\\.? {WORD}|{WORD} {DAY}),? {YEAR}{DATE_END}"
+DE = f"(?:{MARK} de | {MARK}de )"   # es-ES writes the mark before the space, es-419 after it
+# Before a month that starts with a vowel, ca-ES writes "d\u2019" in place of "de", as in "d\u2019octubre"
+DE_MONTH = f"(?:{DE}| {MARK}d\u2019)"
+ROMANCE = f"(?:{WORD},? )?{DAY}{DE_MONTH}{MARK}?[^\\W\\d_]+{DE}{YEAR}"   # jueves, 17 de septiembre de 2020
+# The year, month, and day, each followed by a mark and the character for it (ja-JP, zh-CN, zh-TW), or by the Korean
+# syllable for it and a space, then the weekday (ko-KR, with a mark before each syllable, and ko-KP, without)
+CJK = f"{YEAR}{MARK}\u5e74{MARK}\\d{{1,2}}{MARK}\u6708{DAY}{MARK}\u65e5"
+KOREAN = f"{YEAR}{MARK}?\ub144 {MARK}\\d{{1,2}}{MARK}?\uc6d4 {DAY}{MARK}?\uc77c {WORD}"
+# The time has no marks: 9:43 PM, 21:43:21, 9:43:21 p. m., with a space or a narrow no-break space before the AM or PM,
+# or with the AM or PM first, as ko-KR and zh-TW write it in their own words
+CLOCK = r"\d{1,2}:\d{2}(?::\d{2})?"
+DESIGNATOR = r"[AaPp]\.? ?[Mm]\.?"
+DESIGNATOR_FIRST = f"(?:{DESIGNATOR}|\uc624\uc804|\uc624\ud6c4|\u4e0a\u5348|\u4e0b\u5348)"
+TIME = f"(?: (?:{CLOCK}(?:[ \u202f]{DESIGNATOR})?|{DESIGNATOR_FIRST} {CLOCK}))?"
+MARKED_DATE = re.compile(f"(?:{NUMBERS}|{WORDS}|{ROMANCE}|{CJK}|{KOREAN}){TIME}")
 MAP_PART = re.compile(r"([A-Za-z][\w ]{0,40}: )(.*)", re.DOTALL)   # a map's "Label: value"
 # Windows' names for the rights a 5145 or 4663 lists as %% codes. EvtxECmd's map names a single code but writes
 # "Unknown code (%%1537 | %%4423 ...)" for a list, so these names are what tell a share's writes from its reads.
@@ -159,14 +181,22 @@ def parse_event_xml(ctx: ParseContext) -> Iterator[Event]:
 def event_from_row(row: dict[str, str], ctx: ParseContext, xml_reader: bool = False) -> Event:
     raw = row.get("Payload")
     fields = payload_fields(raw)
+    # Only a payload with a mark pays for the date check: written as the character, or as a JSON escape (\u200e).
+    marked = bool(raw) and ("\u200e" in raw or "\u200f" in raw or "\\u200" in raw)
     if not _decoded(row, xml_reader) and raw and "&" in raw:   # JSON leaves & as it is, so a payload without one holds no entity
         fields = {k: html.unescape(v) for k, v in fields.items()}
+        # A mark written as an entity, such as &#x200E;, is a character only once unescaped
+        marked = marked or any("\u200e" in v or "\u200f" in v for v in fields.values())
     unmarked: dict[str, str] = {}   # each value that lost its marks, as written, to the value as loaded
-    # Only a payload with a mark pays for the date check: written as the character, or as a JSON escape (\u200e).
-    if raw and ("\u200e" in raw or "\u200f" in raw or "\\u200" in raw):
+    if marked:
         provider = row.get("Provider", "")
         for name, value in fields.items():
-            plain = _unmarked_date(value) if _dated(name, provider) else value
+            if not _dated(name, provider):
+                continue
+            plain = _unmarked_date(value)
+            if plain == value and name == "Data":
+                # EvtxECmd joins unnamed values into one with ", ", such as an unexpected shutdown's time and date
+                plain = ", ".join(_unmarked_date(part) for part in value.split(", "))
             if plain != value:
                 fields[name] = unmarked[value] = plain
         # Text that another field keeps, marks and all, keeps them in the message too.

@@ -1,15 +1,27 @@
 """The report, the scoped exports, and Written from this case, in a real browser: the Summary written and saved,
-Preview with nothing written, Write report as the page's one lead button, each export card's scope and its file, the
-table of files written with the whole hash on hover, and the audit trail's cut of a long event name with the whole in
-its hover and the click through. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke
-does, and are skipped without it."""
+Preview with nothing written, Write report as the page's one lead button, off while its write is out, each export
+card's scope and its file, the table of files written with the whole hash on hover, and the audit trail's cut of a long
+event name with the whole in its hover and the click through. They drive the installed Microsoft Edge through
+Playwright, as test_browser_smoke does, and are skipped without it."""
 
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from conftest import SEC, T0
-from test_browser_smoke import HOST_BOX_CHECKED, browser, case_menu, filtered_view, served_page, view, window_text  # noqa: F401
+from test_browser_smoke import (  # noqa: F401
+    HOST_BOX_CHECKED,
+    RECORD_REQUESTS,
+    asked,
+    browser,
+    case_menu,
+    filtered_view,
+    served_page,
+    view,
+    wait_held,
+    window_text,
+)
 from test_report import LONG
 
 from glessner.journal import JOURNAL_FILE
@@ -132,6 +144,29 @@ def test_the_summary_is_saved_previewed_and_the_report_written(browser, syntheti
         assert p.locator("#caseState").inner_text().startswith("Open · ")   # the header's line was read again after the re-hash
 
 
+def test_a_second_click_on_write_report_while_its_write_is_out_writes_nothing(browser, synthetic_case):  # noqa: F811
+    """With /api/report held, Write report is disabled from the click and the line under it says the report is being
+    written, and a click on the disabled button sends no second request. Once the write answers, the line names the
+    file, the button is enabled again, and the journal holds one report."""
+    for p in served_page(browser, synthetic_case):
+        open_findings(p)
+        write = p.locator("#details .exports-col").get_by_role("button", name="Write report (Markdown)")
+        p.evaluate(RECORD_REQUESTS)
+        held = []
+        reports = lambda url: urlsplit(url).path == "/api/report"
+        p.route(reports, lambda route: held.append(route))   # noqa: B023
+        write.click()
+        wait_held(p, held)
+        assert write.is_disabled() and p.locator(RESULT).inner_text() == "Writing the report…"
+        write.click(force=True)
+        assert asked(p, "/api/report") == ["/api/report"]
+        held[0].continue_()
+        wrote(p, "Wrote the report (")
+        p.unroute(reports)
+        assert write.is_enabled()
+        assert [e["kind"] for e in entries(synthetic_case) if e["action"] == "file_written"] == ["report"]
+
+
 def test_the_exports_state_their_scope_and_write_their_files(browser, synthetic_case):  # noqa: F811
     """Each card names its scope and contents before the click: Marked events the whole case, Events in the window
     the window shown with the events in it, Indicators the Malicious marks, Audit trail the whole journal. Each click
@@ -155,9 +190,10 @@ def test_the_exports_state_their_scope_and_write_their_files(browser, synthetic_
         for timeline in (marked, window):
             assert timeline.locator(".export-what").inner_text().endswith(
                 f" · in CSV, {cells}; JSONL keeps values as written")
-        assert ("a network record's signature, community ID, URL, DNS and TLS names, and a DHCP client's MAC address · "
-                "each event's mark") in marked.inner_text()
-        assert indicators.locator(".export-what").inner_text().endswith(f" · read from parsed fields only · {cells}")
+        assert ("a network record's signature, community ID, Suricata flow ID, Zeek uid, URL, DNS and TLS names, and a "
+                "DHCP client's MAC address · each event's mark") in marked.inner_text()
+        assert indicators.locator(".export-what").inner_text().endswith(
+            f" · read from parsed fields only, with a note on a Windows system folder file · {cells}")
         assert "formula" not in audit.inner_text()
         marked.get_by_role("button", name="CSV").click()
         result = wrote(p, "Wrote 2 events to ")

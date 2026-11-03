@@ -1201,7 +1201,10 @@ def loaded_as_output(case: Case, runs: list | None = None) -> dict[str, dict]:
 def importable(case: Case, include_unidentified: bool = False) -> list[dict]:
     """Evidence files the import reads: text logs, identified at intake or read again since (intake.current_entries),
     such as unidentified files from a case taken in before the import existed, and, on request, every other
-    unidentified file. A file loaded as found output says so in `loaded`, and the import refuses it."""
+    unidentified file. A file loaded as found output says so in `loaded`, and the import refuses it. A case with no
+    manifest, which intake hasn't run on yet, has none."""
+    if not case.manifest_path.exists():
+        return []
     runs = read_runs(case)
     imports = {r.inputs[0]: r for r in runs if r.tool == TOOL and r.status == "ok"}
     loaded = loaded_as_output(case, runs)

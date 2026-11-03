@@ -1,9 +1,11 @@
 """The Overview's note on a host's events outside its span, and bidi controls on the pages that carry the report's and the
 case's text, in a real browser. A host's span leaves out a time no run could have read; the note beside it counts those
-events with their dates. The header's line and its hover, the Overview (host names, Integrity's hover of changed files),
-the Tools page's found output, and the Export preview show each bidi control as a visible [U+XXXX], as the pages
+events with their dates. The header's case name, line, and hovers, the Overview (host names, Integrity's hover of changed
+files), the Tools page's found output, and the Export preview show each bidi control as a visible [U+XXXX], as the pages
 test_browser_bidi covers do. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke does, and
 are skipped without it."""
+
+import shutil
 
 import pytest
 from test_browser_bidi import MIXED, NAME, RLO, USER, mixed_case, raw_controls, shown
@@ -13,6 +15,7 @@ from test_browser_smoke import browser, case_menu, served_page  # noqa: F401
 from test_overview import RUN, STRAY, run_record, timed
 from test_tool_outputs import EVTX_COLUMNS, evtx_rows, write_rows
 
+from glessner.case import create_case
 from glessner.events import connect, to_us
 from glessner.intake import intake, verify
 from glessner.server import api_mark, api_setting
@@ -54,7 +57,7 @@ def test_the_overview_draws_a_note_beside_the_span_of_a_host_with_events_outside
                                              "1 event dated 3320-11-16, outside the rest")
         assert span("DESKTOP").inner_text() == ("2020-09-19 02:21:48 to 2020-09-19 03:36:58\n"
                                                 "2 events outside the rest, dated 1980-01-01 to 3320-11-16")
-        assert "before 1990 or more than a day after the newest tool run" in span("DC01").locator(".muted").get_attribute("title")
+        assert "before 1990 or more than a day after the newest run, " in span("DC01").locator(".muted").get_attribute("title")
         assert p.locator("#ovHosts tr[data-host='DC01'] td").nth(3).inner_text() == "8"   # the events counted still hold it
         assert raw_controls(p) == []
 
@@ -86,6 +89,21 @@ def test_the_tools_page_shows_found_output_s_host_and_file_names_with_bidi_contr
         row = p.locator("#details .tools-outputs tbody tr").first
         assert row.locator("td").nth(2).inner_text() == f"1 file, on {shown(host)}"
         assert row.locator("td").first.get_attribute("title") == f"{shown(host)}/{path}"
+        assert raw_controls(p) == []
+
+
+def test_the_header_names_a_case_with_its_bidi_control_as_a_code_point(browser, tmp_path, synthetic_events):  # noqa: F811
+    """A case made elsewhere can carry any name in its case.yaml. The header writes a right-to-left override in the name
+    as [U+202E], in the name and in its hover."""
+    name = f"Case {NAME}"
+    for host in ("DC01", "DESKTOP"):
+        (tmp_path / "evidence" / host).mkdir(parents=True)
+    case = create_case(tmp_path / "case", name, tmp_path / "evidence", "cody")
+    shutil.copyfile(synthetic_events, case.db_path)
+    for p in served_page(browser, case, tab="overview", setup=no_tool_scan):
+        header = p.locator("#caseName")
+        assert header.inner_text() == shown(name)
+        assert header.get_attribute("title") == shown(name)
         assert raw_controls(p) == []
 
 

@@ -1,8 +1,12 @@
 """Runs one tool at a time against a host's evidence and records everything about the run.
 
 Each run gets a fresh folder under runs/ holding run.json, stdout.txt, stderr.txt, and the
-tool's output. After the tool exits, the runner checks that every expected output exists,
-re-hashes the evidence files the run read, and loads the output through the tool's parser.
+tool's output, which includes any batch file or maps folder the run composes for the tool from
+the tool's own and the app's (composed_files). After the tool exits, the runner checks that
+every expected output exists, re-hashes the run's inputs, the host's files named by
+ToolSpec.related, and the files beside the inputs that a without_related entry covers
+(read_beside), and loads the output through the tool's parser. A file the tool reads on its own
+isn't re-hashed.
 """
 
 from __future__ import annotations
@@ -11,33 +15,42 @@ import csv
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
 from contextlib import closing, suppress
 from dataclasses import MISSING, asdict, dataclass, field, fields, replace
 from datetime import UTC, datetime
+from itertools import pairwise
 from pathlib import Path, PureWindowsPath
+from typing import NamedTuple
 
 import duckdb
+import yaml
 
-from .case import CASE_FILE, Case, CaseError, check_outside_evidence, write_atomically
+from .case import CASE_FILE, Case, CaseError, check_outside_evidence, upgrading, utc_now, write_atomically
 from .events import SeenSources, connect, load
 from .intake import NOT_IN_MANIFEST, current_entries, placeholders_among, sha256_file, verify, walk_evidence
 from .journal import host_layout
 from .long_paths import long_path
 from .parsers import COUNTS_SKIPPED, LOCAL_TIME, PARSERS, ParseContext
-from .parsers.common import LOCAL_TIME_NOTE, SKIPPED_NOTE
+from .parsers.common import DETAILS_NOTE, LOCAL_TIME_NOTE, SKIPPED_NOTE, evidence_relative
 from .parsers.sbecmd import CONSOLE_LOG, MESSAGES
 from .timezones import ZoneError, fmt_offset, host_timezones, resolve_zone
+from .tool_outputs import KINDS
 from .tools import DetectedTool, ToolSpec, load_registry, rules_file, rules_label, rules_version, tool_env, tool_listing
 from .tools_manifest import check_tool
 from .version import build_id
 
 RUN_FILE = "run.json"
 IMPORT = "import"   # the tool and parser name of an import (imports.py), which reads evidence instead of output
-PLACEHOLDERS = ("{host_dir}", "{input_file}", "{input_list}", "{output_dir}", "{tool_dir}", "{value}")
+PLACEHOLDERS = ("{batch_file}", "{host_dir}", "{input_file}", "{input_list}", "{maps_dir}", "{output_dir}", "{tool_dir}",
+                "{value}")
 INPUT_LIST = "inputs.txt"   # {input_list}: the run's input files, one full path per line, in the run folder
+# What a registry entry's compose entries write in the run's output folder, by kind (tools.COMPOSE_KINDS), where the
+# runner hashes them with the tool's output; args name each by its kind as a placeholder, such as {batch_file}
+COMPOSED = {"batch_file": "composed_batch.reb", "maps_dir": "composed_maps"}
 
 
 class RunError(Exception):
@@ -131,6 +144,17 @@ def records_format_4(case: Case) -> bool:
     return case.settings.case_format >= 4
 
 
+def names_found_output_as_format_4(case: Case) -> bool:
+    """Whether a load of found output names each file by its path under the resolved evidence root and replaces the rows
+    an earlier load under a link left (events.SeenSources.inputs): in a case at format 4 or later, and in an upgrade's
+    steps (case.upgrading). A case kept below format 4, as one whose journal is read-only is, names them as its own
+    format's builds did, against the evidence path as case.yaml writes it. Of those rows it replaces a run's whole when
+    it reads every file of that run, and otherwise only the ones that name a file it reads by that same name
+    (load_output). A file then keeps the name and IDs its rows have, and the step from 3 to 4 still finds and rekeys
+    them."""
+    return records_format_4(case) or upgrading()
+
+
 def plan_runs(case: Case, tool: DetectedTool, hosts: list[str] | None = None) -> list[RunPlan]:
     """One plan per host (host_dir tools) or per matching file (each_file tools)."""
     by_host: dict[str, list[str]] = {}
@@ -153,9 +177,7 @@ def _unselected(spec: ToolSpec, paths: list[str]) -> tuple[str, ...]:
     of them, without regard to case."""
     if not spec.selects:
         return ()
-    patterns = [pattern.lower() for pattern in spec.selects]
-    return tuple(path for path in paths
-                 if not any(fnmatch.fnmatchcase(path.rsplit("/", 1)[-1].lower(), p) for p in patterns))
+    return tuple(path for path in paths if not _fits(path.rsplit("/", 1)[-1], spec.selects))
 
 
 def handles(spec: ToolSpec, artifact: str | None, detail: str) -> bool:
@@ -170,7 +192,9 @@ def _matches(patterns: tuple[str, ...], artifact: str | None, detail: str) -> bo
 
 def build_argv(case: Case, plan: RunPlan, output_dir: Path, options: dict[str, str],
                input_root: Path | None = None) -> list[str]:
-    """The tool's argument list. With input_root, the tool reads the working copies there instead of the evidence."""
+    """The tool's argument list. With input_root, the tool reads the working copies there instead of the evidence. A
+    compose entry's placeholder, such as {batch_file}, names its file in output_dir (COMPOSED), which run writes once
+    the folder is made; a placeholder with no compose entry is refused, as any placeholder without a value is."""
     spec = plan.tool.spec
     base = input_root or case.evidence
     host_dir = (base if case.settings.single_host else base / plan.host) if input_root else case.host_dir(plan.host)
@@ -180,6 +204,7 @@ def build_argv(case: Case, plan: RunPlan, output_dir: Path, options: dict[str, s
         "{input_list}": str(output_dir.parent / INPUT_LIST),
         "{output_dir}": str(output_dir),
         "{tool_dir}": str(plan.tool.executable.parent),
+        **{f"{{{kind}}}": str(output_dir / COMPOSED[kind]) for kind in spec.compose},
     }
     args = [_fill(a, values, spec) for a in spec.args]
     for rel in spec.related:   # another of the host's files, such as $MFT for MFTECmd reading $J
@@ -222,13 +247,14 @@ def related_files(case: Case, plan: RunPlan, artifact: str) -> list[str]:
     return sorted(found, key=lambda path: (-path.count("/"), path))[:1]   # the deepest folder is the nearest
 
 
-def files_beside(case: Case, plan: RunPlan, artifact: str) -> dict[str, list[str]]:
-    """Each of the plan's inputs with the files of an artifact beside it: those in the input's folder named for it with
-    .log after its name, as a hive's transaction logs are (NTUSER.DAT.LOG1), without regard to case. An input with none
-    has an empty list."""
+def files_beside(case: Case, plan: RunPlan, artifact: str | None = None) -> dict[str, list[str]]:
+    """Each of the plan's inputs with the files beside it: those in the input's folder named for it with .log after its
+    name, as a hive's transaction logs are (NTUSER.DAT.LOG1), without regard to case. With `artifact`, only the files
+    intake identified as that artifact and read without an error; without it, every file intake listed there, whatever
+    it is. An input with none has an empty list."""
     in_folder: dict[str, list[str]] = {}
     for e in current_entries(case):
-        if e.artifact == artifact and not e.error:
+        if artifact is None or (e.artifact == artifact and not e.error):
             in_folder.setdefault(e.path.rpartition("/")[0], []).append(e.path)
     beside = {}
     for path in plan.inputs:
@@ -245,13 +271,16 @@ def inputs_without(case: Case, plan: RunPlan, artifact: str) -> list[str]:
 
 def read_beside(case: Case, plan: RunPlan) -> list[str]:
     """The files the tool reads beside the plan's inputs because build_argv left out the arguments of a without_related
-    entry, which it does when every input has a file of the entry's artifact beside it (files_beside): those files, as
-    sorted evidence-relative paths. A run's inputs don't list them, and the evidence check after the run covers them."""
+    entry, which it does when every input has a file of the entry's artifact beside it (files_beside), as sorted
+    evidence-relative paths. The tool may then read any file named for an input with .log after its name, so these are
+    all such files intake listed, whatever it identified them as: a hive's zeroed NTUSER.DAT.LOG2, which intake leaves
+    unidentified, is read with its signed NTUSER.DAT.LOG1. A run's inputs don't list them, and the evidence check after
+    the run covers them. A tool whose registry entry has no without_related entry gets none, whatever it reads beside
+    its inputs on its own."""
     read = set()
     for entry in plan.tool.spec.without_related:
-        beside = files_beside(case, plan, entry["artifact"])
-        if all(beside.values()):
-            read.update(path for found in beside.values() for path in found)
+        if all(files_beside(case, plan, entry["artifact"]).values()):
+            read.update(path for found in files_beside(case, plan).values() for path in found)
     return sorted(read)
 
 
@@ -331,9 +360,10 @@ def cloud_placeholders_text(paths: list[str], reader: str = "the tool", hashed: 
 
 
 def evidence_read(case: Case, plan: RunPlan) -> list[str]:
-    """The evidence files a run of the plan has its tool read, without repeats: its inputs, the host's file of each
-    ToolSpec.related entry (related_files), the files beside its inputs that it reads (read_beside), and, for a tool that
-    works on copies, the files it copies with its inputs (_copy_also)."""
+    """The evidence files a run of the plan has its tool read, as its registry entry names them, without repeats: its
+    inputs, the host's file of each ToolSpec.related entry (related_files), the files beside its inputs that a
+    without_related entry covers (read_beside), and, for a tool that works on copies, the files it copies with its
+    inputs (_copy_also)."""
     spec = plan.tool.spec
     paths = [*plan.inputs, *read_beside(case, plan)]
     for entry in spec.related:
@@ -344,12 +374,24 @@ def evidence_read(case: Case, plan: RunPlan) -> list[str]:
 
 
 def check_not_placeholders(case: Case, plan: RunPlan, paths: list[str]) -> None:
-    """Refuse a run that would read a file that is a cloud placeholder now but was an ordinary file when intake hashed
-    it: the tool would download it, and no record would show the download. It reads the files' attributes and opens no
-    file."""
-    if placeholders := placeholders_among(case, paths):
-        raise RunError(f"{plan.tool.spec.name} wasn't run on {plan.host}: it reads files that intake hashed before they "
-                       f"became cloud placeholders. {cloud_placeholders_text(placeholders, hashed=True)}")
+    """Refuse a run when one of `paths`, evidence files the run would read, is a cloud placeholder now: the tool would
+    download it, and no record would show the download. A placeholder that intake never hashed, such as a log beside a
+    hive that intake recorded as one, is reported apart from one that intake hashed before it became one. It reads the
+    files' attributes and opens no file."""
+    if not (found := placeholders_among(case, paths)):
+        return
+    hashed = {e.path for e in current_entries(case) if not e.error}
+    never = [path for path in found if path not in hashed]
+    became = [path for path in found if path in hashed]
+    text = f"{plan.tool.spec.name} wasn't run on {plan.host}: it reads " + (
+        "files that intake never hashed." if never else "files that intake hashed before they became cloud placeholders.")
+    if never:
+        text += f" {cloud_placeholders_text(never)}"
+    if became:
+        if never:
+            text += " It also reads files that intake hashed before they became cloud placeholders."
+        text += f" {cloud_placeholders_text(became, hashed=True)}"
+    raise RunError(text)
 
 
 def check_selected(plan: RunPlan) -> None:
@@ -371,17 +413,169 @@ def _paths(paths: list[str]) -> str:
     return "; ".join(paths[:SHOWN]) + more
 
 
+def composed_files(spec: ToolSpec, exe: Path) -> dict[str, bytes | Path]:
+    """What the registry entry's compose entries write in a run's output folder, by their paths there (COMPOSED): for a
+    batch_file, the tool's batch file with the app's entries after its own (compose_batch), as bytes; for a maps_dir,
+    the files of the tool's folder and then the app's, each as the file to copy. RunError naming the file or folder
+    that is missing or can't be read or composed."""
+    files: dict[str, bytes | Path] = {}
+    for kind, entry in spec.compose.items():
+        source = exe.parent / entry.tool
+        if kind == "batch_file":
+            base, additions = _batch_text(source), _batch_text(entry.app)
+            try:
+                files[COMPOSED[kind]] = compose_batch(base, additions).encode("utf-8")
+            except ValueError as exc:
+                raise RunError(f"its batch file can't be composed from {source} and {entry.app}: {exc}") from exc
+        else:
+            files |= {f"{COMPOSED[kind]}/{rel}": path for rel, path in _composed_folder(source, entry.app).items()}
+    return files
+
+
+def _batch_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise RunError(f"{path} can't be read, so its batch file can't be composed: {exc.strerror or exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise RunError(f"{path} isn't UTF-8 text, so its batch file can't be composed") from exc
+
+
+KEYS_LINE = re.compile(r"Keys:[ \t]*(?:#.*)?")   # a batch file's top-level key for its list of entries
+ITEM = re.compile(r"( *)-(?:\s|$)")   # a line that starts an item of a YAML list, with its indentation
+
+
+def compose_batch(base: str, additions: str) -> str:
+    """A RECmd batch file's text: `base`'s, such as DFIRBatch.reb's, then what `additions`, another batch file, holds
+    after its Keys: line, its comments and its entries, indented as base's entries are. base's text is kept as it is,
+    apart from each entry with an addition's hive type, key path, and value name, which is left out. They compare
+    without case, as Windows compares key and value names, and as DFIRBatch.reb writes both NTUSER and NtUser. An
+    addition's description is part of the event IDs of its rows, so when a later base adopts an addition's value, the
+    rows keep their IDs. Either may have an empty Keys list. ValueError when either text isn't a batch file whose
+    entries can be told apart line by line, or when the result doesn't read back as base's entries that are kept, in
+    their order, and then the additions."""
+    tool, app = _batch_parts(base, "the tool's batch file"), _batch_parts(additions, "the app's additions")
+    taken = {_entry_key(entry) for entry, _ in app.entries}
+    kept = [(entry, text) for entry, text in tool.entries if _entry_key(entry) not in taken]
+    shift = _indent(tool) - _indent(app) if tool.entries and app.entries else 0
+    composed = "".join([tool.head, tool.intro, *(text for _, text in kept),
+                        _shifted(app.intro + "".join(text for _, text in app.entries), shift)])
+    if _batch_keys(composed) != [entry for entry, _ in [*kept, *app.entries]]:
+        raise ValueError("the composed text doesn't read back as the tool's entries followed by the app's")
+    return composed
+
+
+class BatchParts(NamedTuple):
+    """A batch file's text in parts: through its Keys: line, then up to its first entry, and each entry as read and as
+    written, from the line that starts it to the next one's, so that comments between two entries go with the first."""
+    head: str
+    intro: str
+    entries: list[tuple[dict, str]]
+
+
+def _batch_parts(text: str, what: str) -> BatchParts:
+    """A batch file's parts. An entry starts at a line that starts a list item at the indentation of the first one
+    after the Keys: line. With an empty Keys list, the part before the first entry runs to the end of the text, and
+    there are no entries. ValueError when the text isn't YAML with a Keys list whose entries are on the lines below its
+    Keys: line, or its lines don't start as many entries as the list holds."""
+    entries = _batch_keys(text, what)
+    lines = _lines(text)
+    keys_line = next((n for n, line in enumerate(lines) if KEYS_LINE.fullmatch(line.rstrip("\n"))), None)
+    if keys_line is None:
+        raise ValueError(f"{what} has no top-level Keys: line with its entries on the lines below it")
+    starts, indent = [], None
+    for n, line in enumerate(lines[keys_line + 1:], keys_line + 1):
+        if (match := ITEM.match(line)) and indent in (None, match.group(1)):
+            indent = match.group(1)
+            starts.append(n)
+    if len(starts) != len(entries):
+        raise ValueError(f"{what} has {len(entries):,} entries under Keys, but {len(starts):,} lines start one")
+    bounds = [*starts, len(lines)]
+    parts = [(entry, "".join(lines[start:end])) for entry, (start, end) in zip(entries, pairwise(bounds), strict=True)]
+    return BatchParts("".join(lines[:keys_line + 1]), "".join(lines[keys_line + 1:bounds[0]]), parts)
+
+
+def _batch_keys(text: str, what: str = "the composed text") -> list:
+    """A batch file's Keys list, [] for an empty one. ValueError when the text isn't YAML or has no Keys list."""
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{what} can't be read as YAML: {str(exc).splitlines()[0]}") from exc
+    keys = data.get("Keys") if isinstance(data, dict) else None
+    if keys is None and isinstance(data, dict) and "Keys" in data:
+        return []
+    if not (isinstance(keys, list) and all(isinstance(entry, dict) for entry in keys)):
+        raise ValueError(f"{what} has no Keys list of entries")
+    return keys
+
+
+def _lines(text: str) -> list[str]:
+    """Text's lines, split at each line feed, each ending in one, the last one too."""
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return [f"{line}\n" for line in lines]
+
+
+def _entry_key(entry: dict) -> tuple[str, ...]:
+    return tuple(str(entry.get(name) or "").casefold() for name in ("HiveType", "KeyPath", "ValueName"))
+
+
+def _indent(parts: BatchParts) -> int:
+    """How far a batch file's entries are indented: the spaces before the - that starts its first."""
+    return len(ITEM.match(parts.entries[0][1]).group(1))
+
+
+def _shifted(text: str, shift: int) -> str:
+    """Text with each line that isn't blank moved `shift` spaces right, or left as far as its leading spaces go."""
+    if shift >= 0:
+        return "".join(" " * shift + line if line.strip() else line for line in _lines(text))
+    return "".join(line[min(-shift, len(line) - len(line.lstrip(" "))):] for line in _lines(text))
+
+
+def _composed_folder(tool: Path, app: Path) -> dict[str, Path]:
+    """The files of a composed folder, by their paths in it with forward slashes, each with the file it is copied from:
+    the tool folder's files, then the app's. Links are skipped, as a run's tool_files skip them. RunError naming a
+    folder that is missing or can't be listed, and an app file whose path is one of the tool's, compared without case
+    as Windows compares names."""
+    files: dict[str, Path] = {}
+    for folder in (tool, app):
+        unreadable: list[tuple[str, str]] = []
+        listed = {rel: folder / rel for rel in walk_evidence(folder, unreadable=unreadable)} if folder.is_dir() else {}
+        if not folder.is_dir() or unreadable:
+            raise RunError(f"{folder} can't be listed, so its maps folder can't be composed")
+        taken = {rel.casefold() for rel in files}
+        if clash := next((rel for rel in listed if rel.casefold() in taken), None):
+            raise RunError(f"{app / clash} has the name of one of the files in {tool}, so its maps folder can't be "
+                           "composed")
+        files |= listed
+    return files
+
+
+def _write_composed(output_dir: Path, files: dict[str, bytes | Path]) -> None:
+    for rel, content in files.items():
+        target = output_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        else:
+            shutil.copyfile(content, target)
+
+
 def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> RunRecord:
     """Run a tool on its plan's evidence, check its output and the evidence, load the output, and record it all in the
-    run's folder. The evidence check covers the run's inputs and the files the tool reads beside them (read_beside). In
-    a case at format 4 the record holds the SHA-256 of the tool's files (tools.tool_listing), with a note naming any link
-    in their folders that the hashes leave out, the check of those files against the tool's pin
-    (tools_manifest.check_tool, which never refuses a run), and the rule set as named when the run starts
-    (tools.rules_label). Refused before anything is made: RunError when the tool can't run here, would read none of its
-    inputs, as its name patterns select files (check_selected), has arguments that can't be filled, has a host folder
-    that holds what intake didn't hash, or a file that became a cloud placeholder after it (check_host_folder), would
-    read a file that became a cloud placeholder after intake (check_not_placeholders), or, in a case at format 4, has a
-    file tools.tool_listing can't hash; CaseError for a run folder that can't be made safely (_new_run_folder)."""
+    run's folder. The evidence check covers the run's inputs and the files beside them that the tool's registry entry
+    declares (read_beside). A file the tool reads beside them on its own isn't checked. In a case at format 4 the record
+    holds the SHA-256 of the tool's files (tools.tool_listing), with a note naming any link in their folders that the
+    hashes leave out, the check of those files against the tool's pin (tools_manifest.check_tool, which never refuses a
+    run), and the rule set as named when the run starts (tools.rules_label). The files of the registry entry's compose
+    entries (composed_files) are written into the output folder before the tool starts, and hashed with its output.
+    Refused before anything is made: RunError when the tool can't run here, would read none of its inputs, as its name
+    patterns select files (check_selected), has arguments that can't be filled, has a host folder that holds what intake
+    didn't hash, or a file that became a cloud placeholder after it (check_host_folder), would read a file its registry
+    entry names that is a cloud placeholder (check_not_placeholders), has a compose entry whose file or folder is
+    missing or can't be composed, or, in a case at format 4, has a file tools.tool_listing can't hash; CaseError for a
+    run folder that can't be made safely (_new_run_folder)."""
     spec = plan.tool.spec
     if plan.tool.missing:
         raise RunError(f"{spec.name} can't run here: {plan.tool.missing}.")
@@ -407,6 +601,10 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         rules = rules_label(spec, plan.tool.executable, hashes)
     else:
         rules = rules_version(spec, plan.tool.executable)
+    try:
+        composed = composed_files(spec, plan.tool.executable)
+    except RunError as exc:
+        raise RunError(f"{spec.name} wasn't run on {plan.host}: {exc}") from exc
     output_dir.mkdir(parents=True)
     related, notes = [], []
     for rel in spec.related:
@@ -418,9 +616,9 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
     for entry in spec.without_related:
         if lacking := inputs_without(case, plan, entry["artifact"]):
             one = len(lacking) == 1
-            notes.append(f"Ran with {' '.join(entry.get('args', []))}, so {spec.name} skipped the transaction logs of every "
-                         f"hive on this host: {_paths(lacking)} {'has' if one else 'have'} none beside "
-                         f"{'it' if one else 'them'}.")
+            hives = "every hive on this host" if spec.input == "host_dir" else "its hive"
+            notes.append(f"Ran with {' '.join(entry.get('args', []))}, so {spec.name} skipped the transaction logs of "
+                         f"{hives}: {_paths(lacking)} {'has' if one else 'have'} none beside {'it' if one else 'them'}.")
     if plan.left_out:
         one = len(plan.left_out) == 1
         notes.append(f"{_files(len(plan.left_out))} that intake identified for {spec.name} {'was' if one else 'were'} not "
@@ -434,7 +632,7 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
                        executable=str(plan.tool.executable), host=plan.host, argv=argv,
                        cwd=str(folder if spec.run_in_run_folder else plan.tool.executable.parent),
                        inputs=[*plan.inputs, *related], notes=notes,
-                       started_utc=_utc_now(), parser=spec.parser or "", dotnet_root=plan.tool.dotnet_root,
+                       started_utc=utc_now(), parser=spec.parser or "", dotnet_root=plan.tool.dotnet_root,
                        rules=rules, evidence_root=str(case.evidence), input_root=str(copies_root or ""),
                        tool_files=hashes, tool_check=tool_check)
     if copies_root is not None:
@@ -443,6 +641,11 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         except (OSError, RunError) as exc:
             record.reason = f"could not make working copies: {exc}"
     _write_record(folder, record)   # before the input list, so a run that fails to write it still has its record
+    if not record.reason:
+        try:
+            _write_composed(output_dir, composed)
+        except OSError as exc:
+            record.reason = f"could not write the composed files: {exc}"
     if not record.reason and any("{input_list}" in a for a in spec.args):   # exactly the files the evidence check covers
         base = copies_root or case.evidence
         listing = "".join(f"{base / p}\n" for p in plan.inputs)
@@ -463,7 +666,7 @@ def run(case: Case, plan: RunPlan, options: dict[str, str] | None = None) -> Run
         except OSError as exc:
             record.reason = f"could not start: {exc}"
     record.seconds = round(time.perf_counter() - t0, 2)
-    record.finished_utc = _utc_now()
+    record.finished_utc = utc_now()
     if record.working_copies:
         record.working_copy_changes = _changed_copies(case, copies_root, record.working_copies)
 
@@ -504,8 +707,13 @@ def load_output(case: Case, record: RunRecord, folder: Path, layout: dict[str, d
     t0 = time.perf_counter()
     ctx = parse_context(case, record, folder)
     routes = (host_layout(case) if layout is None else layout).get(record.host)
+    replaces = list(record.inputs)
+    if record.from_output and not names_found_output_as_format_4(case):
+        # The name its events give each file it reads, the whole extended-length path under a link, as the rows of an
+        # earlier load of that file have it
+        replaces += [evidence_relative(str(path), ctx.evidence_root) for path in ctx.files]
     result = load(case.db_path, parser(ctx), host=record.host, tool=record.tool, tool_version=record.tool_version,
-                  run_id=record.run_id, replaces_sources=record.inputs, staging_dir=folder,
+                  run_id=record.run_id, replaces_sources=replaces, staging_dir=folder,
                   replace_seen_sources=seen_sources(case, record) if record.from_output else None, routes=routes)
     record.loaded_rows = result.rows
     record.replaced_rows = result.replaced
@@ -516,10 +724,11 @@ def load_output(case: Case, record: RunRecord, folder: Path, layout: dict[str, d
     # Replaced on each load, so a rebuild doesn't repeat them: the parser's own, such as the offset Autoruns' local
     # times were read at, which it notes only when it read one, and the count of events without a
     # time, since nothing on the page shows one: Autoruns entries without one mustn't vanish silently. Also the count
-    # of lines or rows a parser made no event of (SKIPPED_NOTE), and of a found output's rows left out because a run of
-    # the tool loaded the files they name itself (READ_ITSELF_NOTE).
-    record.notes = [n for n in record.notes
-                    if not (n.startswith((LOCAL_TIME_NOTE, SKIPPED_NOTE)) or n.endswith((NO_TIME_NOTE, READ_ITSELF_NOTE)))]
+    # of lines or rows a parser made no event of (SKIPPED_NOTE), what RECmd's plugin CSVs added (DETAILS_NOTE), and the
+    # count of a found output's rows left out because a run of the tool loaded the files they name itself
+    # (READ_ITSELF_NOTE).
+    record.notes = [n for n in record.notes if not (n.startswith((LOCAL_TIME_NOTE, SKIPPED_NOTE, DETAILS_NOTE))
+                                                    or n.endswith((NO_TIME_NOTE, READ_ITSELF_NOTE)))]
     record.notes += ctx.notes
     if result.without_time:
         n = result.without_time
@@ -550,15 +759,18 @@ def seen_sources(case: Case, record: RunRecord) -> SeenSources:
     out. That goes by the rows the database holds, not by the run's inputs: a run that a rebuild left out holds none,
     nor does a run for an input its tool skipped. A rebuild loads the runs in the order they were made, so a load finds
     the rows of the tool's runs made before it that the rebuild loaded, and a tool's run made after it replaces the
-    found rows naming its inputs, as it replaces its own on a rerun."""
+    found rows naming its inputs, as it replaces its own on a rerun. In a case kept below format 4, the rows that name a
+    file by its extended-length path are replaced whole, or by the name the load gives a file it reads (load_output,
+    names_found_output_as_format_4)."""
     runs = [r for r in read_runs(case) if (r.tool, r.host) == (record.tool, record.host)]
     found = [r for r in runs if r.from_output]
     inputs = set(record.inputs)
+    read = {r.run_id: tuple(r.inputs) for r in (*found, record)} if names_found_output_as_format_4(case) else {}
     return SeenSources(runs=frozenset({record.run_id, *(r.run_id for r in found)}),
                        superseded=frozenset({record.run_id, *(r.run_id for r in found if set(r.inputs) <= inputs)}),
                        folder="" if case.settings.single_host else record.host,
                        direct=frozenset(r.run_id for r in runs if not r.from_output),
-                       inputs={r.run_id: tuple(r.inputs) for r in (*found, record)}, root=evidence_root_name(case))
+                       inputs=read, root=evidence_root_name(case))
 
 
 def parse_context(case: Case, record: RunRecord, folder: Path, former: int = 0) -> ParseContext:
@@ -568,21 +780,27 @@ def parse_context(case: Case, record: RunRecord, folder: Path, former: int = 0) 
     # that ends in a dot or runs past 260 characters opens its own file. Its events name the files the tool read, which
     # they replace. Its evidence root is the resolved one the files are opened under, since the case may keep the
     # evidence by a junction, a substituted drive, or a mapped one, which a resolved file path doesn't start with;
-    # evidence_relative reads a found file's path and the root each in its plain form.
-    files = ()
+    # evidence_relative reads a found file's path and the root each in its plain form. A case kept below format 4 keeps
+    # the evidence path as case.yaml writes it as the root (names_found_output_as_format_4), so under a link its events
+    # name each file by its whole path, as its rows from earlier loads do.
+    # The files beside found output that intake hashed and its parser may read too (detail_files) are opened the same
+    # way.
+    files, beside = (), ()
     evidence = Path(record.evidence_root) if record.evidence_root else case.evidence   # as the output names it
     if record.from_output:
-        evidence = long_path(case.evidence)
-        files = tuple(long_path(evidence, p) for p in record.inputs)
+        resolved = long_path(case.evidence)
+        files = tuple(long_path(resolved, p) for p in record.inputs)
+        beside = tuple(long_path(resolved, p) for p in detail_files(case, record))
+        evidence = resolved if names_found_output_as_format_4(case) else case.evidence
     return ParseContext(folder / "output", evidence, tuple(record.inputs), files, record.zone, record.input_root,
-                        former=former)
+                        former=former, beside=beside)
 
 
 def read_runs(case: Case) -> list[RunRecord]:
-    """Every run's record, oldest first. A run.json that isn't a JSON object, lacks a key every record has, has a key
-    RunRecord doesn't declare (written by a newer build), or has a format 4 key that is neither null nor of its shape
-    (_misshapen) is refused by name, as open_case refuses a setting, rather than failing as a TypeError on a page or
-    carrying the value into a rewrite."""
+    """Every run's record, oldest first. A run.json that doesn't parse as JSON in UTF-8, isn't a JSON object, lacks a key
+    every record has, has a key RunRecord doesn't declare (written by a newer build), or has a format 4 key that is
+    neither null nor of its shape (_misshapen) is refused by name, as open_case refuses a setting, rather than failing
+    with the decoder's message alone or as a TypeError on a page, or carrying the value into a rewrite."""
     return [_read_record(path) for path in sorted(case.runs_folder.glob(f"*/{RUN_FILE}"))]
 
 
@@ -597,8 +815,12 @@ def read_run(case: Case, run_id: str) -> RunRecord | None:
 
 def _read_record(path: Path) -> RunRecord:
     """A run.json's record, refused by name as read_runs says."""
-    data = json.loads(path.read_text(encoding="utf-8"))
     run = path.parent.name
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, RecursionError) as exc:   # UnicodeDecodeError and JSONDecodeError are ValueErrors
+        raise CaseError(f"{path} doesn't parse as JSON in UTF-8 ({exc}), so run {run} can't be read. "
+                        "Restore the file from a copy of the case.") from exc
     if not isinstance(data, dict):
         raise CaseError(f"{path} isn't a JSON object, so run {run} can't be read. "
                         "Restore the file from a copy of the case.")
@@ -682,7 +904,7 @@ def _unfinished(record: RunRecord) -> RunRecord:
     no rows, and a note saying why, which the Tools page and the overview's Gaps show as its reason."""
     notes = [n for n in record.notes if not n.endswith(UNFINISHED_NOTE)]
     return replace(record, loaded_rows=0, rows_skipped=None,
-                   notes=[*notes, f"Rebuild at {_utc_now()}{LEFT_OUT}{UNFINISHED_NOTE}"])
+                   notes=[*notes, f"Rebuild at {utc_now()}{LEFT_OUT}{UNFINISHED_NOTE}"])
 
 
 def _refuse_held(case: Case) -> None:
@@ -746,6 +968,14 @@ def held_runs(runs: list[RunRecord], spec: ToolSpec, specs: dict[str, ToolSpec])
     return held
 
 
+def tool_names(specs: dict[str, ToolSpec]) -> dict[str, str]:
+    """What the pages and the report call each tool, by ID: the registry's tools, the makers of output found in the
+    evidence, and the import. The pages and the report show an ID that none of them names, such as one a hand-edited
+    run.json gives, as it is."""
+    tools = {k.tool: k.maker for k in KINDS if k.maker} | {s.id: s.name for s in specs.values()}
+    return {**tools, IMPORT: "Import"}
+
+
 def rules_text(record: RunRecord, specs: dict[str, ToolSpec]) -> str:
     """The rule or map set a run used, as the pages name it: its label. A run of a tool whose registry entry has a
     rules_label, made without tool_files, which only a case at format 4 or later records, has none to name and reads
@@ -801,7 +1031,7 @@ def _reload(case: Case, record: RunRecord, layout: dict[str, dict[str, str]], re
     record.notes = [n for n in record.notes if not n.endswith((UNHASHED_NOTE, UNLISTED_NOTE, UNFINISHED_NOTE))]
     if problems:
         record.loaded_rows, record.rows_skipped = 0, None
-        note = f"Rebuild at {_utc_now()}{LEFT_OUT}{'; '.join(problems)}"
+        note = f"Rebuild at {utc_now()}{LEFT_OUT}{'; '.join(problems)}"
     else:
         load_output(case, record, folder, layout)
         note = _unchecked_note(record, unchecked)
@@ -820,10 +1050,10 @@ def _unchecked_note(record: RunRecord, files: list[str]) -> str:
     one = len(files) == 1
     named = f"{', '.join(files[:10])}{', and more' if len(files) > 10 else ''}"
     if record.from_output:
-        return (f"Rebuild at {_utc_now()}: {'1 file' if one else f'{len(files):,} files'} beside the output "
+        return (f"Rebuild at {utc_now()}: {'1 file' if one else f'{len(files):,} files'} beside the output "
                 f"{'was' if one else 'were'} read unchecked, since the manifest doesn't list {'it' if one else 'them'} "
                 f"({named}). {UNLISTED_NOTE}")
-    return (f"Rebuild at {_utc_now()}: {len(files):,} output {'file was' if one else 'files were'} loaded unchecked "
+    return (f"Rebuild at {utc_now()}: {len(files):,} output {'file was' if one else 'files were'} loaded unchecked "
             f"({named}): {UNHASHED_NOTE}")
 
 
@@ -842,15 +1072,20 @@ FOUND_OUTPUT = "found output"   # the tool version of a load of output found in 
 # The files a parser reads beside a found output's inputs, by parser, as name patterns matched without regard to case:
 # SBECmd's messages file, or the console log of a 2026.10 build, names each CSV's hive
 COMPANIONS = {"sbecmd_csv": (MESSAGES, CONSOLE_LOG)}
+# The files a parser may read in the folders just below a found output's inputs, by parser, as the tool output kind
+# intake identified them by: RECmd's plugin CSVs, which it writes in a folder named for its run beside the batch CSV
+DETAIL_FILES = {"recmd_csv": "recmd_plugin"}
 
 
 def companions(case: Case, record: RunRecord) -> tuple[list[str], list[str]]:
     """The files a load of found output reads beside its inputs (COMPANIONS): each one in an input's folder that the
     manifest lists, and each that is on disk but not in the manifest (named as the folder holds it), as two lists of
-    evidence-relative paths, sorted and without repeats. Both are empty for any other run."""
+    evidence-relative paths, sorted and without repeats. The first list holds the files below the inputs that the
+    parser may read too (detail_files); the parser reads none of the kind that the manifest doesn't list, so the second
+    names none of them. Both are empty for any other run."""
     patterns = COMPANIONS.get(record.parser, ()) if record.from_output else ()
     if not patterns:
-        return [], []
+        return detail_files(case, record), []
     folders = {rel.rpartition("/")[0] for rel in record.inputs}
     in_folders = {folder.lower() for folder in folders}
     listed = {e.path.lower(): e.path for e in current_entries(case)}
@@ -864,6 +1099,19 @@ def companions(case: Case, record: RunRecord) -> tuple[list[str], list[str]]:
             if rel.lower() not in listed:
                 unlisted.add(rel)
     return sorted(found), sorted(unlisted)
+
+
+def detail_files(case: Case, record: RunRecord) -> list[str]:
+    """The files a load of found output may read below its inputs (DETAIL_FILES): those the manifest lists, read
+    without error, as that kind of tool output, in a folder directly below an input's folder, as evidence-relative
+    paths, sorted. An input's folder is in its host's folder, so they are on the run's host. None for any other run."""
+    kind = DETAIL_FILES.get(record.parser) if record.from_output else None
+    if not kind:
+        return []
+    folders = {rel.rpartition("/")[0].lower() for rel in record.inputs}
+    return sorted(e.path for e in current_entries(case)
+                  if (e.artifact, e.detail) == ("tool_output", kind) and not e.error
+                  and e.path.rpartition("/")[0].rpartition("/")[0].lower() in folders)
 
 
 def _fits(name: str, patterns: tuple[str, ...]) -> bool:
@@ -942,14 +1190,14 @@ def start_run(case: Case, tool: str, name: str, **fields) -> tuple[RunRecord, Pa
     CaseError (_new_run_folder)."""
     run_id, folder = _new_run_folder(case, tool, name)
     folder.mkdir(parents=True)
-    record = RunRecord(run_id=run_id, tool=tool, executable="", argv=[], cwd="", started_utc=_utc_now(), **fields)
+    record = RunRecord(run_id=run_id, tool=tool, executable="", argv=[], cwd="", started_utc=utc_now(), **fields)
     _write_record(folder, record)
     return record, folder
 
 
 def finish_run(folder: Path, record: RunRecord) -> None:
     """Note when a run finished, and write its record."""
-    record.finished_utc = _utc_now()
+    record.finished_utc = utc_now()
     _write_record(folder, record)
 
 
@@ -1155,7 +1403,3 @@ def _write_record(folder: Path, record: RunRecord) -> None:
         if data[key] is None:
             del data[key]
     write_atomically(folder / RUN_FILE, json.dumps(data, indent=2))
-
-
-def _utc_now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

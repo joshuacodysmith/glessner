@@ -17,12 +17,14 @@ from test_format3 import entries_of, journal_path, opened, wait
 
 from glessner import heads
 from glessner import intake as intake_module
+from glessner import rekey as rekey_module
 from glessner.audit import KINDS, describe, lookups, read_entries
-from glessner.case import CaseError, open_case
+from glessner.case import CaseError, copy_case, open_case
 from glessner.cli import main
-from glessner.intake import ManifestCheck, ManifestEntry, add_new, intake, manifest_text
+from glessner.intake import UNRECORDED_MANIFEST, ManifestCheck, ManifestEntry, add_new, intake, manifest_text
 from glessner.journal import Journal, JournalError, check, unvouched_words
 from glessner.overview import _manifest_row
+from glessner.rekey import upgraded_copy
 from glessner.server import App, api_case_state, api_evidence_add, api_overview, api_report
 from glessner.start import start_new_case
 
@@ -351,8 +353,56 @@ def test_verify_close_and_the_report_give_each_answer(synthetic_case, capsys, st
     assert main(["close", str(case.folder)]) == code
     assert SAYS[state] in capsys.readouterr().out
     close = read_entries(journal_path(case))[-1]
-    assert close["value"]["manifest"] == key and close["value"]["hash_check"] == "ok"
+    assert (close["value"]["manifest"], close["value"]["hash_check"]) == (key, result)
     assert (last_check(case)["manifest"], last_check(case)["result"]) == (key, result)
+
+
+def test_close_on_a_manifest_line_edited_to_match_a_swapped_file_records_a_mismatch(recorded_case, capsys):
+    """An evidence file swapped, and its manifest line edited to match, after the record: the re-hash finds no evidence
+    problem, but manifest.jsonl differs from its record, so the close's entry records a mismatch, as verification.jsonl
+    does, and the command line and the audit trail say the evidence matches manifest.jsonl, not the intake manifest."""
+    case = recorded_case
+    (record,) = records(case)
+    swapped = case.evidence / "DC01" / "a.txt"
+    old = sha(swapped.read_bytes())
+    swapped.write_text("fifth", encoding="utf-8")   # the length the manifest line gives
+    case.manifest_path.write_bytes(case.manifest_path.read_bytes().replace(old.encode(), sha(b"fifth").encode()))
+    capsys.readouterr()
+    assert main(["close", str(case.folder)]) == 1
+    out = capsys.readouterr().out
+    assert re.search(rf"^Case closed\. All \d+ evidence files match {re.escape(UNRECORDED_MANIFEST)}\. Recorded in the "
+                     r"journal\.$", out, re.MULTILINE), out
+    assert f"manifest.jsonl differs from its record in the journal, entry #{record['seq']}" in out
+    assert "the intake manifest" not in out
+    close = read_entries(journal_path(case))[-1]
+    assert (close["value"]["hash_check"], close["value"]["problems"]) == ("mismatch", [])
+    assert close["value"]["manifest"] == {"state": "differs", "seq": record["seq"]}
+    assert (last_check(case)["result"], last_check(case)["problems"]) == ("mismatch", [])
+    trail = described(case, close)
+    assert re.match(rf"Closed the case\. All \d+ evidence files match {re.escape(UNRECORDED_MANIFEST)}\. ", trail), trail
+    assert "intake manifest" not in trail
+    assert f"manifest.jsonl differed from its record in the journal, entry #{record['seq']}." in trail
+
+
+def test_close_on_a_manifest_emptied_after_its_record_names_manifest_jsonl_as_listing_none(recorded_case, capsys):
+    """manifest.jsonl emptied after its record lists no evidence file, so the re-hash checks none and finds no problem,
+    but the manifest differs from its record: the command line and the audit trail say manifest.jsonl lists none, not
+    the intake manifest."""
+    case = recorded_case
+    (record,) = records(case)
+    case.manifest_path.write_bytes(b"")
+    capsys.readouterr()
+    assert main(["close", str(case.folder)]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith(f"Case closed. No evidence file was checked: {UNRECORDED_MANIFEST}, lists none. Recorded in "
+                          "the journal."), out
+    assert "the intake manifest" not in out
+    close = read_entries(journal_path(case))[-1]
+    assert (close["value"]["hash_check"], close["value"]["problems"]) == ("mismatch", [])
+    assert close["value"]["manifest"] == {"state": "differs", "seq": record["seq"]}
+    trail = described(case, close)
+    assert trail.startswith(f"Closed the case. No evidence file was checked: {UNRECORDED_MANIFEST}, lists none. "), trail
+    assert "the intake manifest" not in trail
 
 
 def test_a_record_after_the_head_vouches_for_nothing(recorded_case, capsys):
@@ -1014,6 +1064,68 @@ def test_a_copy_carries_the_record_at_its_source_s_head_not_one_appended_after_i
         capsys.readouterr()
         assert main(["verify", str(case.folder)]) == 1
         assert "manifest.jsonl grew past its record in the journal, entry #" in capsys.readouterr().out
+
+
+def add_to(source) -> None:
+    """Add new evidence on `source`, recorded in its journal, which moves the head recorded here past the record."""
+    evidence_file(source, "c.txt")
+    add_new(source, Journal(source))
+
+
+def assert_holds_its_record(copy, source, capsys) -> None:
+    """The copy's record carries the values of the source's newest, the copy holds the source's manifest.jsonl byte for
+    byte, and verify finds both matching their records."""
+    newest = records(source)[-1]
+    [record] = records(copy)
+    assert (record["sha256"], record["bytes"]) == (newest["sha256"], newest["bytes"])
+    assert copy.manifest_path.read_bytes() == source.manifest_path.read_bytes()
+    for case in (source, copy):
+        capsys.readouterr()
+        assert main(["verify", str(case.folder)]) == 0
+        assert "manifest.jsonl matches its record in the journal, entry #" in capsys.readouterr().out
+
+
+def test_a_copy_holds_the_manifest_its_record_describes_when_the_source_adds_evidence_during_the_copy(
+        recorded_case, tmp_path, capsys):
+    """Add new evidence on the source after the copy copied its files and before it records the manifest, as one made
+    while the copy copies runs/ is, gives the copy the source's manifest.jsonl with the record that describes it, so the
+    copy's verify matches as the source's does, not a manifest that changed after it was recorded."""
+    source = recorded_case
+    copy = copy_case(source, tmp_path / "copy", "Copy", "cody")
+    add_to(source)
+    assert_holds_its_record(upgraded_copy(copy, source), source, capsys)
+
+
+def test_a_copy_reads_the_manifest_again_when_the_source_changed_it_before_its_record_was_read(recorded_case, tmp_path,
+                                                                                               monkeypatch, capsys):
+    """Add new evidence on the source between the copy's read of manifest.jsonl and its read of the record: the file no
+    longer holds the bytes read, so the copy reads both again and carries the record of the bytes it holds."""
+    source = recorded_case
+    copy = copy_case(source, tmp_path / "copy", "Copy", "cody")
+    real, reads = rekey_module.source_record, []
+
+    def adding_first(case):
+        if not reads:
+            add_to(source)
+        reads.append(case)
+        return real(case)
+
+    monkeypatch.setattr(rekey_module, "source_record", adding_first)
+    copy = upgraded_copy(copy, source)
+    assert len(reads) == 2
+    assert_holds_its_record(copy, source, capsys)
+
+
+def test_a_copy_whose_source_is_written_at_every_try_is_refused_without_a_record(recorded_case, tmp_path, monkeypatch):
+    """A writer that holds the source's journal at every try for the whole wait refuses the copy's record, with what to
+    do, rather than carrying a record taken while the source's manifest and journal may disagree."""
+    source = recorded_case
+    copy = copy_case(source, tmp_path / "copy", "Copy", "cody")
+    monkeypatch.setattr(rekey_module, "_writing", lambda path: True)
+    monkeypatch.setattr(rekey_module, "LOCK_WAIT", 0.05)
+    with pytest.raises(CaseError, match="Remove the copy's folder, then make the copy again"):
+        upgraded_copy(copy, source)
+    assert records(copy) == []
 
 
 def verified_copy_and_source(source, tmp_path, capsys):

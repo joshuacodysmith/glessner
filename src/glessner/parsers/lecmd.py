@@ -23,7 +23,8 @@ TIME_COLUMNS = (("TargetCreated", "LNK target created"), ("TargetModified", "LNK
                 ("TargetAccessed", "LNK target accessed"), ("TrackerCreatedOn", "LNK tracker created"))
 EXTRA_COLUMNS = ("LocalPath", "NetworkPath", "CommonPath", "TargetIDAbsolutePath", "RelativePath", "WorkingDirectory",
                  "Arguments", "FileSize", "FileAttributes", "DriveType", "VolumeSerialNumber", "VolumeLabel",
-                 "TargetMFTEntryNumber", "TargetMFTSequenceNumber", "MachineID", "MachineMACAddress", "MACVendor")
+                 "TargetMFTEntryNumber", "TargetMFTSequenceNumber", "MachineID", "MachineMACAddress", "MACVendor",
+                 "VolumeDroid", "FileDroid", "VolumeDroidBirth", "FileDroidBirth")
 SOURCE_TIMES = ("SourceCreated", "SourceModified", "SourceAccessed")
 TRACKER_NOTE = ("Later than the LNK file's own times, so not placed on the timeline. LECmd derives this time from "
                 "the tracker's ID, which holds a time only when the ID is time-based.")

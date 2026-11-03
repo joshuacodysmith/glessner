@@ -11,7 +11,7 @@ import { filterParam } from './filters.js';
 import { mismatchFound, refreshCaseState, showTab } from './frame.js';
 import { openHost } from './hosts.js';
 import { jumpTo, markableList, stickUnder } from './pages.js';
-import { searchTerm, typedSearch } from './search.js';
+import { ruleTerm, searchTerm, typedSearch } from './search.js';
 import { shownCounted, sourcesOn } from './state_line.js';
 import { showSuggestions } from './suggestions.js';
 import { showTools } from './tools.js';
@@ -44,8 +44,8 @@ const day = (us) => fmtUs(us).slice(0, 10);
 
 // The note under a host's first and last time on its events outside them (overview._host_span): one is dated, several
 // give the dates of the earliest and latest. The hover says where the span's bounds lie.
-const OUTSIDE_WHY = 'The first and last time leave out events dated before 1990 or more than a day after the newest tool ' +
-  'run, which a wrong clock or a placeholder time gives. They are still counted, and on the timeline.';
+const OUTSIDE_WHY = 'The first and last time leave out events dated before 1990 or more than a day after the newest run, ' +
+  'which a wrong clock or a placeholder time gives. They are still counted, and on the timeline.';
 const outsideNote = (o) => el('div', { class: 'muted', title: OUTSIDE_WHY }, o.count === 1
   ? `1 event dated ${day(o.first)}, outside the rest`
   : `${o.count.toLocaleString()} events outside the rest, dated ${day(o.first)} to ${day(o.last)}`);
@@ -94,14 +94,18 @@ async function listOpened(title, filterId, latest) {
   if (!latest()) return;
   const reopen = () => listOpened(title, filterId, claimDetails());
   const render = () => {
-    const { buttons, list } = markableList(res.events, opened.checked, render, (done) => done());
+    // The find box; a list cut at the server's limit says how far it reaches, with its line over the list
+    const find = { page: key, name: 'opened', covers: 'The count and the timeline still cover',
+                   listed: res.limited ? res.events.length : null, total: res.total, more: 'events' };
+    const { buttons, list, find: found } = markableList(res.events, opened.checked, render, (done) => done(), { find });
     const head = el('div', { class: 'sticky-head' }, el('h2', {}, title),
-      el('div', { class: 'actions' }, el('strong', {}, plural(res.total, 'event')), ...(res.total ? buttons : [])));
+      el('div', { class: 'actions' }, el('strong', {}, plural(res.total, 'event')), ...(res.total ? [...buttons, found.box] : [])));
     stickUnder(list, head);
     setPage('opened', [el('div', { class: 'related' }, head,
       ...(res.limited ? [el('p', { class: 'muted' }, `Listing the first ${res.events.length.toLocaleString()} in time order. ` +
                                                     'The timeline shows all of them.')] : []),
-      res.total ? list : el('p', {}, 'No event is in this set now.'))], { key, title, reopen });
+      ...(!res.total ? [el('p', {}, 'No event is in this set now.')] : res.limited ? [found.foot, list] : [list, found.foot]))],
+            { key, title, reopen });
   };
   render();
   drew(key, reopen);
@@ -138,13 +142,15 @@ function leadRow(lead) {
 }
 
 // The lead's "why" line. A Hayabusa lead names its rules, and each title opens the events the rule hit on the lead's host in
-// a search, at any time; the text reads as the server's `why` does. A title holding a quote can't be written as
-// rule:"..." and stays text.
+// a search, at any time; the text reads as the server's `why` does. A title that search can't name alone stays text (ruleTerm).
 function whyLine(lead) {
   if (!lead.rules) return [lead.why];
-  const link = (rule) => (rule.title.includes('"') ? el('span', {}, rule.title)
-    : button(rule.title, () => { showTab('timeline'); typedSearch(`rule:"${rule.title}" ${searchTerm('host', lead.host)}`); },
-             { class: 'linklike', title: `Search the events this rule hit on ${lead.host}, at any time` }));
+  const link = (rule) => {
+    const query = ruleTerm(rule.title, searchTerm('host', lead.host));
+    return query === null ? el('span', {}, rule.title)
+      : button(rule.title, () => { showTab('timeline'); typedSearch(query); },
+               { class: 'linklike', title: `Search the events this rule hit on ${lead.host}, at any time` });
+  };
   return ['Rules: ', ...lead.rules.flatMap((rule, i) => [i ? ', ' : '', link(rule), ` (${plural(rule.count, 'event')})`]),
           `${lead.rules_more ? `, and ${lead.rules_more.toLocaleString()} more` : ''}.`];
 }
@@ -262,13 +268,16 @@ function errorList(entries) {
       ? [el('li', {}, `and ${(entries.length - SHOWN_UNREADABLE).toLocaleString()} more`)] : []));
 }
 
-// Only what the case records: runs that failed or loaded nothing, files intake couldn't identify or read, folders it
-// couldn't list, log clears, and hosts without event logs.
+// Only what the case records: runs that failed or loaded nothing, disk images, which no tool reads, files intake
+// couldn't identify or read, folders it couldn't list, log clears, and hosts without event logs.
 function gaps(g) {
   const items = [
     ...g.runs.map((r) => el('li', { 'data-run': r.run_id }, el('span', { class: 'warn' }, `${r.name} on ${r.host || 'no host'}:`),
       ` ${sentence(r.status === 'failed' ? `failed${r.reason ? `: ${r.reason}` : ''}` : `ran and loaded nothing${r.reason ? `. ${r.reason}` : ''}`)} `,
       button('See the run', () => { showTab('timeline'); showTools(false, { run: r.run_id }); }, { class: 'linklike' }))),
+    ...(g.disk_images ? [el('li', { id: 'ovImages' }, el('span', { class: 'warn' }, `${plural(g.disk_images, 'disk image file')} no tool reads,`),
+      ' kept in the manifest and hashed. Mount or extract each image first, and point Glessner at the extracted folder. ',
+      button('See in Tools', () => { showTab('timeline'); showTools(false, { images: true }); }, { class: 'linklike' }))] : []),
     ...(g.unidentified ? [el('li', {}, el('span', { class: 'warn' }, `${plural(g.unidentified, 'file')} intake could not identify,`),
       ' kept in the manifest and hashed. ',
       button('See in Tools', () => { showTab('timeline'); showTools(false, { unidentified: true }); }, { class: 'linklike' }))] : []),

@@ -3256,7 +3256,10 @@
     },
     {
      "pivot": "window",
-     "reason": "The row's time is the AppCompatCache key's last write, shared by every entry."
+     "reason": "The row's time is the AppCompatCache key's last write, shared by every entry.",
+     "when": {
+      "ts_desc": "Registry Key LastWrite"
+     }
     }
    ],
    "later": [
@@ -3268,7 +3271,7 @@
      ]
     }
    ],
-   "also": "The app times these rows by the key's LastWrite, not by the file's modified time that the entry holds.",
+   "also": "The app times each row by the key's LastWrite. The file's modified time that the entry holds is an event of its own beside the row, which takes a time window.",
    "measured": "546 rows: DESKTOP's 266 share one time, DC01's 280 another. No file key; window \u00b160 s 870. Their paths match an MFT key 256 of 278 times on DC01 and 142 of 181 on DESKTOP, once SYSVOL\\ is read as the volume root."
   },
   {
@@ -3641,7 +3644,10 @@
     },
     {
      "pivot": "window",
-     "reason": "The row's time is the Services key's last write, shared by every service on the host. Each service's own key time is in the row's data, as Name last write."
+     "reason": "The row's time is the Services key's last write, shared by every service on the host. Each service's own key time is in the row's data, as Name last write.",
+     "when": {
+      "ts_desc": "Registry Key LastWrite"
+     }
     }
    ],
    "later": [],
@@ -3675,7 +3681,10 @@
    "not_offered": [
     {
      "pivot": "window",
-     "reason": "The row's time is the TaskCache\\Tasks key's last write, shared by every task. The task's created time is in the row's data."
+     "reason": "The row's time is the TaskCache\\Tasks key's last write, shared by every task. The task's created time is in the row's data.",
+     "when": {
+      "ts_desc": "Registry Key LastWrite"
+     }
     }
    ],
    "later": [],
@@ -3747,7 +3756,10 @@
     },
     {
      "pivot": "window",
-     "reason": "The row's time is the Count key's last write, shared by its entries. The program's last run time is in the row's data."
+     "reason": "The row's time is the Count key's last write, shared by its entries. The program's last run time is in the row's data.",
+     "when": {
+      "ts_desc": "Registry Key LastWrite"
+     }
     }
    ],
    "later": [],
@@ -3819,7 +3831,10 @@
     },
     {
      "pivot": "window",
-     "reason": "The row's time is the user's BAM key's last write. The program's execution time is in the row's data."
+     "reason": "The row's time is the user's BAM key's last write. The program's execution time is in the row's data.",
+     "when": {
+      "ts_desc": "Registry Key LastWrite"
+     }
     },
     {
      "pivot": "account",

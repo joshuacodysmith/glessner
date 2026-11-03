@@ -971,6 +971,15 @@ def test_import_page_adds_previews_and_imports(running, synthetic_case):
     assert res.status == 400 and "Not an evidence file" in json.loads(payload)["error"]
 
 
+def test_the_import_page_lists_no_files_on_a_case_served_before_intake(running, synthetic_case):
+    """A case made on the command line has no manifest until intake runs. Served before then, the Import page lists no
+    files to import rather than answering with an error."""
+    app, port, _ = running
+    assert not synthetic_case.manifest_path.exists()
+    res, payload = request(port, "GET", "/api/imports", session=login(port, app))
+    assert res.status == 200 and json.loads(payload)["files"] == []
+
+
 def test_an_import_whose_save_as_name_is_refused_imports_nothing(running, synthetic_case):
     """The "Save mapping as" name is checked before any file is imported, with save_mapping's own message, so a refused
     name leaves no run and no events behind the error the page shows."""
@@ -1403,6 +1412,7 @@ def test_every_route_that_journals_appends_under_the_lock(synthetic_case, monkey
             (server.api_suggestion, {"decision": "restore", "source": "hayabusa", "uids": uids[:1]}),
             (server.api_suggestion, {"decision": "accept", "source": "machine-accounts-authorized"}),
             (server.api_undo, {"seq": seq}),
+            (server.api_reject_ticked, {"uids": uids[:1]}),   # the undo left the event's restored suggestion pending
             # The journal's other writers: follow-up, each finding op, and the three file entries
             (server.api_followup, {"uids": uids[:2], "done": True}),
             (server.api_finding, {"op": "add", "title": "Lateral movement", "severity": "High", "targets": uids[:1]}),
@@ -1419,12 +1429,12 @@ def test_every_route_that_journals_appends_under_the_lock(synthetic_case, monkey
                 (server.api_report, {}), (server.api_indicators, {}), (server.api_audit_export, {})]
         for route, body in more:
             route(app, body)
-        assert journaled(app)[-29:] == ["mark", "note", "note_retract", "tag", "tag_suggestion", "case_setting",
+        assert journaled(app)[-30:] == ["mark", "note", "note_retract", "tag", "tag_suggestion", "case_setting",
                                         "case_setting", "host_role", "host_offset", "host_identity", "host_role",
                                         "rule_add", "rule_change", "rule_remove", "suggestion_decision",
-                                        "suggestion_decision", "mark", "undo", "followup", "finding", "finding",
-                                        "finding", "finding", "finding", "finding", "file_written", "file_written",
-                                        "file_written", "file_written"]
+                                        "suggestion_decision", "mark", "undo", "suggestion_decision", "followup",
+                                        "finding", "finding", "finding", "finding", "finding", "finding",
+                                        "file_written", "file_written", "file_written", "file_written"]
         assert unlocked == []
         # Every function of server.py that writes the journal is a route called here, a helper such a route calls
         # under its lock, or Continue with the break on record, which test_journal_actions.py checks the same way
@@ -1522,6 +1532,43 @@ def test_the_tools_page_says_which_rule_set_its_latest_runs_used_and_how_many_ro
     assert (unlabeled["rules_unrecorded"], unlabeled["rules"]) == (False, ["Fake rules 1111111", "Fake rules 2222222"])
     ran("e", "WS02", from_output=True)   # a load of found output made no tool run
     assert last_run(labeled)["rules_unrecorded"] is False
+
+
+def test_the_tools_page_names_the_hosts_whose_run_had_none_of_the_apps_additions(synthetic_case, tmp_path):
+    """A run of a tool whose registry entry composes files from the app's (tools.Composed) ran without them when its
+    outputs hold none of the files composed (runner.COMPOSED), as a run made before the app composed them does. The
+    page names what it lacks, read from the outputs alone, with the hosts of those runs. A run that holds them, a load
+    of found output, and a tool that composes nothing name none."""
+    from glessner.runner import COMPOSED, finish_run, start_run
+    from glessner.toolbox import ADDITIONS, overview
+    from glessner.tools import COMPOSE_KINDS, Composed
+
+    assert set(ADDITIONS) == set(COMPOSE_KINDS) == set(COMPOSED)
+    specs, detected = fake_tool_case(synthetic_case, tmp_path)
+    plain = specs["fake"]
+    composing = plain.__class__(**{**plain.__dict__, "compose": {"maps_dir": Composed("Maps", tmp_path / "maps")}})
+
+    def ran(name, host, outputs, **fields):
+        record, folder = start_run(synthetic_case, "fake", name, tool_version="1.0", host=host, inputs=["x"], status="ok",
+                                   loaded_rows=10, outputs=[{"path": path, "sha256": "ab" * 32} for path in outputs],
+                                   **fields)
+        finish_run(folder, record)
+
+    def without(spec):
+        tool = detected["fake"].__class__(spec, detected["fake"].executable, detected["fake"].version)
+        (row,) = overview(synthetic_case, {"fake": spec}, {"fake": tool})["tools"]
+        return row["last_run"]["without_additions"]
+
+    ran("a", "DC01", ["out.csv"])   # made before the app composed its maps
+    assert without(composing) == {"what": "Glessner maps", "hosts": ["DC01"]}
+    assert without(plain) is None
+    ran("b", "DESKTOP", ["out.csv", "composed_maps/a.smap"])
+    ran("c", "WS02", [], from_output=True)
+    assert without(composing) == {"what": "Glessner maps", "hosts": ["DC01"]}
+    ran("d", "DC01", ["composed_maps/sub/b.smap", "out.csv"])   # run again with them
+    assert without(composing) is None
+    ran("e", "DESKTOP", ["composed_maps.csv"])   # a file named like the folder isn't in it
+    assert without(composing) == {"what": "Glessner maps", "hosts": ["DESKTOP"]}
 
 
 def test_a_group_of_found_output_loaded_by_its_parser_says_how_many_rows_it_skipped(tmp_path):

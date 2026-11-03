@@ -1,0 +1,57 @@
+# This map's IdentifyQuery adapts the one in Windows_ChromiumBrowser_HistoryVisits.smap, one of SQLECmd's maps
+# (https://github.com/EricZimmerman/SQLECmd/tree/master/SQLMap/Maps), which SQLECmd's LICENSE file
+# (https://github.com/EricZimmerman/SQLECmd/blob/master/LICENSE) puts under this license:
+#
+# MIT License
+#
+# Copyright (c) Eric R. Zimmerman 2027
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+Description: Chromium Browser Visit Sources, for visits the browser didn't make itself
+Author: Glessner
+Email: none
+Id: 1877b601-e124-43d7-8b0a-830b4a3bb186
+Version: 1.0
+CSVPrefix: ChromiumBrowser
+FileName: History
+IdentifyQuery: SELECT count(*) FROM sqlite_master WHERE type='table' AND (name='urls' OR name='visits' OR name='downloads' OR name='segments' OR name='keyword_search_terms' OR name='visit_source');
+IdentifyValue: 6
+Queries:
+    -
+        Name: Chromium Browser Visit Sources
+        Query: |
+                SELECT
+                visit_source.id AS VisitID,
+                visit_source.source AS Source
+                FROM
+                visit_source
+                ORDER BY
+                visit_source.id ASC
+        BaseFileName: VisitSources
+
+# Glessner's map, from sqlecmd_maps in its registry folder. A run of SQLECmd reads the maps in SQLECmd's own Maps
+# folder and these, from a maps folder the run composes in its output folder.
+#
+# The visit_source table holds a row for each visit the browser didn't make itself, with the visit's ID in the visits
+# table and where it came from: 0 synced from another device, 2 added by an extension, 3 imported from Firefox,
+# 4 imported from Internet Explorer, and 5 imported from Safari. A visit the user browsed has no row. Glessner joins
+# each row to the visit that Windows_ChromiumBrowser_HistoryVisits.smap, one of SQLECmd's maps
+# (https://github.com/EricZimmerman/SQLECmd/tree/master/SQLMap/Maps), reads from the same History, by its VisitID.
+# Its IdentifyQuery follows that map's, with the visit_source table added, under the license at the top.

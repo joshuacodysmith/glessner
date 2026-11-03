@@ -20,9 +20,9 @@ from glessner.journal import (
     Journal,
     JournalError,
     _validate,
+    last_action,
     replay,
 )
-from glessner.overview import _last_action
 
 
 def new_id(name: str) -> str:
@@ -310,14 +310,14 @@ def test_the_upgrade_entry_says_how_many_events_merged():
 
 
 def test_the_last_action_reads_through_the_rekeys_after_it(tmp_path):
-    """overview._last_action reads back from the end; the rekeys it passes are those after the entry, in file order."""
+    """The last-action reader reads back from the end; the rekeys it passes are those after the entry, in file order."""
     a, b, c = new_id("a"), new_id("b"), new_id("c")
     up = lambda pairs: {"action": "case_upgrade", "who": SYSTEM, "from_format": 1, "to_format": 2, "text": "",
                         "rekey": {"pairs": pairs}}
     path = write(tmp_path / "journal.jsonl", [{"seq": 1, "who": "cody", "action": "note", "target": a, "text": "x"},
                                               {"seq": 2, **up({a: b})}, {"seq": 3, **up({b: c, a: b})},
                                               {"seq": 4, "who": SYSTEM, "action": "case_open", "build": "x"}])
-    assert _last_action(path) == {"seq": 1, "who": "cody", "action": "note", "target": c, "text": "x", REKEYED: [2, 3]}
+    assert last_action(path) == {"seq": 1, "who": "cody", "action": "note", "target": c, "text": "x", REKEYED: [2, 3]}
 
 
 def test_an_unplaced_id_says_why_and_the_trail_finds_an_old_id(synthetic_case):

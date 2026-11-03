@@ -5,13 +5,19 @@ import csv
 import json
 import os
 import time
+from dataclasses import replace
+from pathlib import Path
+
+from test_recmd import COLUMNS as RECMD_COLUMNS
+from test_recmd import sam_account, userassist, write_detail
 
 from glessner.case import create_case
 from glessner.events import connect
 from glessner.identify import identify_bytes
 from glessner.intake import intake
-from glessner.runner import load_found_output, read_runs, rebuild
-from glessner.tool_outputs import kind_of
+from glessner.parsers.common import DETAILS_NOTE
+from glessner.runner import LEFT_OUT, companions, detail_files, load_found_output, read_runs, rebuild, run_problems
+from glessner.tool_outputs import BY_KIND, kind_of
 from glessner.toolbox import found_outputs, start_load_job
 from glessner.tools import DetectedTool, load_registry
 
@@ -144,8 +150,8 @@ def test_loading_from_the_page_job_and_sbecmd_without_its_messages_file(tmp_path
 
 
 def test_a_console_log_in_the_evidence_is_no_tool_output(tmp_path):
-    """A 2026.10 build's console log is read beside SBECmd's CSVs, but intake identifies it as nothing, and found
-    output lists the CSV alone."""
+    """A 2026.10 build's console log is read beside SBECmd's CSVs, but intake identifies it as a console log, not as
+    tool output, and found output lists the CSV alone."""
     from sbecmd_log_fixtures import CONSOLE_LOG_NAME, console_log_text
 
     from glessner.intake import current_entries
@@ -156,13 +162,13 @@ def test_a_console_log_in_the_evidence_is_no_tool_output(tmp_path):
                             r"C:\out\alice_UsrClass.csv")
     first_line = text.split("\r\n", 1)[0]
     assert kind_of(CONSOLE_LOG_NAME, first_line) is None
-    assert identify_bytes(CONSOLE_LOG_NAME, text.encode()).artifact is None
+    assert identify_bytes(CONSOLE_LOG_NAME, text.encode()).artifact == "console_log"
     ev = tmp_path / "evidence"
     write_rows(ev / csv_path, SBE_COLUMNS, [{"BagPath": "BagMRU\\0", "Slot": "1", "AbsolutePath": "Desktop\\This PC\\C:\\Tools"}])
     (ev / folder / CONSOLE_LOG_NAME).write_text(text, encoding="utf-8", newline="")
     case = create_case(tmp_path / "case", "Console log", ev, "cody")
     intake(case)
-    assert {e.path: e.artifact for e in current_entries(case)}[f"{folder}/{CONSOLE_LOG_NAME}"] is None
+    assert {e.path: e.artifact for e in current_entries(case)}[f"{folder}/{CONSOLE_LOG_NAME}"] == "console_log"
     groups = found_outputs(case, load_registry(), {})
     assert [(g["key"], g["host"], g["paths"]) for g in groups] == [("sbecmd_csv", "WS01", [csv_path])]
 
@@ -280,6 +286,26 @@ def test_the_tools_page_reads_the_manifest_once_and_each_file_once(tmp_path, mon
     app.con.close()
 
 
+def test_the_tools_page_lists_console_logs_as_files_no_tool_reads_not_as_unidentified(tmp_path):
+    """Each of Eric Zimmerman's tools writes <stamp>_<Tool>_<version>_ConsoleLog.txt beside its output from 2026.10. A case
+    whose intake left such a log unidentified reads it as a console log too."""
+    from glessner.toolbox import overview
+
+    log = tmp_path / "evidence" / "WS01" / "EventLogs" / "20261026060736_EvtxECmd_2026.10.2_ConsoleLog.txt"
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b"[13:08:02.051 INF] EvtxECmd version 2026.10.2\r\n\r\nAuthor: Eric Zimmerman\r\n")
+    case = create_case(tmp_path / "case", "Console logs", tmp_path / "evidence", "cody")
+    intake(case)
+    page = overview(case, load_registry(), {})
+    assert (page["unidentified"], page["unread"]) == (0, [{"what": "1 Eric Zimmerman console log"}])
+    (entry,) = [json.loads(line) for line in case.manifest_path.read_text(encoding="utf-8").splitlines()]
+    assert (entry["artifact"], entry["detail"]) == ("console_log", "EvtxECmd")
+    older = {**entry, "artifact": None, "method": "unidentified", "detail": ""}   # as an older build's intake recorded it
+    case.manifest_path.write_bytes(f"{json.dumps(older)}\n".encode())
+    page = overview(case, load_registry(), {})
+    assert (page["unidentified"], page["unread"]) == (0, [{"what": "1 Eric Zimmerman console log"}])
+
+
 def test_the_tools_page_answers_before_intake(tmp_path):
     """The overview reads no manifest before intake, and the page takes both of its passes, tools and found output, from
     that one overview, so a second pass over found output can't fail with FileNotFoundError."""
@@ -335,3 +361,169 @@ def test_a_load_that_fails_partway_still_refreshes_the_case_and_records_its_run(
     while not job.finished:
         time.sleep(0.05)
     assert job.error == "RuntimeError: the database refused it" and refreshed == [["ok"]]   # the tool's run, then the fault
+
+
+RECMD_FOLDER = "WS01/Modules/Registry"
+RECMD_CSV = f"{RECMD_FOLDER}/20240514120000_RECmd_Batch_Kroll_Batch_Output.csv"
+RECMD_RAN = "20240514120000"   # the folder RECmd writes its plugin CSVs in, named for when it ran
+RECMD_PAIRS = {"UserAssist": userassist("cmd.exe", "2015-03-22 15:52:15.9991623"),
+               "UserAccounts": sam_account("1000", "informant", login="2015-03-25 09:58:04.4373155")}
+
+
+def recmd_detail(plugin):
+    """The evidence-relative path of a plugin's detail CSV beside the batch CSV."""
+    return f"{RECMD_FOLDER}/{RECMD_RAN}/{Path(RECMD_CSV).stem}_{plugin}.csv"
+
+
+def recmd_found_case(tmp_path, listed=tuple(RECMD_PAIRS), copies=(), copied=RECMD_PAIRS["UserAccounts"][1], named=()):
+    """A case whose evidence holds KAPE's RECmd output for WS01: the batch CSV, with a UserAssist row and a SAM account
+    row that name their plugins' CSVs where RECmd wrote them on the collecting machine, and those CSVs in the folder
+    RECmd named for its run, the plugins of `listed` before intake and the others after. DC01's folder holds a copy of
+    the SAM plugin's CSV, which intake hashes, and each evidence-relative path of `copies` holds the SAM detail row
+    `copied`. Each name in `named` is a file in the run's folder that one more UserAssist row names, which the caller
+    writes there first."""
+    evidence = tmp_path / "evidence"
+    rows = [{**{k: v for k, v in main.items() if k != "plugin"},
+             "PluginDetailFile": f"C:\\KAPE\\out\\Registry\\{RECMD_RAN}\\{Path(RECMD_CSV).stem}_{plugin}.csv"}
+            for plugin, (main, _) in RECMD_PAIRS.items()]
+    rows += [{**{k: v for k, v in RECMD_PAIRS["UserAssist"][0].items() if k != "plugin"},
+              "PluginDetailFile": f"C:\\KAPE\\out\\Registry\\{RECMD_RAN}\\{name}"} for name in named]
+    write_rows(evidence / RECMD_CSV, RECMD_COLUMNS, rows)
+    write_detail(evidence / recmd_detail("UserAccounts").replace("WS01", "DC01", 1), [RECMD_PAIRS["UserAccounts"][1]])
+    for copy in copies:
+        write_detail(evidence / copy, [copied])
+    for plugin in listed:
+        write_detail(evidence / recmd_detail(plugin), [RECMD_PAIRS[plugin][1]])
+    case = create_case(tmp_path / "case", "KAPE", evidence, "cody")
+    intake(case)
+    for plugin in set(RECMD_PAIRS) - set(listed):
+        write_detail(evidence / recmd_detail(plugin), [RECMD_PAIRS[plugin][1]])
+    return case
+
+
+def test_found_output_reads_only_hashed_detail_csvs_of_its_host(tmp_path):
+    """A load of RECmd's batch CSV found in the evidence reads a plugin's detail CSV only from the folder RECmd named
+    for its run beside the batch CSV, and only when intake hashed it: one put there since is read from nowhere else,
+    not another host's copy either, and the run's notes count the rows naming it. The run's input is the batch CSV."""
+    case = recmd_found_case(tmp_path, listed=("UserAssist",))
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (record.status, record.evidence_check, record.inputs) == ("ok", "ok", [RECMD_CSV])
+    assert record.loaded_rows == 3   # the two rows' LastWrite events and the program's last run
+    assert f"{DETAILS_NOTE}1 entry time became an event. 1 row named a detail file the load may not read." in record.notes
+    con = connect(case.db_path, read_only=True)
+    try:
+        assert con.execute("SELECT ts_desc FROM events ORDER BY ts_desc").fetchall() == [
+            ("Registry Key LastWrite",), ("Registry Key LastWrite",), ("UserAssist last executed",)]
+    finally:
+        con.close()
+
+
+def test_found_output_checks_its_detail_csvs_against_their_intake_hashes(tmp_path):
+    """The detail CSVs a load of RECmd's batch CSV reads are checked against their intake hashes before and after it
+    reads them and on each rebuild, as the batch CSV is, though the run's inputs are the batch CSV alone, which the
+    Tools page shows as loaded. A detail CSV that changed fails the load, and a rebuild leaves the run out."""
+    case = recmd_found_case(tmp_path)
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (record.status, record.evidence_check, record.inputs, record.loaded_rows) == ("ok", "ok", [RECMD_CSV], 5)
+    groups = {g["key"]: g for g in found_outputs(case, load_registry(), {}) if g["host"] == "WS01"}
+    assert groups["recmd_csv"]["status"] == "loaded"
+    assert groups["recmd_plugin"]["note"] == BY_KIND["recmd_plugin"].note == (
+        "Details from RECmd's plugins, loaded with the batch CSV that names them")
+    (saved,) = read_runs(case)
+    assert run_problems(case, saved, "test") == ([], [])
+    write_detail(case.evidence / recmd_detail("UserAssist"), [userassist("evil.exe", "2015-03-22 15:52:15.9991623")[1]])
+    assert run_problems(case, saved, "test") == ([f"{recmd_detail('UserAssist')}: SHA-256 changed"], [])
+    rebuild(case)
+    (rebuilt,) = read_runs(case)
+    assert rebuilt.loaded_rows == 0 and LEFT_OUT in rebuilt.notes[-1]
+    again = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (again.status, again.evidence_check) == ("failed", "mismatch")
+    assert f"{recmd_detail('UserAssist')}: SHA-256 changed" in again.reason
+    assert recmd_detail("UserAccounts") not in again.reason
+
+
+def test_found_output_checks_only_the_detail_csvs_just_below_its_batch_csv(tmp_path):
+    """A load of RECmd's batch CSV checks and may read only the plugin CSVs in a folder directly below the batch CSV's
+    folder. A plugin CSV of the same host deeper down or in another folder isn't one of them, so a change to it after
+    intake leaves the load as it was."""
+    elsewhere = (f"WS01/Other/{RECMD_RAN}/{Path(RECMD_CSV).stem}_UserAccounts.csv",
+                 f"{RECMD_FOLDER}/{RECMD_RAN}/older/{Path(RECMD_CSV).stem}_UserAccounts.csv")
+    case = recmd_found_case(tmp_path, copies=elsewhere)
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (record.status, record.evidence_check, record.loaded_rows) == ("ok", "ok", 5)
+    (saved,) = read_runs(case)
+    assert companions(case, saved) == (sorted(recmd_detail(plugin) for plugin in RECMD_PAIRS), [])
+    for path in elsewhere:
+        write_detail(case.evidence / path, [sam_account("1001", "admin11")[1]])
+    assert run_problems(case, saved, "test") == ([], [])
+    again = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (again.status, again.evidence_check, again.loaded_rows) == ("ok", "ok", 5)
+
+
+def test_found_output_reads_no_other_kind_of_csv_beside_its_plugin_csvs(tmp_path):
+    """A load of RECmd's batch CSV checks and may read only the files below it that intake identified as RECmd plugin
+    output. A CSV in the same folder that intake listed as something else, here a plain CSV named as a plugin's would
+    be and EvtxECmd's output, isn't one of them, even where a batch row names it: the notes count those rows as naming
+    a file the load may not read, and a change to either file after intake leaves the load as it was."""
+    folder = tmp_path / "evidence" / RECMD_FOLDER / RECMD_RAN
+    plain, evtx = f"{Path(RECMD_CSV).stem}_Notes.csv", "20240514120000_EvtxECmd_Output.csv"
+    write_rows(folder / plain, ["time", "user", "action"], [{"time": "2024-05-14", "user": "alice", "action": "logon"}])
+    write_rows(folder / evtx, EVTX_COLUMNS, evtx_rows("WS01.corp.local"))
+    case = recmd_found_case(tmp_path, named=(plain, evtx))
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (record.status, record.evidence_check, record.loaded_rows) == ("ok", "ok", 7)
+    assert [n for n in record.notes if n.startswith(DETAILS_NOTE)] == [
+        f"{DETAILS_NOTE}3 entry times became events. 2 rows named a detail file the load may not read."]
+    (saved,) = read_runs(case)
+    assert companions(case, saved) == (sorted(recmd_detail(plugin) for plugin in RECMD_PAIRS), [])
+    write_rows(folder / plain, ["time", "user", "action"], [{"time": "2024-05-15", "user": "mallory", "action": "logon"}])
+    write_rows(folder / evtx, EVTX_COLUMNS, evtx_rows("WS01.corp.local", records=(1,)))
+    assert run_problems(case, saved, "test") == ([], [])
+    again = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (again.status, again.evidence_check, again.loaded_rows) == ("ok", "ok", 7)
+
+
+def test_found_output_reads_no_plugin_csv_whose_manifest_entry_has_a_read_error(tmp_path, monkeypatch):
+    """A plugin CSV whose manifest entry records a read error has no hash to check it by, so a load of the batch CSV
+    found in the evidence may not read it, though the entry names it as RECmd plugin output."""
+    from glessner import runner
+    from glessner.intake import current_entries
+
+    case = recmd_found_case(tmp_path)
+    load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    (saved,) = read_runs(case)
+    entries, unread = current_entries(case), recmd_detail("UserAssist")
+    monkeypatch.setattr(runner, "current_entries", lambda c: [
+        replace(e, error="PermissionError: access denied") if e.path == unread else e for e in entries])
+    assert detail_files(case, saved) == [recmd_detail("UserAccounts")]
+
+
+def test_found_output_reads_the_plugin_csv_in_the_folder_its_row_names(tmp_path):
+    """Other RECmd runs' folders beside the one a row names can hold a plugin CSV of the same name, which intake hashes
+    too. The load reads the row's details from the CSV in the folder the row names, wherever the others sort."""
+    siblings = tuple(f"{RECMD_FOLDER}/{ran}/{Path(RECMD_CSV).stem}_UserAccounts.csv"
+                     for ran in ("20240514110000", "20240514130000"))
+    case = recmd_found_case(tmp_path, copies=siblings, copied={**RECMD_PAIRS["UserAccounts"][1], "TotalLoginCount": "7"})
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    assert (record.status, record.evidence_check, record.loaded_rows) == ("ok", "ok", 5)
+    con = connect(case.db_path, read_only=True)
+    try:
+        counts = con.execute("SELECT ts_desc, json_extract_string(extra, '$.TotalLoginCount') FROM events "
+                             "WHERE json_extract_string(extra, '$.UserId') = '1000' ORDER BY ts_desc").fetchall()
+    finally:
+        con.close()
+    assert counts == [("Registry Key LastWrite", "0"), ("SAM account last logon", "0"),
+                      ("SAM account name key last write", "0")]
+
+
+def test_a_rebuild_replaces_the_detail_note(tmp_path):
+    """A rebuild loads a run again and replaces its note on what the plugin CSVs added, so the note stands once."""
+    case = recmd_found_case(tmp_path)
+    record = load_found_output(case, "recmd", "recmd_csv", "WS01", [RECMD_CSV])
+    note = [f"{DETAILS_NOTE}3 entry times became events."]
+    assert [n for n in record.notes if n.startswith(DETAILS_NOTE)] == note
+    rebuild(case)
+    rebuild(case)
+    (rebuilt,) = read_runs(case)
+    assert rebuilt.loaded_rows == 5
+    assert [n for n in rebuilt.notes if n.startswith(DETAILS_NOTE)] == note

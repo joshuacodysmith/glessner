@@ -1,4 +1,4 @@
-import { api, el, plural, post, S, setStatus } from './core.js';
+import { api, el, plural, post, S, setStatus, showControls } from './core.js';
 
 // ---------- next pivots on the Event page ----------
 // The server ranks the pivots for the event's kind from the table in pivots.py: each row has the
@@ -272,7 +272,7 @@ async function askCount(state) {
     if (err.name === 'AbortError' || mine !== turn || state.pending !== own) return;
     ui.count.className = 'pv-n muted';
     ui.count.textContent = row.count ? 'could not count' : '';
-    ui.count.title = err.message;
+    ui.count.title = showControls(err.message);
   }
 }
 

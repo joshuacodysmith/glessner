@@ -3,9 +3,9 @@
 // reads; and other known tools in the tools folder. A tool runs, or found output loads, from here, one at a time, in
 // the background; the page follows it and the timeline reloads after.
 
-import { $, api, el, plural, post, sentence, setStatus } from './core.js';
+import { $, api, el, fmtAt, listWords, plural, post, sentence, setStatus, showControls } from './core.js';
 import { askConfirm } from './confirm.js';
-import { button, claimDetails, pageAction, pageAnswered, pageRead, setPage } from './event_page.js';
+import { button, claimDetails, pageAction, pageAnswered, pageRead, setPage, showingPage } from './event_page.js';
 import { refreshCaseState } from './frame.js';
 import { showImport } from './import.js';
 
@@ -22,10 +22,23 @@ const loadedText = (run, hits) => rowsText(run.rows, hits)
   + (run.skipped ? `, ${run.skipped.toLocaleString()} skipped` : '');
 // The rule or map sets those runs used, and that a run of a tool that names its set made none to name.
 const rulesText = (run) => [...run.rules, ...(run.rules_unrecorded ? ['rules not recorded'] : [])].join('; ');
+// The app's additions that any of those runs ran without (toolbox._without_additions), with their hosts where the tool
+// has runs on others too, and what to do about it; '' when every run had them.
+function additionsText(t) {
+  const missing = t.last_run.without_additions;
+  if (!missing) return '';
+  const on = missing.hosts.length < t.last_run.hosts.length ? ` on ${listWords(missing.hosts, { cap: 3 })}` : '';
+  return `${t.name} ran without ${missing.what}${on}. Run ${t.name} again to load the added rows.`;
+}
 // What a job's steps are (toolbox.ToolJob): a tool's runs, loads of found output, or both for Run and load everything
 // ready. They are not hosts.
 const STEPS = { run: ['run', 'runs'], load: ['load', 'loads'], all: ['run or load', 'runs and loads'] };
 const stepsText = (job) => `${job.done} of ${job.total} ${(STEPS[job.kind] || STEPS.run)[job.total === 1 ? 0 : 1]}`;
+// The button that shows or hides a list of files under its line
+const listButton = (list) => button('List', (ev) => {
+  list.hidden = !list.hidden;
+  ev.currentTarget.textContent = list.hidden ? 'List' : 'Hide';
+}, { class: 'linklike' });
 
 // A running job's step, for its box and the status line: the tool or output and the host, as its step names them.
 function jobProgress(job) {
@@ -35,17 +48,19 @@ function jobProgress(job) {
 }
 
 // `focus` brings a part of the page into view once it draws, as the Case overview's Gaps do: a run, as
-// { run: ID }, or the unidentified files, as { unidentified: true }.
+// { run: ID }, the unidentified files, as { unidentified: true }, or the disk images, as { images: true }.
 export async function showTools(rescan = false, focus = null) {
   if (rescan) setStatus('Scanning the tools folder...');
-  // The first open after the server starts, and Scan again, run every tool's version check, which takes a few seconds,
-  // so the page says what it is doing while it waits. Opened again, it answers at once.
+  // A case's first Tools page, and Scan again, run every found tool's version check and hash the tools' files for the pin
+  // check, and the first Tools page after a job hashes again the files the job may have changed. Each takes a few
+  // seconds, so the page says what it is doing while it waits. Opened again, it answers at once.
   let latest = claimDetails();
   const drew = pageRead();
   const checking = setTimeout(() => {
     if (!latest()) return;
-    setPage('tools', [el('p', { class: 'muted tools-checking' }, 'Checking the tools folder: '
-      + 'each tool reports its version, which takes a few seconds after the app starts or a scan.')],
+    setPage('tools', [el('p', { class: 'muted tools-checking' }, 'Checking the tools folder: on the first Tools page after a '
+      + 'case opens, and after Scan again, each tool found there reports its version and its files are hashed for the pin '
+      + 'check. After a job, the files it may have changed are hashed again. This takes a few seconds.')],
             { title: 'Tools', reopen: () => showTools() });
     latest = claimDetails();   // setPage claimed the panel for the line; the answer still draws over it
   }, CHECKING_MS);
@@ -54,7 +69,7 @@ export async function showTools(rescan = false, focus = null) {
   catch (err) {
     setStatus(`Tools page failed: ${err.message}`);
     const checkingNote = latest() && $('details').querySelector('.tools-checking');   // the line above, if it showed
-    if (checkingNote) checkingNote.textContent = `Tools page failed: ${err.message}`;
+    if (checkingNote) checkingNote.textContent = showControls(`Tools page failed: ${err.message}`);
     return;
   } finally { clearTimeout(checking); }
   if (rescan) setStatus(`Found ${res.found} of ${res.total} tools.`);
@@ -72,8 +87,9 @@ function render(res, focus = null) {
     let status, action = '';
     if (t.status === 'ran') {
       const differed = t.last_run.latest?.check?.result === 'differs' ? '; its tools differed from the pin' : '';
-      status = [el('span', { class: 'ok' }, `Ran ${t.last_run.at.slice(0, 16).replace('T', ' ')} UTC: ${loadedText(t.last_run, t.hits)}${differed}`),
-        ...(rulesText(t.last_run) ? [el('div', { class: 'muted' }, rulesText(t.last_run))] : [])];
+      status = [el('span', { class: 'ok' }, `Ran ${fmtAt(t.last_run.at)}: ${loadedText(t.last_run, t.hits)}${differed}`),
+        ...(rulesText(t.last_run) ? [el('div', { class: 'muted' }, rulesText(t.last_run))] : []),
+        ...(additionsText(t) ? [el('div', { class: 'warn tools-additions' }, additionsText(t))] : [])];
       action = button('Run again', () => runTool(t), { 'aria-label': `Run ${t.name} again` });
     } else if (t.status === 'blocked') {
       status = el('span', { class: 'warn' }, `Can't run here: ${t.missing}`);
@@ -102,12 +118,28 @@ function render(res, focus = null) {
   const unread = [...res.unread.map((u) => el('li', {}, `${u.what}: no installed tool reads them`))];
   // The files the Import page offers to import, counted as it lists them
   if (res.to_import.length) unread.push(el('li', {}, `${res.to_import.join(' and ')}: `, button('open the Import page', () => showImport(), { class: 'linklike' })));
+  if (res.disk_images) {
+    // Each image file with its format, any note on that format, its SHA-256, and any hashes it stores for its disk. No
+    // tool reads an image, so the step comes first.
+    const list = el('ul', { class: 'tools-images', id: 'toolsImages', hidden: '' }, ...res.disk_images_sample.map((f) =>
+      el('li', {}, f.path, el('span', { class: 'muted' }, ` (${f.format})${f.note ? ` ${f.note}` : ''}`),
+        el('div', {}, `SHA-256 of this file: ${f.sha256}`),
+        ...(f.stored_md5 ? [el('div', {}, `MD5 stored for the disk: ${f.stored_md5}`)] : []),
+        ...(f.stored_sha1 ? [el('div', {}, `SHA-1 stored for the disk: ${f.stored_sha1}`)] : []),
+        ...(f.stored_md5 || f.stored_sha1
+          ? [el('div', { class: 'muted' }, "The imaging tool stored these. Glessner doesn't check them against the image's data.")]
+          : []))),
+      ...(res.disk_images > res.disk_images_sample.length
+        ? [el('li', { class: 'muted' }, `The first ${res.disk_images_sample.length} of ${res.disk_images}, those that store hashes first.`)]
+        : []));
+    unread.push(el('li', {}, `${plural(res.disk_images, 'disk image file')}: no tool reads them. Mount or extract each `
+      + 'image first, and point Glessner at the extracted folder. ', listButton(list), list));
+  }
   if (res.unidentified) {
     // Each file with why intake couldn't identify it, where it says, as the CLI's intake summary does
     const list = el('ul', { class: 'tools-unidentified', id: 'toolsUnidentified', hidden: '' }, ...res.unidentified_sample.map((f) =>
       el('li', {}, f.path, ...(f.reason ? [el('span', { class: 'muted' }, ` (${f.reason})`)] : []))));
-    unread.push(el('li', {}, `${plural(res.unidentified, 'unidentified file')} `,
-      button('List', (ev) => { list.hidden = !list.hidden; ev.currentTarget.textContent = list.hidden ? 'List' : 'Hide'; }, { class: 'linklike' }), list));
+    unread.push(el('li', {}, `${plural(res.unidentified, 'unidentified file')} `, listButton(list), list));
   }
   const ready = res.ready.tools.length + res.ready.outputs;
   const all = button('Run and load everything ready', () => runAll(), { title: readyText(res.ready) });
@@ -126,7 +158,7 @@ function render(res, focus = null) {
     ...(res.gaps.length ? [el('h3', {}, 'Runs that failed or loaded nothing'),
       el('ul', { class: 'tools-gaps' }, ...res.gaps.map((g) => el('li', { 'data-run': g.run_id },
         `${sentence(`${g.name} on ${g.host || 'no host'}: ${g.status === 'failed' ? 'failed' : 'ran and loaded nothing'}${g.reason ? `. ${g.reason}` : ''}`)} `,
-        el('span', { class: 'muted' }, `Run ${g.run_id}, ${g.at.slice(0, 16).replace('T', ' ')} UTC`))))] : []),
+        el('span', { class: 'muted' }, `Run ${g.run_id}, ${fmtAt(g.at)}`))))] : []),
     el('h3', {}, 'Evidence no installed tool reads'),
     unread.length ? el('ul', { class: 'tools-unread' }, ...unread) : el('p', { class: 'muted' }, 'Every identified file has a tool.'),
     el('h3', {}, 'Other tools in the tools folder'),
@@ -135,9 +167,9 @@ function render(res, focus = null) {
       : el('p', { class: 'muted' }, 'None that the app knows of.'),
   ], { title: 'Tools', reopen: () => showTools() });
   const target = focus && (focus.run ? $('details').querySelector(`li[data-run="${CSS.escape(focus.run)}"]`)
-    : focus.unidentified ? $('toolsUnidentified') : null);
+    : focus.unidentified ? $('toolsUnidentified') : focus.images ? $('toolsImages') : null);
   if (!target) return;
-  if (focus.unidentified) {
+  if (focus.unidentified || focus.images) {
     target.hidden = false;
     target.previousElementSibling.textContent = 'Hide';   // the list's List button
   }
@@ -167,9 +199,7 @@ function dotnetNote(t) {
 // ---------- Pins: a tool's files against the tools folder's manifest ----------
 
 const openFolds = new Set();   // tools whose fold of pinned files is open, kept across redraws
-const utcText = (stamp) => `${stamp.slice(0, 16).replace('T', ' ')} UTC`;
 const shortSha = (sha) => `${sha.slice(0, 12)}...`;
-const nameList = (names) => (names.length < 3 ? names.join(' and ') : `${names.slice(0, -1).join(', ')}, and ${names.at(-1)}`);
 
 let pinOut = false;   // a confirmed pin is waiting for the server, so a page drawn meanwhile draws its pin buttons held
 
@@ -252,7 +282,7 @@ function pinFold(t, res) {
   const { pinned, rows, link_rows: links } = t.pin;
   const latest = t.last_run?.latest;
   const manifest = res.manifest;
-  const intro = `Pinned ${utcText(pinned.utc)} by build ${pinned.by}, at version ${pinned.version}`
+  const intro = `Pinned ${fmtAt(pinned.utc)} by build ${pinned.by}, at version ${pinned.version}`
     + `${pinned.rules ? ` with ${pinned.rules}` : ''}.`;
   return el('tr', { class: 'pin-fold', 'data-tool': t.id, ...(openFolds.has(t.id) ? {} : { hidden: '' }) },
     el('td', { colspan: '5' },
@@ -263,7 +293,7 @@ function pinFold(t, res) {
       linkLine(links),
       el('div', { class: 'muted' }, `Tools manifest ${manifest.path}, SHA-256 `,
         el('span', { title: manifest.sha256 }, shortSha(manifest.sha256)), '.'),
-      el('div', { class: 'muted' }, latest ? `Latest run, ${utcText(latest.at)} on ${latest.host}: ${latest.text}.`
+      el('div', { class: 'muted' }, latest ? `Latest run, ${fmtAt(latest.at)} on ${latest.host}: ${latest.text}.`
         : 'No run of this tool in this case.')));
 }
 
@@ -281,7 +311,7 @@ function manifestLine(res, running) {
 // says to scan again.
 async function pinTools(res, ids) {
   const tools = ids.map((id) => res.tools.find((t) => t.id === id));
-  const names = nameList(tools.map((t) => t.name));
+  const names = listWords(tools.map((t) => t.name));
   const changed = tools.filter((t) => t.pin.changes);
   const ok = await askConfirm({
     title: `Pin ${names} as ${tools.length === 1 ? 'it is' : 'they are'} now, in ${res.manifest.path}? `
@@ -325,7 +355,7 @@ function outputTable(outputs, running) {
       // Events without a time show nowhere else on the page, so the count says so, and so does the count of rows skipped.
       const timeless = g.loaded.without_time ? `, ${g.loaded.without_time.toLocaleString()} without a time, so off the timeline` : '';
       const skipped = g.loaded.skipped ? `, ${g.loaded.skipped.toLocaleString()} skipped` : '';
-      status = el('span', { class: 'ok' }, `Loaded ${g.loaded.at.slice(0, 16).replace('T', ' ')} UTC: ${rowsText(g.loaded.rows || 0, false)}${timeless}${skipped}`);
+      status = el('span', { class: 'ok' }, `Loaded ${fmtAt(g.loaded.at)}: ${rowsText(g.loaded.rows || 0, false)}${timeless}${skipped}`);
     } else if (g.status === 'ready') {
       status = el('span', {}, 'Ready, not loaded');
       action = button('Load', () => loadOutput(g, false), { 'aria-label': `Load ${g.label} on ${g.host}` });
@@ -394,6 +424,9 @@ function follow() {
     const job = res.job;
     if (!job) return;
     setStatus(job.finished ? `${job.tool} finished.` : `Working: ${jobProgress(job)}`);
+    // While the Tools page holds the Details panel, its job box follows the job: the step, and each result as it comes
+    const box = showingPage('tools') && $('detailsBody').querySelector('.tools-job');
+    if (box) box.replaceWith(jobBox(job));
     if (!job.finished) return;
     clearInterval(polling);
     polling = null;

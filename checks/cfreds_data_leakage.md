@@ -28,11 +28,11 @@ This is an open-answer check. The case was worked with its published answers at 
 
 [glossary.md](../glossary.md) defines terms such as lane, pivot, mark, lead, and finding.
 
-**Date and build.** The check ran on 2026-10-22, the day v0.2.0 was released, on a development build made after that release and before v0.3.0, with Hayabusa 4.1.0 and the 2026.5.0 builds of Eric Zimmerman's tools. Each gap's state under Gaps found says where the gap stands in v0.3.0, and a fixed gap names the release that fixed it.
+**Date and build.** The check ran on 2026-10-22, the day v0.2.0 was released, on a development build made after that release and before v0.3.0, with Hayabusa 4.1.0 and the 2026.5.0 builds of Eric Zimmerman's tools. Each gap's state under Gaps found says where the gap stands in v0.3.0, and a fixed gap names the release that fixed it. A gap built since v0.3.0 says so in its state, and the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) lists what is built since.
 
 **Evidence.** Glessner reads a folder of collected files, not a disk image (see Inputs in [known_limitations.md](../known_limitations.md#inputs)). Each image was first read in full outside the app. Its MD5 and SHA-1 matched the values stored in the E01 and the values in the answer document, which gives RM#1's in its section 4.3, not in question 1. The PC's disk holds the two partitions question 2 gives, and one shadow copy store.
 
-The PC's image was unpacked into a collection of 483 files, 506.4 MB. It holds the artifacts the app reads, 5 hash lists from the unpacking step, and 261 files of kinds the app doesn't read yet, most of them collected to show what a case would miss. The unpacking step took no shadow copy, and it left out some files the answers need (gaps 9 and 10). It found nothing to take from the removable media, so each device's folder holds a copy of its E01 image. Read outside the app with The Sleuth Kit, RM#1 opens as exFAT with 8 files in 4 folders. RM#2 opens as FAT with one 0-byte directory entry, the state a quick format leaves, and RM#3 doesn't open. The evidence folder held 486 files, 934.2 MB, in four folders: INFORMANT-PC, RM1, RM2, and RM3.
+The PC's image was unpacked into a collection of 483 files, 506.4 MB. It holds the artifacts the app reads, 5 hash lists from the unpacking step, and 261 files of kinds the app doesn't read yet, most of them collected to show what a case would miss. The unpacking step took no shadow copy, and it left out some files the answers need (gaps 9 and 10). That step was an earlier version of the builder scripts in [scripts/](../scripts/), run on the PC's image in the order [disk_images.md](../disk_images.md) gives: `extract_e01.sh`, `extract_more.sh`, `extract_app_dbs.sh`, and `extract_wide.sh`. It found nothing to take from the removable media, so each device's folder holds a copy of its E01 image. Read outside the app with The Sleuth Kit, RM#1 opens as exFAT with 8 files in 4 folders. RM#2 opens as FAT with one 0-byte directory entry, the state a quick format leaves, and RM#3 doesn't open. The evidence folder held 486 files, 934.2 MB, in four folders: INFORMANT-PC, RM1, RM2, and RM3.
 
 **Loading.** A case was made from the start page, with each top-level folder as a host. The page read "Found 486 files, 934.2 MB, in 4 folders: INFORMANT-PC, RM1, RM2, RM3." and "16 of 16 registry tools found." **Create case and take in evidence** took about 7 s. The Tools page's **Run and load everything ready** then made 10 tool runs in 2 minutes 26 seconds. Every run succeeded and every evidence check passed. AmcacheParser, RBCmd, SrumECmd, Suricata, WxTCmd, and the event XML reader had nothing to read.
 
@@ -238,7 +238,7 @@ The score is 26, 21, 10 of 57, plus 3 out of scope. Of the 57 items in scope, 26
 
 Reading disk images' file systems, recovering deleted files, and carving are out of scope ([scope.md](../scope.md#not-in-scope)). Items 33, 55, 57, and 59 each have a part on the PC and a part only on a removable medium's image. Each is scored on its PC part, and its row names the part left out, as [How each item is scored](README.md#how-each-item-is-scored) says for an item partly out of scope. Item 55 is reached on the PC's trace of winter_whether_advisory.zip, the jump list and shellbag records that item 26 rests on. Items 25 and 26 ask about RM#2. Item 25's answer gives folders under drive E:, and item 26's gives the file and its times, with no device. So neither item needs a tie of E: to RM#2, and item 55 doesn't either.
 
-Items 3 and 18 are partly reached because a version number shows only as a release name, or the reverse, which is decoding: version 6.1 from Windows 7, and Outlook 2013 from the `Office15` folder. Item 58 is partly reached because no PC record could show the devices being taken out on 3/25. Under the rule for synthesis items, a part no record could hold keeps the item partly reached. Item 1 stays counted and missed. It asks for the hashes the images store, which the app doesn't read (gap 2), and that is a different task from reading an image's file system.
+Items 3 and 18 are partly reached because a version number shows only as a release name, or the reverse, which is decoding: version 6.1 from Windows 7, and Outlook 2013 from the `Office15` folder. Item 58 is partly reached because no PC record could show the devices being taken out on 3/25. Under the rule for synthesis items, a part no record could hold keeps the item partly reached. Item 1 stays counted and missed. It asks for the hashes the images store, which v0.3.0 doesn't read (gap 2), and that is a different task from reading an image's file system.
 
 The table gives each item's state on the build the check ran on, before the fixes in v0.3.0.
 
@@ -265,7 +265,7 @@ The report listed the 324 Malicious and Suspicious events in time order. Each ha
 
 ## Gaps found
 
-The check found 32 gaps that held. This page numbers them 1 to 35, in the order the check recorded them, and the results above refer to them by number. A proposed fix that didn't hold is under Not counted as gaps. Two gaps are split here, since their parts have different states: the gap on the removable media's images is gaps 1 to 3, and the gap on a finding's listed events is gaps 30 and 31. Of the 35, 9 are fixed in v0.3.0, 18 are planned, 5 are open, 2 are outside the app, and 1 is out of scope. [CHANGELOG.md](../CHANGELOG.md) lists what v0.3.0 changed, and [known_limitations.md](../known_limitations.md) lists what the app still doesn't do.
+The check found 32 gaps that held. This page numbers them 1 to 35, in the order the check recorded them, and the results above refer to them by number. A proposed fix that didn't hold is under Not counted as gaps. Two gaps are split here, since their parts have different states: the gap on the removable media's images is gaps 1 to 3, and the gap on a finding's listed events is gaps 30 and 31. Of the 35, 9 are fixed in v0.3.0, 18 are planned, 5 are open, 2 are outside the app, and 1 is out of scope. Of the 18 planned, 6 are built since for the next release: gaps 1, 12, 14, 16, 20, and 27. Gaps 11, 15, and 35 are built in part. Gap 2, open in v0.3.0, is built since too. [CHANGELOG.md](../CHANGELOG.md) lists what v0.3.0 changed and what is built since, and [known_limitations.md](../known_limitations.md) lists what the app still doesn't do.
 
 Each gap has one of the [gap states](README.md#gap-states). A fixed gap names the release that fixed it, and a gap whose remedy is documentation is fixed by the release that carries it. Each gap also lists the answer items it affected.
 
@@ -275,7 +275,7 @@ Items: 1, 33, and 53 to 57.
 
 Intake listed the three E01 images among 264 unidentified files, with no hint that they are disk images. RM1, RM2, and RM3 didn't appear as hosts or on the Overview.
 
-**State now:** Planned. Intake will recognize a disk image or container, such as an E01, and say to mount or extract it first. The app still won't read the image's file system. The Planned, not built section of [known_limitations.md](../known_limitations.md#planned-not-built) lists it.
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. Intake recognizes a disk image or container by its format, and the start page, the Tools page, and the Case overview say to mount or extract it first. On a copy of this check's evidence folder, the three removable-media images read as E01 segment 1 each, and the unidentified count fell from 264 to 261. The app still doesn't read an image's file system.
 
 ### Gap 2: The images' stored hashes don't show
 
@@ -283,7 +283,7 @@ Items: 1.
 
 The app shows each evidence file's SHA-256. It doesn't read the MD5 and SHA-1 that an E01 stores for its disk, which item 1 asks for. Read outside the app, each image's stored hashes matched the hashes of its disk and the document's values.
 
-**State now:** Open. Deferred, with the question of what else the app should read from disk images.
+**State now:** Open in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. For an E01 in the evidence folder, the Tools page's list of disk images shows the MD5 and SHA-1 the image stores, beside each file's SHA-256. The app doesn't check them against the image's data.
 
 ### Gap 3: The removable media's file systems aren't read
 
@@ -297,7 +297,7 @@ No installed tool reads RM#1's exFAT file system, the files of RM#2's quick-form
 
 Items: 1 and 2.
 
-The evidence folder holds the files unpacked from the PC's image, not the image, so the image's MD5, SHA-1, and partition table aren't in the case.
+The evidence folder holds the files unpacked from the PC's image, not the image, so the image's MD5, SHA-1, and partition table aren't in the case. Plaso's per-file hash lists in the folder tie its files to the image, except `$MFT`, `$J`, and `$LogFile`, which the lists don't cover, as [disk_images.md](../disk_images.md#what-the-case-cant-show) says.
 
 **State now:** Outside the app, in the collection. Glessner reads a folder of collected files, as the Inputs section of [known_limitations.md](../known_limitations.md#inputs) says.
 
@@ -339,7 +339,7 @@ Items: 11, 21, 30, 31, 36, 52, and 59.
 
 The unpacking step didn't take the Outlook OST (16,818,176 bytes), Google Drive's sync_log.log (408,238 bytes), StickyNotes.snt (4,096 bytes), IconCache.db (2,405,456 bytes), the resignation letter's docx (11,893 bytes) and xps (178,139 bytes), or Internet Explorer's History.IE5. They hold the message bodies, the deleted items, and the message recovered from the OST's unused space (item 21), and the 7 deleted emails (item 52). They also hold sync_log.log's modified times (item 30), sign-in (item 31), and sign-out (item 52), the docx's own properties (item 36), and the icon cache (item 11).
 
-**State now:** Outside the app, in the collection. The unpacking step used for these checks now takes the OST, sync_log.log, StickyNotes.snt, the user's Office documents, and IconCache.db. That step isn't part of this repository. This check's evidence folder stays as it was, so the check's later runs don't gain these files. No reader for them is planned yet.
+**State now:** Outside the app, in the collection. The unpacking step used for these checks now takes the OST, sync_log.log, StickyNotes.snt, the user's Office documents, and IconCache.db. `extract_wide.sh` takes them through `wide_gap_filter.yaml`, both in [scripts/](../scripts/). This check's evidence folder stays as it was, so the check's later runs don't gain these files. No reader for them is planned yet.
 
 ### Gap 10: The shadow copy isn't extracted
 
@@ -347,7 +347,7 @@ Items: 30, 48, and 49.
 
 The PC has one shadow copy store, created 2015-03-25 14:57:27 UTC. The unpacking step took no shadow copy, and the app reads none, as the Inputs section of [known_limitations.md](../known_limitations.md#inputs) says.
 
-**State now:** Open. Deferred, with the question of disk images in gap 2.
+**State now:** Open. Deferred. The builder scripts pass `--vss_stores none`, and `extract_wide.sh` only counts each partition's stores, as [disk_images.md](../disk_images.md#what-the-case-cant-show) says.
 
 ### Gap 11: RECmd's rows list at their key's last write
 
@@ -355,23 +355,23 @@ Items: 6, 10, 11, and 22.
 
 RECmd's plugin rows take the last write time of the key the batch file names as their time. Each entry's own time is only in a raw field (ValueData2 or ValueData3). The Uninstall rows list at 2015-03-25 15:19:05.99 (45 rows) and 2015-03-23 20:02:46.07 (16). The AppCompatCache rows list at 2015-03-25 15:31:05.17 (292) and 10:18:30.75 (13). The SAM's account rows list at 2015-03-22 15:53:01.90, the Volume Info Cache rows at 2009-07-14, and the Device Classes rows at 2015-03-25 10:17:27.55. 20 of the report's 324 entries are such rows.
 
-**State now:** Planned. Each plugin row at its entry's own time, with one event for each time a row carries.
+**State now:** Planned in v0.3.0, and built in part since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. Each row keeps its event at the key's last write. A row whose detail file row pairs with it also adds an event at each of its entry's own times. A case was built again from this check's evidence folder on a development build after v0.3.0, with RECmd 2026.10.2. It keeps an event for each of RECmd's 4,934 rows and adds 1,944 at entries' own times. Among them, the 61 Uninstall entries add 61 events at their own keys' last writes. The 305 AppCompatCache entries add 305 at their files' modified times. The six SAM accounts add 19 at their name keys' last writes, last logons, password changes, and last incorrect passwords. The Volume Info Cache and Device Classes entries add 7 and 72 at their own keys' last writes. The USBSTOR plugin's `Timestamp`, which every serial of one model shares, stays a detail. Windows' own install time stays a value in RECmd's system info rows and gets no event of its own.
 
 ### Gap 12: RECmd's batch file writes no row for ten values the answers need
 
 Items: 3, 13, 18, 29, 32, 33, and 57, and 37 and 42 with no effect on their states.
 
-The hives load, but RECmd's batch file, DFIRBatch.reb, names none of these values: Internet Explorer's svcVersion (11.0.9600.17691), the `CD Burning` value DefaultToMastered (0, last written 2015-03-24 20:53:16.67), `Software\Google\Drive` (last written 2015-03-25 15:22:48.88), Chrome's BLBeacon version (41.0.2272.101), the mailto command, `Clients\Mail`, `Print\Printers` with the XPS Document Writer, the Windows Search database's FileName, CurrentVersion 6.1, and NetworkCards\8. RECmd shows each one when it reads a copy of the hive for that key.
+The hives loaded, but on this run RECmd's batch file, DFIRBatch.reb, gave no row for these values: Internet Explorer's svcVersion (11.0.9600.17691), the `CD Burning` value DefaultToMastered (0, last written 2015-03-24 20:53:16.67), `Software\Google\Drive` (last written 2015-03-25 15:22:48.88), Chrome's BLBeacon version (41.0.2272.101), the mailto command, `Clients\Mail`, `Print\Printers` with the XPS Document Writer, the Windows Search database's FileName, CurrentVersion 6.1, and NetworkCards\8. RECmd shows each one when it reads a copy of the hive for that key. With the 2026.10 tools that v0.3.0 runs, BLBeacon's version loads through DFIRBatch.reb's own Google Chrome entry, which reads `Software\Google\Chrome*` and its subkeys.
 
-**State now:** Planned. The app's own RECmd batch file, with these values and the adapter's interface ID (gap 15).
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. A run gives RECmd DFIRBatch.reb's entries and then the app's own ten additions. The additions write nine of the ten values and Google Drive's file types. They leave BLBeacon to DFIRBatch.reb's Chrome entry. In the case built again after v0.3.0 (gap 11), they write 27 rows.
 
 ### Gap 13: RECmd's USBSTOR and SCSI plugins fail on this hive
 
 Items: 22, and 25 and 55 as context.
 
-Both plugins fail with "Array cannot be null" on ControlSet001 and ControlSet002, so no install, first-install, or removal time loads for either drive. The times are in the hive, one key below where the plugin looks: for RM#2, the `Properties\{83da6326-...}\00000064\00000000` key gives 2015-03-24 13:58:33.612. Device Classes rows carry each serial with its last arrival, so a later connection still ties to a serial. A volume and drive E: tie to a device only by time and by MountedDevices bytes. Items 25 and 55 don't need that tie.
+Both plugins fail with "Array cannot be null" on ControlSet001 and ControlSet002, so no install, first-install, or removal time loads for either drive. The times are in the hive, one key below where the plugin looks: for RM#2, the `Properties\{83da6326-...}\00000064\00000000` key gives 2015-03-24 13:58:33.612. Device Classes rows carry each serial with its key's last write. On this hive, a drive's keys were last written when the drive was connected again, so a later connection still ties to a serial. A volume and drive E: tie to a device only by time and by MountedDevices bytes. Items 25 and 55 don't need that tie.
 
-**State now:** Fixed in v0.3.0, by documentation. The Tools and rule sets section of [known_limitations.md](../known_limitations.md#tools-and-rule-sets) describes the failure and how to read the times from the hive. A report to RECmd's maintainer isn't filed yet.
+**State now:** Fixed in v0.3.0, by documentation. The Tools and rule sets section of [known_limitations.md](../known_limitations.md#tools-and-rule-sets) has a row on RECmd's USB plugins and on how to read the device times from the hive. Since v0.3.0, the row has been reworded for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. It now names the failure above as RECmd 2026.5.0's. In the case built again after v0.3.0 (gap 11), RECmd 2026.10.2 ran the USB, SCSI, and USBSTOR plugins on this hive without an error. Their rows hold no install, first-install, last connection, or removal time for any device, the two USB drives included. The row also says that the USBSTOR and SCSI plugins give every serial of a model one `Timestamp`. It says the USBSTOR rows can repeat one `DiskId`. A report to RECmd's maintainer isn't filed yet.
 
 ### Gap 14: MountedDevices shows its bytes as characters
 
@@ -379,7 +379,7 @@ Items: 2 and 22.
 
 RECmd writes MountedDevices data as one character per byte, not as a disk signature and offset or a device path. The bytes survive one to one, so the offsets decode by hand, but many of them are null and control characters that a page can't show.
 
-**State now:** Planned. MountedDevices decoded into a disk signature and offset, or a device path.
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. A MountedDevices row's message and details give an MBR volume's disk signature and partition offset, a GPT volume's partition GUID, or a device path's parts. ValueData2 keeps the data as RECmd wrote it. In the case built again after v0.3.0 (gap 11), the 10 MountedDevices rows carry the decode.
 
 ### Gap 15: The network adapter's row lacks its interface ID
 
@@ -387,7 +387,7 @@ Items: 9.
 
 The Network Adapters row gives the adapter's description, driver, and provider, but not its NetCfgInstanceId, so the DHCP interface can't be tied to the adapter's name. The link is in the SYSTEM hive's `Class\{4D36E972-...}\0007` key and the SOFTWARE hive's NetworkCards\8 key, which both name {E2B9AEEC-...}, and neither has a row.
 
-**State now:** Planned, with gap 12's batch file: the adapter's row with its interface ID.
+**State now:** Planned in v0.3.0, and built in part since for the next release, with gap 12's batch file. The batch file's Network Cards rows give an adapter's interface ID and description on one key. In the case built again after v0.3.0 (gap 11), the NetworkCards\8 rows name {E2B9AEEC-...} and the Intel(R) PRO/1000 MT Network Connection. The DHCP interface's key is named by that GUID, so those rows tie the interface to the adapter's name. The Network Adapters row still lacks NetCfgInstanceId.
 
 ### Gap 16: RECmd's detail files aren't loaded
 
@@ -395,7 +395,7 @@ Items: 6, and 42 with no effect on its state.
 
 Some RECmd plugins write a detail file beside their rows. The SAM's logon counts (TotalLoginCount and InvalidLoginCount) and the services' start modes are only there. Each row names its detail file, but the app loads only the rows' ValueData to ValueData3 fields. The logon counts in the detail file match the document.
 
-**State now:** Planned. The detail files' columns loaded with their rows.
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. A row whose detail file row pairs with it carries that row's columns in its details. In the case built again after v0.3.0 (gap 11), the six SAM accounts carry their logon counts. The four accounts item 6 names read 10, 2, 0, and 1, as the answers give. All 883 Services rows carry their start modes, and so do the 883 events at their service keys' last writes.
 
 ### Gap 17: The time zone's name kept trailing bytes
 
@@ -427,7 +427,7 @@ Items: 29.
 
 SQLECmd's map for Chromium downloads fails with "no such column: downloads.guid" on this History file's schema, version 29, so no Chrome download loads. A read-only copy of the database holds 2: icloudsetup.exe at 2015-03-23 19:55:47 and googledrivesync.exe at 19:56:30.
 
-**State now:** Planned. A SQLECmd map for this History schema. A report to SQLECmd's maintainer isn't filed yet.
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. A run gives SQLECmd its own maps and the app's two. The app's downloads map reads a Chromium History without a `downloads.guid` column. In the case built again after v0.3.0 (gap 11), the 2 downloads load as 4 events, each download's start and finish. A report to SQLECmd's maintainer isn't filed yet.
 
 ### Gap 21: An LNK event carries its target's times
 
@@ -443,7 +443,7 @@ Items: 36.
 
 MFTECmd writes a $FN row only where its times differ from the $SI times. The resignation letter has three $SI rows and no $FN row, though its two $FN attributes hold the $SI times, as MFTECmd's `--de` option shows on a copy of the `$MFT`.
 
-**State now:** Fixed in v0.3.0, by documentation. The Tools and rule sets section of [known_limitations.md](../known_limitations.md#tools-and-rule-sets) describes it and how to see a file's $FN times. Whether the app's MFTECmd runs should pass `--at`, which writes every $FN time, is undecided.
+**State now:** Fixed in v0.3.0, by documentation. The Tools and rule sets section of [known_limitations.md](../known_limitations.md#tools-and-rule-sets) describes it and how to see a file's $FN times. The app's MFTECmd runs don't pass `--at`, the option that writes every $FN time of a file's long name. A `FnEqualsSi` field on a file's events is built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. It names the MACB letters whose $FN time equals the same letter's $SI time, where that $SI time loaded. So the long name's $FN times that make no event can be read from the file's $SI events. To see a short name's $FN times, run MFTECmd with `--de`, as known_limitations.md says.
 
 ### Gap 23: No lead or suggestion points to the leak
 
@@ -483,7 +483,7 @@ Items: 15, and 44 as context.
 
 16 visits from 2015-03-22 15:09:02 to 15:11:16, all before Chrome's install at 15:11:51.92, were imported from Internet Explorer and read "Chrome visit". No field shows a visit's source.
 
-**State now:** Planned, with gap 20's map, which will give each visit's source.
+**State now:** Planned in v0.3.0, and built since for the next release, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. The app's second SQLECmd map reads Chrome's `visit_source` table. A visit Chrome didn't make itself names its source in its message and details, such as "Chrome visit, imported from Internet Explorer". In the case built again after v0.3.0 (gap 11), the 16 visits read that way.
 
 ### Gap 28: Jump list application names can be wrong
 
@@ -547,7 +547,7 @@ Items: 15, 16, 22 to 36, 51, and 52.
 
 The report's section on what the marked evidence doesn't prove covered Prefetch (7 entries), AppCompatCache (2), and LNK files and jump lists (8): 17 of the 324 entries. The `$J` (104), browser (81), `$MFT` (41), shellbag (40), other registry (29), and event log (12) entries had none. A `$J` entry's folder can read PathUnknown or a later name, and a shellbag's time marks a key's first or last use, not every visit.
 
-**State now:** Planned. Caveat texts for `$J`, shellbag, browser, `$MFT`, registry, and event log entries.
+**State now:** Planned in v0.3.0, and built in part since for the next release. Caveat texts for `$J`, shellbag, browser, `$MFT`, registry, and event log entries. Thirteen registry caveats are built, as the Unreleased section of [CHANGELOG.md](../CHANGELOG.md#unreleased) says. They cover 44 of the 45 kinds of entry time that gap 11's fix adds.
 
 ### Not counted as gaps
 
@@ -564,6 +564,6 @@ The report's section on what the marked evidence doesn't prove covered Prefetch 
 - What WebCache, the Windows Search index, thumbcache, `setupapi.dev.log`, and the removable media's file systems would add inside the app isn't shown, since none of them loads. What they hold comes from outside tools, run on copies.
 - The email channel isn't checked, since the OST wasn't collected.
 - The check has one host. The removable media never became hosts, and the dataset has no packet capture, so pivots across hosts and the clock check had nothing to work on.
-- The step that unpacks the images into the evidence folder isn't part of this repository, so a reader can't yet rebuild the same folder from the published images.
+- The builder scripts that unpacked the PC's image are in [scripts/](../scripts/), and [disk_images.md](../disk_images.md) shows how to run them. A rebuild from the published image with today's scripts holds more files than this check's folder: they keep an empty event log that matches another, and the wide filter takes the OST, sync_log.log, StickyNotes.snt, the user's Office documents, and IconCache.db, which gap 9 lists. The removable media's folders held copies of their E01 images.
 - Gaps 29 to 35 were found while the report was written, and no second pass checked them. A second pass did check every other gap, with outside tools on copies of the hives, WebCache, the index, thumbcache, Chrome's History, `setupapi.dev.log`, and the `$MFT`.
 - The What has been checked section of [known_limitations.md](../known_limitations.md#what-has-been-checked) says what else hasn't been shown.

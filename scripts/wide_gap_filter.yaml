@@ -1,0 +1,88 @@
+description: Windows sources and user files the app doesn't read yet, for measuring which ones a collection holds.
+# Plaso splits each path on / before reading it as patterns, so a class such as [^/]+ breaks; .+ matches one folder,
+# and a folder tree takes one line per depth. An alternation can't span folders, so each profile root has its own line.
+# Each segment must match a whole name, ignoring case, and a pattern matches only at its own depth. A segment's
+# alternation takes parentheses, because dfVFS, which Plaso calls, wraps the segment in ^ and $: a|b would read as
+# ^a or b$.
+# $LogFile isn't here: image_export writes every partition's copy to the one path _LogFile, so extract_wide.sh copies
+# the largest partition's instead, as extract_e01.sh does for $MFT.
+type: include
+path_separator: '/'
+paths:
+# PowerShell console history and transcripts (transcripts at their default location)
+- '/Users/.+/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/.+_history\.txt'
+- '/Windows/System32/config/systemprofile/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/.+_history\.txt'
+- '/Windows/ServiceProfiles/.+/AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/.+_history\.txt'
+- '/Users/.+/Documents/[0-9]+/PowerShell_transcript\..+\.txt'
+# Scheduled task XML, and the legacy .job folder
+- '/Windows/System32/Tasks/.+'
+- '/Windows/System32/Tasks/.+/.+'
+- '/Windows/System32/Tasks/.+/.+/.+'
+- '/Windows/System32/Tasks/.+/.+/.+/.+'
+- '/Windows/System32/Tasks/.+/.+/.+/.+/.+'
+- '/Windows/System32/Tasks/.+/.+/.+/.+/.+/.+'
+- '/Windows/Tasks/.+'
+# WMI repository
+- '/Windows/System32/wbem/Repository/.+'
+- '/Windows/System32/wbem/Repository/FS/.+'
+# User Access Logging
+- '/Windows/System32/LogFiles/Sum/.+'
+# Defender's support logs (MPLog, MPDetection) and DetectionHistory
+- '/ProgramData/Microsoft/Windows Defender/Support/.+'
+- '/ProgramData/Microsoft/Windows Defender/Scans/History/Service/DetectionHistory/.+'
+- '/ProgramData/Microsoft/Windows Defender/Scans/History/Service/DetectionHistory/.+/.+'
+# Device installation logs, with their rotated copies, and Windows XP's
+- '/Windows/INF/setupapi\.dev(\..+)?\.log'
+- '/Windows/setupapi\.log'
+# Windows Error Reporting
+- '/ProgramData/Microsoft/Windows/WER/(ReportArchive|ReportQueue)/.+/Report\.wer'
+- '/Users/.+/AppData/Local/Microsoft/Windows/WER/(ReportArchive|ReportQueue)/.+/Report\.wer'
+# certutil's URL cache metadata. Content/ holds the fetched files themselves and is left out.
+- '/Users/.+/AppData/LocalLow/Microsoft/CryptnetUrlCache/MetaData/.+'
+- '/Windows/System32/config/systemprofile/AppData/LocalLow/Microsoft/CryptnetUrlCache/MetaData/.+'
+- '/Windows/SysWOW64/config/systemprofile/AppData/LocalLow/Microsoft/CryptnetUrlCache/MetaData/.+'
+- '/Windows/ServiceProfiles/.+/AppData/LocalLow/Microsoft/CryptnetUrlCache/MetaData/.+'
+# BITS job queue: qmgr.db and its database logs, or qmgr0.dat and qmgr1.dat
+- '/ProgramData/Microsoft/Network/Downloader/.+'
+# Windows 11 program compatibility assistant
+- '/Windows/appcompat/pca/.+'
+# AnyDesk and TeamViewer logs and settings
+- '/ProgramData/AnyDesk/.+'
+- '/Users/.+/AppData/Roaming/AnyDesk/.+'
+- '/Program Files/TeamViewer/.+\.(log|txt)'
+- '/Program Files \(x86\)/TeamViewer/.+\.(log|txt)'
+- '/Users/.+/AppData/Roaming/TeamViewer/.+\.(log|txt)'
+# Windows diagnostic data
+- '/ProgramData/Microsoft/Diagnosis/EventTranscript/.+'
+# Windows Search index: Windows.edb on Windows 10 and earlier, Windows.db on Windows 11, with their logs
+- '/ProgramData/Microsoft/Search/Data/Applications/Windows/.+'
+# Internet Explorer and Edge Legacy WebCache, with its logs
+- '/Users/.+/AppData/Local/Microsoft/Windows/WebCache/.+'
+# OneDrive logs, and the settings files their readers need
+- '/Users/.+/AppData/Local/Microsoft/OneDrive/logs/.+'
+- '/Users/.+/AppData/Local/Microsoft/OneDrive/logs/.+/.+'
+- '/Users/.+/AppData/Local/Microsoft/OneDrive/logs/.+/.+/.+'
+- '/Users/.+/AppData/Local/Microsoft/OneDrive/settings/.+'
+- '/Users/.+/AppData/Local/Microsoft/OneDrive/settings/.+/.+'
+# Thumbnail cache
+- '/Users/.+/AppData/Local/Microsoft/Windows/Explorer/thumbcache_.+\.db'
+# RDP bitmap cache
+- '/Users/.+/AppData/Local/Microsoft/Terminal Server Client/Cache/.+'
+# Outlook data files, in Outlook's own folder and in Documents\Outlook Files. They can run to gigabytes.
+- '/Users/.+/AppData/Local/Microsoft/Outlook/.+\.(ost|pst)'
+- '/Users/.+/Documents/Outlook Files/.+\.(ost|pst)'
+# Google Drive's sync log, in the client's per-account folder
+- '/Users/.+/AppData/Local/Google/Drive/.+/sync_log\.log'
+# Sticky Notes: StickyNotes.snt on Windows 7, plum.sqlite with its write-ahead log and shared memory on Windows 10
+- '/Users/.+/AppData/Roaming/Microsoft/Sticky Notes/StickyNotes\.snt'
+- '/Users/.+/AppData/Local/Packages/Microsoft\.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum\.sqlite(-wal|-shm)?'
+# Icon cache: IconCache.db on Windows 7, iconcache_*.db in Explorer's folder on Windows 10
+- '/Users/.+/AppData/Local/IconCache\.db'
+- '/Users/.+/AppData/Local/Microsoft/Windows/Explorer/iconcache_.+\.db'
+# Office, XPS, and PDF documents in a user's Documents, Desktop, and Downloads folders: in the folder itself and in
+# folders up to three levels below it. Office's ~$ owner files match, and so do the Zone.Identifier streams of matched
+# files. Documents elsewhere, such as under OneDrive, aren't collected.
+- '/Users/.+/(Documents|Desktop|Downloads)/.+\.(docx?|docm|dotx?|dotm|xlsx?|xlsm|xlsb|xltx?|xltm|pptx?|pptm|ppsx?|ppsm|potx?|potm|xps|oxps|pdf)'
+- '/Users/.+/(Documents|Desktop|Downloads)/.+/.+\.(docx?|docm|dotx?|dotm|xlsx?|xlsm|xlsb|xltx?|xltm|pptx?|pptm|ppsx?|ppsm|potx?|potm|xps|oxps|pdf)'
+- '/Users/.+/(Documents|Desktop|Downloads)/.+/.+/.+\.(docx?|docm|dotx?|dotm|xlsx?|xlsm|xlsb|xltx?|xltm|pptx?|pptm|ppsx?|ppsm|potx?|potm|xps|oxps|pdf)'
+- '/Users/.+/(Documents|Desktop|Downloads)/.+/.+/.+/.+\.(docx?|docm|dotx?|dotm|xlsx?|xlsm|xlsb|xltx?|xltm|pptx?|pptm|ppsx?|ppsm|potx?|potm|xps|oxps|pdf)'

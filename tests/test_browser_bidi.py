@@ -5,13 +5,26 @@ the installed Microsoft Edge through Playwright, as test_browser_smoke does, and
 
 import json
 import re
+from urllib.parse import urlsplit
 
 import pivot_key_fixtures as fx
 import pytest
 from conftest import SEC, T0
 from test_browser_badges import tooltip_for
+from test_browser_frame import no_tool_scan
 from test_browser_pivots import COUNTED, pv, select
-from test_browser_smoke import browser, filtered_view, page, point_of, served_page, wait_drawn  # noqa: F401
+from test_browser_report import open_findings
+from test_browser_smoke import (  # noqa: F401
+    browser,
+    case_menu,
+    filtered_view,
+    page,
+    point_of,
+    refused_with,
+    served_page,
+    wait_drawn,
+    wait_held,
+)
 from test_parsers import EVTX_COLUMNS, write_csv
 from test_pivots import INSTALLER, load_events, system_event, uid_of
 from test_splits import DC1_SEC, EDGE_SEC, PC01_SEC, security
@@ -34,6 +47,9 @@ SHORT = "C:\\Users\\Public\\REPORT~1.SCR"   # NAME's 8.3 form
 USER = f"evil{RLO}resu"
 ADDRESS = f"fe80::1%{RLO}1"   # an IPv6 address keeps its scope ID as written
 MESSAGE = f"Wrote {NAME}"
+# A server fault's text, as the server words an exception it didn't expect: the type and the message, which can name an
+# evidence path
+FAULT = f"OSError: [Errno 22] Invalid argument: '{FILE}'"
 SOURCE = f"bidi{RLO}.csv"
 MIXED = f"LAB{LRI}"
 # Every bidi control, then the zero-width characters, which ordinary text uses (U+200D joins emoji) and which stay
@@ -332,4 +348,66 @@ def test_the_start_page_s_folder_checks_show_bidi_controls_as_escapes(browser, t
 
         p.get_by_role("button", name="Use this folder").click()
         assert field.get_by_label("Evidence folder", exact=True).input_value() == str(evidence / f"copy{RLO}A")
+    assert seen == {stop: [] for stop in seen}
+
+
+def faulting(p, path):
+    """Answer each request for `path` with HTTP 500 and FAULT. The returned function lets the requests through again and
+    drops the refusals from p.errors, since they were the point."""
+    match = lambda url: urlsplit(url).path == path
+    p.route(match, refused_with(FAULT))
+
+    def stop():
+        p.unroute(match)
+        p.errors[:] = [e for e in p.errors if path not in e]
+    return stop
+
+
+def test_a_server_fault_s_text_shows_its_bidi_controls_as_escapes_outside_the_status_line(browser, synthetic_case):  # noqa: F811
+    """A server fault's text can name an evidence path. Each place a page shows it outside the status line writes a
+    right-to-left override in it as [U+202E]: a pivot count's hover, the Rules page's refusal, the Tools page's note
+    while it checks the tools folder, the ATT&CK box's hint in a finding form, and the Export column's result line."""
+    said = shown(FAULT)
+    seen = {}
+    for p in served_page(browser, synthetic_case, setup=no_tool_scan):
+        attack = faulting(p, "/api/attack")   # the list is read once a page, so it fails from the start
+
+        counts = faulting(p, "/api/pivot_count")
+        select(p, p.evaluate("() => window.__app.S.data.events.find((e) => e.code === '4624').uid"))
+        assert p.locator("#details .pv-n", has_text="could not count").first.get_attribute("title") == said
+        seen["pivot count"] = raw_controls(p)
+        counts()
+
+        rule = faulting(p, "/api/rule")
+        case_menu(p, "rulesButton")
+        rules = p.locator("#details[data-page='rules']")
+        rules.get_by_role("button", name="Add rule").click()
+        assert rules.locator("p.muted", has_text="OSError").inner_text() == said
+        seen["Rules page"] = raw_controls(p)
+        rule()
+
+        held = []
+        tools = lambda url: urlsplit(url).path == "/api/tools"
+        p.route(tools, lambda route: held.append(route))   # noqa: B023
+        case_menu(p, "toolsButton")
+        p.locator("#details .tools-checking").wait_for()
+        wait_held(p, held)
+        held[0].fulfill(status=500, content_type="application/json", body=json.dumps({"error": FAULT}))
+        assert p.locator("#details .tools-checking", has_text="failed").inner_text() == f"Tools page failed: {said}"
+        seen["Tools page"] = raw_controls(p)
+        p.unroute(tools)
+        p.errors[:] = [e for e in p.errors if "/api/tools" not in e]
+
+        open_findings(p)
+        p.locator("#details").get_by_role("button", name=re.compile("^New finding")).first.click()
+        hint = p.locator("#details .finding-form .attack-hint", has_text="Could not load")
+        assert hint.inner_text() == f"Could not load the ATT&CK list: {said}"
+        seen["ATT&CK hint"] = raw_controls(p)
+        attack()
+
+        export = faulting(p, "/api/export")
+        p.locator("#details .export-card").first.get_by_role("button", name="CSV").click()
+        assert p.locator("#details .export-result", has_text="Not written").inner_text() == f"Not written: {said}"
+        seen["Export result"] = raw_controls(p)
+        export()
     assert seen == {stop: [] for stop in seen}

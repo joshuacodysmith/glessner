@@ -4,9 +4,9 @@
 
 import { attackPicker } from './attack.js';
 import { askSelection, CONFIRM_ABOVE } from './confirm.js';
-import { $, api, el, plural, post, reportAction, S, setStatus } from './core.js';
+import { $, api, el, fmtAt, plural, post, S, setStatus } from './core.js';
 import { fetchView } from './data.js';
-import { button, focusedPageAction, pageAction } from './event_page.js';
+import { button, focusedPageAction, pageAction, reportWrite } from './event_page.js';
 import { reloadLanes } from './lanes.js';
 import { closeQuickMenu, menuItem, placeMenu } from './quick_menu.js';
 import { renderViewPanel } from './view.js';
@@ -50,8 +50,9 @@ export async function applyTags(uids, { add = [], remove = [], via = '', after =
   let res;
   try { res = await post('/api/tag', { uids, add, remove, ...(via ? { via } : {}), ...consent }); }
   catch (err) { setStatus(`Tag failed: ${err.message}`); return false; }
-  await afterTagChange(done, listed && (() => listed(after)));
-  reportAction(add.length ? `Tagged ${n}: ${add.map(shown).join(', ')}` : `Removed from ${n}: ${remove.map(shown).join(', ')}`, res.server_ms);
+  const reloadError = await afterTagChange(done, listed && (() => listed(after)));
+  reportWrite(add.length ? `Tagged ${n}: ${add.map(shown).join(', ')}` : `Removed from ${n}: ${remove.map(shown).join(', ')}`,
+              res.server_ms, reloadError);
   return true;
 }
 
@@ -60,16 +61,20 @@ export async function decideTagSuggestions(uids, keys, decision) {
   let res;
   try { res = await post('/api/tag_suggestion', { uids, tags: keys, decision }); }
   catch (err) { setStatus(`Change failed: ${err.message}`); return; }
-  await afterTagChange(done);
-  reportAction(`${decision === 'dismissed' ? 'Dismissed' : 'Restored'}: ${keys.map(tagLabel).join(', ')}`, res.server_ms);
+  const reloadError = await afterTagChange(done);
+  reportWrite(`${decision === 'dismissed' ? 'Dismissed' : 'Restored'}: ${keys.map(tagLabel).join(', ')}`, res.server_ms, reloadError);
 }
 
 // `listed` settles the list the change came from (applyTags). It runs before done(), whose redraw of the focused Event
 // page claims the panel: a pivot's list on that page, whose rows can include the event in focus, still has its rows read
-// again.
+// again. The change is written once the server has answered, so lanes that fail to reload don't keep the rest from
+// following. Returns the lanes error's message, or '' when the lanes reloaded or had no need to (reloadTimeline).
 async function afterTagChange(done, listed = null) {
   // Tactic lanes and a View on tags depend on tags, so the lanes reload; the counts in the View panel follow.
-  if (S.groupby.includes('tactic') || S.filterId) await reloadLanes();
+  let failed = '';
+  if (S.groupby.includes('tactic') || S.filterId) {
+    try { await reloadLanes(); } catch (err) { failed = err.message; }
+  }
   await fetchView();
   if (listed) listed();
   done();
@@ -77,12 +82,14 @@ async function afterTagChange(done, listed = null) {
     try { S.tagCounts = await api('/api/tags'); } catch (_) { /* the panel keeps its old counts */ }
     renderViewPanel();
   }
+  return failed;
 }
 
 // The tag picker, in the shared popup menu: the 15 tactics, a technique picked from the ATT&CK list, or the analyst's own
 // tag. `current` holds the keys the one event being tagged already has, so a click on one of those tactics removes it, and
-// the technique list leaves those techniques out. `after` is applyTags'.
-export async function openTagPicker(uids, x, y, current = new Set(), { after = null } = {}) {
+// the technique list leaves those techniques out. `after` is applyTags'. `head` names the events in the picker's head in
+// place of "Tag this event" or "Tag N events".
+export async function openTagPicker(uids, x, y, current = new Set(), { after = null, head = null } = {}) {
   closeQuickMenu();
   if (!uids.length) { setStatus('Select or tick the events to tag first.'); return; }
   const token = S.menuToken;
@@ -112,7 +119,7 @@ export async function openTagPicker(uids, x, y, current = new Set(), { after = n
   const menu = $('quickMenu');
   menu.setAttribute('aria-label', 'Tag events');
   menu.replaceChildren(
-    el('div', { class: 'menu-head' }, el('div', {}, many ? `Tag ${uids.length} events` : 'Tag this event'),
+    el('div', { class: 'menu-head' }, el('div', {}, head || (many ? `Tag ${uids.length} events` : 'Tag this event')),
        el('div', { class: 'muted' }, 'ATT&CK tactics, in kill-chain order')),
     el('div', { class: 'tactic-grid' }, ...tactics), el('hr'),
     el('div', { class: 'menu-technique' }, el('span', {}, 'Technique'), technique.node),
@@ -129,18 +136,22 @@ export const SUGGESTIONS_OPEN_KEY = 'glessner.tagSuggestionsOpen';   // per-brow
 // row. `toggle` is the "N suggested tags" fold toggle beside it, when Hayabusa suggests tags. `rows` go in the header's
 // third row: the event's own tags, and the suggestions, which show only while the toggle is open. On real cases Hayabusa
 // suggests tags on most events it hits, so a full row of them would make the common event three rows tall.
-export function tagZone(ev, uid, n) {
-  if (n > 1) {
-    return { plus: button(`Tag ${n} selected events`, (e) => {
+// With `several`, the page lists several events, and the button tags the `n` selected, which are the list's ticked rows.
+// Its picker's head repeats the button's words, since one ticked event may not be the page's event.
+export function tagZone(ev, uid, n, several) {
+  if (several) {
+    const label = `Tag ${plural(n, 'selected event')}`;
+    return { plus: button(label, (e) => {
+      if (!n) { setStatus('Tick the events to tag first.'); return; }
       const r = e.currentTarget.getBoundingClientRect();
-      openTagPicker([...S.selected], r.left, r.bottom + 2);
+      openTagPicker([...S.selected], r.left, r.bottom + 2, new Set(), { head: label });
     }), toggle: null, rows: [] };
   }
   const tags = ev.tags || [], suggested = ev.tag_suggestions || [];
   // A technique's hover names it; an older one off the ATT&CK list is dashed with the server's flag, and × still removes it
   const chips = tags.map((t) => el('span', { class: `tagchip ${t.kind}${t.flag ? ' off-list' : ''}`,
     title: `${t.kind === 'tactic' ? `${t.key.slice(7)}, ` : ''}${t.name ? `${t.name}, ` : ''}` +
-           `tagged by ${t.who}, ${String(t.at).slice(0, 16).replace('T', ' ')} UTC` +
+           `tagged by ${t.who}, ${fmtAt(t.at)}` +
            (t.via === 'hayabusa' ? ', accepted from Hayabusa' : '') },
     t.label, t.flag ? el('span', { class: 'flag' }, ` (${t.flag})`) : '',
     button('×', () => applyTags([uid], { remove: [t.key] }), { 'aria-label': `Remove the tag ${t.label}` })));

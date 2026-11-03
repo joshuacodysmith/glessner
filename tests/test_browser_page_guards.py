@@ -1022,11 +1022,11 @@ def add_logons(app):
 def test_a_confirm_opened_while_a_decision_is_out_stays_until_it_closes(browser, synthetic_case):  # noqa: F811
     """An event's Accept on the logons rule's Suggestions page is out when the analyst opens Accept all's confirm. The
     Accept's answer doesn't draw the page over the confirm, so the question stays. Cancel closes it, and the page then
-    draws once, without the accepted event."""
+    draws once, with the accepted event no longer pending."""
     def run(p):
         open_suggestions(p, "logons")
         details = p.locator("#details")
-        rows = details.locator(".sg-events li")
+        rows = details.locator(".sg-events li:not(.sg-decided)")
         listed = rows.count()
         p.evaluate(RECORD_REQUESTS)
         accepting = Held(p, "/api/suggestion")
@@ -1053,11 +1053,11 @@ def test_a_confirm_opened_while_a_decision_is_out_stays_until_it_closes(browser,
 def test_a_confirm_opened_while_the_page_reads_itself_again_stays_until_it_closes(browser, synthetic_case):  # noqa: F811
     """After an event's Accept on the logons rule's Suggestions page, the page reads its suggestions again to draw the
     change. Accept all's confirm, opened while that read is out, stays when the read answers. Cancel closes it, and the
-    page then draws, without the accepted event."""
+    page then draws, with the accepted event no longer pending."""
     def run(p):
         open_suggestions(p, "logons")
         details = p.locator("#details")
-        rows = details.locator(".sg-events li")
+        rows = details.locator(".sg-events li:not(.sg-decided)")
         listed = rows.count()
         p.evaluate(RECORD_REQUESTS)
         reading = Held(p, "/api/pending")
@@ -1071,7 +1071,8 @@ def test_a_confirm_opened_while_the_page_reads_itself_again_stays_until_it_close
         settled(p)
         assert block.count() == 1 and rows.count() == listed
         block.get_by_role("button", name="Cancel").click()
-        p.wait_for_function("(n) => document.querySelectorAll('#details .sg-events li').length === n", arg=listed - 1)
+        p.wait_for_function("(n) => document.querySelectorAll('#details .sg-events li:not(.sg-decided)').length === n",
+                            arg=listed - 1)
         settled(p)
         assert block.count() == 0
         assert len(asked(p, "/api/pending?")) == 2
@@ -1233,7 +1234,8 @@ def test_a_tag_from_a_pivots_list_draws_the_list_again(browser, pcase):  # noqa:
 def test_a_tag_from_a_pivots_list_with_the_focused_event_ticked_draws_the_list_again(browser, pcase):  # noqa: F811
     """With the View on Lateral Movement, the RDP logon's Same logon session list holds the logon itself, and both it
     and the session's 4672 are hidden. Tagging the two from the list draws the logon's Event page again, since it is
-    among them, and reads the list again too, so the 4672's row is no longer hidden."""
+    among them, and reads the list again too, so the 4672's row is no longer hidden. The tag picker's head counts the
+    ticked events, so with the 4672 ticked alone it doesn't read "Tag this event", which would name the logon."""
     rdp = uid(pcase, RDP)
     for p in served_page(browser, pcase):
         p.evaluate("(v) => import('/js/view.js').then((m) => m.addViewValue(v))", LATERAL_MOVEMENT)
@@ -1241,14 +1243,20 @@ def test_a_tag_from_a_pivots_list_with_the_focused_event_ticked_draws_the_list_a
         select(p, rdp)
         pv(p, "session").locator("button.pv-go").click()
         listed = p.locator("#relatedList")
+        menu = p.locator("#quickMenu")
         row = listed.locator("li.rel-row", has_text="4672")
         row.wait_for()
         assert row.locator(".tag").inner_text().startswith("hidden")
-        listed.locator(f"li.rel-row[data-uid='{rdp}'] input").check()
         row.locator("input").check()
+        listed.get_by_role("button", name="Tag 1 as...").click()
+        assert menu.locator(".menu-head > div").first.inner_text() == "Tag 1 ticked event"
+        p.keyboard.press("Escape")
+        menu.wait_for(state="hidden")
+        listed.locator(f"li.rel-row[data-uid='{rdp}'] input").check()
         p.evaluate(RECORD_REQUESTS)
         listed.get_by_role("button", name="Tag 2 as...").click()
-        p.locator("#quickMenu").get_by_role("menuitem", name="Lateral Movement", exact=True).click()
+        assert menu.locator(".menu-head > div").first.inner_text() == "Tag 2 ticked events"
+        menu.get_by_role("menuitem", name="Lateral Movement", exact=True).click()
         p.wait_for_function(TAKEN, arg="/api/tag")
         settled(p)
         assert len(asked(p, "/api/event?")) == 1 and len(asked(p, "/api/related?")) == 1

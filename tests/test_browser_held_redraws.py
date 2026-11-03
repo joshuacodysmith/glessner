@@ -215,12 +215,12 @@ def test_a_question_opened_while_a_host_changes_redraw_reads_stays_until_it_clos
 def test_a_refusal_left_open_holds_no_redraw(browser, synthetic_case, monkeypatch):  # noqa: F811
     """A refusal asks nothing, so it holds no redraw. With a mark limited to one event, Accept all on the logons rule's
     Suggestions page shows a refusal in place of its question. An event's Accept made while the refusal is open draws the
-    page again, without the accepted event."""
+    page again, with the accepted event no longer pending."""
     monkeypatch.setattr(server, "MAX_MARK_TARGETS", 1)
     for p in served_page(browser, synthetic_case, setup=add_logons):
         open_suggestions(p, "logons")
         details = p.locator("#details")
-        rows = details.locator(".sg-events li")
+        rows = details.locator(".sg-events li:not(.sg-decided)")
         listed = rows.count()
         details.get_by_role("button", name="Accept all").click()
         details.locator(".confirm-block[role='alert']").wait_for()

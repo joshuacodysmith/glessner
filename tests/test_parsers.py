@@ -691,6 +691,26 @@ def test_a_logon_names_its_authentication_package_once(tmp_path):
     assert failed.message == "4625 Failed logon | Target: CORP\\alice | AuthenticationPackage: NTLM"
 
 
+def test_a_map_part_names_the_package_in_any_column_and_for_a_failed_logon(tmp_path):
+    """The map's package part counts in whichever message column it is written, and for a 4625 too. One with an empty
+    value names no package, so the parser adds its own part."""
+    payload = {"TargetUserName": "alice", "TargetDomainName": "CORP", "LogonType": "3",
+               "AuthenticationPackageName": "NTLM"}
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        security_row(1, 4624, "Successful logon", payload, PayloadData1="Target: CORP\\alice",
+                     PayloadData2="LogonType 3", PayloadData4="AuthenticationPackageName: "),
+        security_row(2, 4624, "Successful logon", payload, PayloadData1="Target: CORP\\alice",
+                     PayloadData2="LogonType 3", PayloadData6="AuthenticationPackageName: NTLM"),
+        security_row(3, 4625, "Failed logon", payload, PayloadData1="Target: CORP\\alice",
+                     PayloadData4="AuthenticationPackageName: NTLM"),
+    ])
+    empty, elsewhere, failed = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert empty.message == "4624 Successful logon | Target: CORP\\alice | LogonType 3 | AuthenticationPackage: NTLM"
+    assert elsewhere.message == ("4624 Successful logon | Target: CORP\\alice | LogonType 3 | "
+                                 "AuthenticationPackageName: NTLM")
+    assert failed.message == "4625 Failed logon | Target: CORP\\alice | AuthenticationPackageName: NTLM"
+
+
 LRM, RLM = "\u200e", "\u200f"
 
 
@@ -727,6 +747,15 @@ def test_bidi_marks_leave_a_windows_date_and_stay_elsewhere(tmp_path):
     f"{LRM}1.2.3", f"1.{LRM}2.3", f"{LRM}6.1.7601", f"{LRM}123-45-6789", f"Windows {LRM}10 2004", f"1 of {LRM}2048",
     f"admin{RLM} 12 2024", f"evil{RLM}gpj 12 2020", f"{LRM}1.2.3 4:56 evil", f"{LRM}9/{LRM}17/{LRM}2020 9:43 evil",
     f"cmd /c echo {RLM}x: {LRM}9/{LRM}17/{LRM}2020 9:43 AM", f"Target: CORP\\admin{RLM} 12 2024",
+    # Pieces no Windows form writes: a comma before the time, fractional seconds, and AM or PM with no space
+    f"{LRM}9/{LRM}17/{LRM}2020, 9:43 AM", f"{LRM}9/{LRM}17/{LRM}2020 9:43:21.5", f"{LRM}9/{LRM}17/{LRM}2020 9:43AM",
+    # A CJK date with no mark before its characters, then with none before only the year's, the month's, or the day's
+    f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5", f"{LRM}2020\u5e74{LRM}9{LRM}\u6708{LRM}17{LRM}\u65e5",
+    f"{LRM}2020{LRM}\u5e74{LRM}9\u6708{LRM}17{LRM}\u65e5", f"{LRM}2020{LRM}\u5e74{LRM}9{LRM}\u6708{LRM}17\u65e5",
+    # A Korean date with no weekday
+    f"{LRM}2020{LRM}\ub144 {LRM}9{LRM}\uc6d4 {LRM}17{LRM}\uc77c",
+    # Words outside the closed lists: a connector other than de, and an AM or PM before the time
+    f"{LRM}17 {LRM}da {LRM}septiembre {LRM}da {LRM}2020", f"{LRM}2020-{LRM}09-{LRM}17 evil 9:43",
 ])
 def test_bidi_marks_stay_in_text_that_is_not_a_windows_date(text):
     from glessner.parsers.evtxecmd import _unmarked_date
@@ -740,6 +769,52 @@ def test_bidi_marks_stay_in_text_that_is_not_a_windows_date(text):
     (f"{LRM}2 {LRM}September {LRM}2020", "2 September 2020"),
     (f"{LRM}Mittwoch, {LRM}2. {LRM}September {LRM}2020 18:21:26", "Mittwoch, 2. September 2020 18:21:26"),
     (f"{RLM}9/{RLM}17/{RLM}2020 9:43 p.m.", "9/17/2020 9:43 p.m."),
+    # Each form below is a date as Windows writes it for the locale named. Where a time follows, a space joins them, as
+    # Task Scheduler and CAPI2 join them.
+    pytest.param(f"{LRM}17.{LRM}9.{LRM}2020. 21:43", "17.9.2020. 21:43", id="hr-HR short"),
+    pytest.param(f"{LRM}17. {LRM}rujna {LRM}2020.", "17. rujna 2020.", id="hr-HR long"),
+    pytest.param(f"{LRM}17. {LRM}9. {LRM}2020 9:43", "17. 9. 2020 9:43", id="sk-SK short"),
+    pytest.param(f"{LRM}17. {LRM}09. {LRM}2020 21:43", "17. 09. 2020 21:43", id="sl-SI short"),
+    pytest.param(f"{LRM}2020. {LRM}09. {LRM}17. 21:43", "2020. 09. 17. 21:43", id="hu-HU short"),
+    # 17.9.2020, then the abbreviation for year
+    pytest.param(f"{LRM}17.{LRM}9.{LRM}2020 {LRM}\u0433. 21:43", "17.9.2020 \u0433. 21:43", id="bg-BG short"),
+    # 17 September 2020, then the abbreviation for year
+    pytest.param(f"{LRM}17 {LRM}\u0441\u0435\u043f\u0442\u0435\u043c\u0432\u0440\u0438 {LRM}2020 {LRM}\u0433.",
+                 "17 \u0441\u0435\u043f\u0442\u0435\u043c\u0432\u0440\u0438 2020 \u0433.", id="bg-BG long"),
+    # 2020, 9, and 17, each followed by the character for year, month, and day
+    pytest.param(f"{LRM}2020{LRM}\u5e74{LRM}9{LRM}\u6708{LRM}17{LRM}\u65e5 21:43:21",
+                 "2020\u5e749\u670817\u65e5 21:43:21", id="ja-JP long"),
+    # The same date, then PM and the time
+    pytest.param(f"{LRM}2020/{LRM}9/{LRM}17 \u4e0b\u5348 09:43", "2020/9/17 \u4e0b\u5348 09:43", id="zh-TW short"),
+    # The same date, then AM and the time
+    pytest.param(f"{LRM}2020/{LRM}9/{LRM}17 \u4e0a\u5348 09:43", "2020/9/17 \u4e0a\u5348 09:43",
+                 id="zh-TW short in the morning"),
+    # 2020, 9, and 17, each followed by the syllable for year, month, and day, then Thursday, then PM and the time
+    pytest.param(f"{LRM}2020{LRM}\ub144 {LRM}9{LRM}\uc6d4 {LRM}17{LRM}\uc77c {LRM}\ubaa9\uc694\uc77c \uc624\ud6c4 9:43:21",
+                 "2020\ub144 9\uc6d4 17\uc77c \ubaa9\uc694\uc77c \uc624\ud6c4 9:43:21", id="ko-KR long"),
+    # The same date and weekday, with no mark before each syllable
+    pytest.param(f"{LRM}2020\ub144 {LRM}9\uc6d4 {LRM}17\uc77c {LRM}\ubaa9\uc694\uc77c",
+                 "2020\ub144 9\uc6d4 17\uc77c \ubaa9\uc694\uc77c", id="ko-KP long"),
+    # AM, then the time
+    pytest.param(f"{LRM}2020-{LRM}09-{LRM}17 \uc624\uc804 9:43", "2020-09-17 \uc624\uc804 9:43", id="ko-KR short"),
+    pytest.param(f"{LRM}jueves, {LRM}17{LRM} de {LRM}septiembre{LRM} de {LRM}2020 21:43:21",
+                 "jueves, 17 de septiembre de 2020 21:43:21", id="es-ES long"),
+    pytest.param(f"{LRM}jueves, {LRM}17 {LRM}de {LRM}septiembre {LRM}de {LRM}2020",
+                 "jueves, 17 de septiembre de 2020", id="es-419 long"),
+    pytest.param(f"{LRM}dijous, {LRM}17 {LRM}de setembre {LRM}de {LRM}2020", "dijous, 17 de setembre de 2020",
+                 id="ca-ES long"),
+    # "d\u2019" in place of "de" before the month
+    pytest.param(f"{LRM}dijous, {LRM}15 {LRM}d\u2019octubre {LRM}de {LRM}2020", "dijous, 15 d\u2019octubre de 2020",
+                 id="ca-ES long in October"),
+    pytest.param(f"{LRM}quinta-feira, {LRM}17{LRM} de {LRM}setembro{LRM} de {LRM}2020",
+                 "quinta-feira, 17 de setembro de 2020", id="pt-BR long"),
+    pytest.param(f"{LRM}17{LRM} de {LRM}setembro{LRM} de {LRM}2020", "17 de setembro de 2020", id="pt-PT long"),
+    pytest.param(f"{LRM}jeudi {LRM}17 {LRM}septembre {LRM}2020 21:43:21", "jeudi 17 septembre 2020 21:43:21",
+                 id="fr-FR long, a weekday without a comma"),
+    pytest.param(f"{LRM}17/{LRM}09/{LRM}2020 09:43 p. m.", "17/09/2020 09:43 p. m.", id="es-MX short"),
+    # A narrow no-break space before PM
+    pytest.param(f"{LRM}9/{LRM}17/{LRM}2020 9:43\u202fPM", "9/17/2020 9:43\u202fPM", id="fil-PH short"),
+    pytest.param(f"{LRM}17/{LRM}9/{LRM}2020 PM 9:43", "17/9/2020 PM 9:43", id="ks-Deva short, PM first"),
 ])
 def test_bidi_marks_leave_each_form_of_a_windows_date(text, shown):
     from glessner.parsers.evtxecmd import _unmarked_date
@@ -838,6 +913,35 @@ def test_bidi_marks_leave_unnamed_dates_in_the_xml_readers_rows(tmp_path):
     assert capi.extra == {"Data1": "Wednesday, September 2, 2020 6:21:26 PM"} and RLM not in capi.message
     assert shutdown.extra["Data2"] == "2020-09-17" and LRM not in shutdown.message
     assert created.process_command_line == f"cmd Time: {CRAFTED}" and f"cmd Time: {CRAFTED}" in created.message
+
+
+def test_bidi_marks_leave_the_date_among_evtxecmds_joined_unnamed_values(tmp_path):
+    """EvtxECmd joins an event's unnamed values into one Data value with ", ", and its 6008 map (an unexpected
+    shutdown) writes that value after "Timestamp: ". The date among the values loses its marks in both; a value that
+    isn't a date keeps them."""
+    written = f"PM 3:32:54, {DATED_FOLDER}, , , 520643, {LRM}1.2.3, "
+    shown = f"PM 3:32:54, 2020-09-17, , , 520643, {LRM}1.2.3, "
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        {**system_row(1, 6008, "Unexpected system shutdown", {}), "Provider": "EventLog",
+         "PayloadData1": f"Timestamp: {written}",
+         "Payload": json.dumps({"EventData": {"Data": written}}, ensure_ascii=False)},
+    ])
+    (shutdown,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert shutdown.extra == {"Data": shown}
+    assert shutdown.message == f"6008 Unexpected system shutdown | Timestamp: {shown.strip()}"
+
+
+def test_bidi_marks_written_as_entities_leave_a_date_in_rows_from_before_2026_10(tmp_path):
+    """EvtxECmd's rows from before 2026.10, which have no RenderingInfo column, hold the event's XML text, where a mark
+    can be an entity such as &#x200E;. Unescaped, it is a mark like any other."""
+    entity_date = "&#x200E;9/&#x200E;17/&#x200E;2020 9:43 AM"
+    write_csv(tmp_path / "evtxecmd.csv", EVTX_COLUMNS, [
+        {**system_row(1, 800, "Task Scheduler service", {"LastRunDateTime": entity_date, "TaskName": "&#x200F;evil"}),
+         "Provider": "Microsoft-Windows-TaskScheduler", "PayloadData1": f"LastRunDateTime: {entity_date}"},
+    ])
+    (task,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert task.extra == {"LastRunDateTime": "9/17/2020 9:43 AM", "TaskName": f"{RLM}evil"}
+    assert task.message == "800 Task Scheduler service | LastRunDateTime: 9/17/2020 9:43 AM"
 
 
 def test_bidi_marks_stay_in_a_date_shaped_value_whose_field_names_no_date(tmp_path):

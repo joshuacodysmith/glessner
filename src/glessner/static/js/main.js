@@ -4,7 +4,7 @@
 // Entry module: index.html loads it, and its imports bring in the rest.
 
 import { alignClocks, renderClockSwitch } from './clock.js';
-import { $, api, el, KEY_LABEL, LABELS_MIN_PX, plural, reportAction, S, setStatus } from './core.js';
+import { $, api, el, KEY_LABEL, LABELS_MIN_PX, plural, reportAction, S, setStatus, showControls } from './core.js';
 import { refreshCounts } from './counts.js';
 import { animateView, fetchView, fitTitle, scheduleFetch, setView } from './data.js';
 import { setupDivider, setupLabelDivider } from './dividers.js';
@@ -51,7 +51,8 @@ export async function init() {
   const page = params.get('page');
   const saved = savedPlace();
   const overviewFirst = saved ? saved.tab === 'overview' : !page && !(from < to) && S.meta.rows > 0;
-  $('caseName').textContent = $('caseName').title = S.meta.case;   // the name ellipsizes in a narrow header
+  // The name ellipsizes in a narrow header. It shows its bidi controls, since a case made elsewhere can carry any name.
+  $('caseName').textContent = $('caseName').title = showControls(S.meta.case);
   const presetSelect = $('groupby');
   presetSelect.replaceChildren(...S.meta.presets.map((p, i) => el('option', { value: String(i) }, p.map((k) => KEY_LABEL[k]).join(' > '))));
   if (saved && saved.preset !== null) {
@@ -105,7 +106,7 @@ export async function init() {
   // A case without events yet starts on the Tools page, which runs the tools that load them.
   if (saved) {
     let words;
-    try { words = await restorePlace(saved); } catch (err) { words = `The reload could not put the page back: ${err.message}`; }
+    try { words = await restorePlace(saved, from < to); } catch (err) { words = `The reload could not put the page back: ${err.message}`; }
     reportAction(orphanWarning ? `${orphanWarning} ${words}` : words);
   } else if (page === 'import') showImport();
   else if (page === 'tools' || !S.meta.rows) showTools();

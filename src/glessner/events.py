@@ -343,13 +343,20 @@ def held_sources(db_path: Path, tool: str, host: str, runs: Iterable[str]) -> se
             f"AND run_id IN (SELECT v FROM {held})", [tool, host]).fetchall()}
 
 
+class AmbiguousRoot(ValueError):
+    """Raised by names_by_root when a run's stored paths fit two roots equally well and the evidence is at neither, so
+    the paths alone can't tell which file each one names."""
+
+
 def names_by_root(sources: Iterable[str], inputs: Iterable[str], root: str = "") -> dict[str, str]:
     """The one of `inputs`, evidence-relative paths, that each of `sources`, the files a run's rows name in extended-length
     form, names. A run named all its files under one root, so a source is an input's when it is that root, a slash, and
     the input, without regard to case: `logs/eve.json` ends in `eve.json` and is another file. The root is the one that
     explains the most sources. Of those that explain as many, it is `root`, the evidence folder's extended-length path
-    when the evidence is still there, and otherwise the shortest, so a run with one source takes the longest input its
-    path ends in. A source that is the root and none of the inputs is not in the answer."""
+    when the evidence is still there. When it is none of them, AmbiguousRoot is raised rather than a guess: when one
+    input's path ends in another's, a source can be the longer input under one root and the shorter under a folder
+    below it, as `R/logs/eve.json` is `logs/eve.json` under `R` and `eve.json` under `R/logs`.
+    A source that is the root and none of the inputs is not in the answer."""
     tails = {path: path.casefold() for path in inputs}
     by_root: dict[str, dict[str, str]] = {}
     for source in sources:
@@ -357,8 +364,15 @@ def names_by_root(sources: Iterable[str], inputs: Iterable[str], root: str = "")
         for path, tail in tails.items():
             if low.endswith(f"/{tail}"):
                 by_root.setdefault(low[:-len(tail) - 1], {})[source] = path
-    here = root.casefold()
-    return by_root[max(by_root, key=lambda r: (len(by_root[r]), r == here, -len(r)))] if by_root else {}
+    if not by_root:
+        return {}
+    most = max(len(names) for names in by_root.values())
+    tied = [r for r, names in by_root.items() if len(names) == most]
+    if len(tied) == 1:
+        return by_root[tied[0]]
+    if root and (here := root.casefold()) in tied:
+        return by_root[here]
+    raise AmbiguousRoot(f"the paths fit {len(tied)} roots equally well, and the evidence is at none of them")
 
 
 def _extended_forms(con: duckdb.DuckDBPyConnection, tool: str, host: str | None, inputs: Mapping[str, Iterable[str]],
@@ -372,9 +386,9 @@ def _extended_forms(con: duckdb.DuckDBPyConnection, tool: str, host: str | None,
 
     A row names the file its run read that fits the run's root (names_by_root, which `root` helps), so the rows of
     `logs/eve.json` are not those of `eve.json`, whatever else the run read and wherever the evidence was. A run whose
-    rows fit two roots equally well, because a folder named like the root's last folder holds a file of the same name,
-    takes the root the evidence is at, or the shortest when it is not at either. A row that fits none of its run's files
-    is left."""
+    rows fit two roots equally well, which can happen when the path of one file it read ends in another's, takes the
+    root the evidence is at. When the evidence is at neither, its rows can't say which file they name, so the
+    load leaves them all. A row that fits none of its run's files is left too."""
     wanted = {well_formed(PureWindowsPath(source).as_posix()).casefold() for source in sources}
     read = {run: [well_formed(PureWindowsPath(p).as_posix()) for p in files] for run, files in inputs.items()}
     held = id_table(con, "extended_runs", sorted(read))
@@ -384,8 +398,14 @@ def _extended_forms(con: duckdb.DuckDBPyConnection, tool: str, host: str | None,
     stored: dict[str, list[str]] = {}
     for run_id, path in rows:
         stored.setdefault(run_id, []).append(path)
-    return {path for run_id, paths in stored.items() for path, named in names_by_root(paths, read.get(run_id, ()), root).items()
-            if named.casefold() in wanted}
+    replaced = set()
+    for run_id, paths in stored.items():
+        try:
+            names = names_by_root(paths, read.get(run_id, ()), root)
+        except AmbiguousRoot:
+            continue
+        replaced |= {path for path, named in names.items() if named.casefold() in wanted}
+    return replaced
 
 
 def load(db_path: Path, events: Iterable[Event], *, host: str | None, tool: str, tool_version: str, run_id: str,

@@ -1,5 +1,5 @@
 import { clockCell, refocus, renderClockSwitch } from './clock.js';
-import { $, api, EITHER_END_PIVOT, el, fmtAt, KEY_LABEL, PIVOTS, plural, post, ROLES, S, setStatus } from './core.js';
+import { $, api, EITHER_END_PIVOT, el, fmtAt, KEY_LABEL, listWords, PIVOTS, plural, post, ROLES, S, setStatus } from './core.js';
 import { refreshCounts } from './counts.js';
 import { fetchView, fitTitle } from './data.js';
 import { artifactName, button, focusedPageAction, loadDetails, pageAnswered, settleRedraw, showingPage } from './event_page.js';
@@ -142,17 +142,18 @@ export async function applyHosts(res, done, { moved = false } = {}) {
   renderClockSwitch();
   if (!$('hostsPanel').hidden) renderHosts();
   const range = moved ? rereadRange() : null;
-  let lanes = null;
-  try { await reloadLanes(); } catch (err) { lanes = err; }
+  let lanesFailed = '';
+  try { await reloadLanes(); } catch (err) { lanesFailed = err.message; }
   const stale = await range;   // the view asks what lies outside Fit case's range, so it waits for the range
-  await fetchView();
+  const viewFailed = await fetchView();
   refreshCounts();
   // The reload is awaited here, not left to the helper, so a control focused after an alignment is on the page it draws
   const unchanged = done(false);   // the page the change was asked from, with no page asked for since
   const page = `event:${S.focus}`;
   if (S.focus && (unchanged || pageAnswered(page, false)) && showingPage(page)) await settleRedraw(() => loadDetails(S.focus));
   if (moved) pageAnswered('investigate');   // the worklist lists the events in their adjusted time order
-  const warning = lanes ? `The hosts changed, but the timeline didn't reload: ${lanes.message}`
+  const failed = lanesFailed || viewFailed;
+  const warning = failed ? `The hosts changed, but the timeline didn't reload: ${failed}`
     : stale ? `The hosts changed, but the case's range didn't reload: ${stale.message}` : '';
   if (warning) setStatus(warning);
   return warning;
@@ -186,7 +187,7 @@ const splitControl = (host, role) => [...$('hostSplits').querySelectorAll(`[data
 const afterUndo = (host) => () => splitControl(host, 'open') || $('hostsButton');
 // Every pivot but the logon session's searches the whole case; the time window's isn't a pivot button.
 const CASE_WIDE = [...PIVOTS.filter(([kind]) => kind !== 'session').map(([, label]) => label), EITHER_END_PIVOT[1]];
-const CASE_WIDE_TEXT = `${CASE_WIDE.slice(0, -1).join(', ')}, and ${CASE_WIDE[CASE_WIDE.length - 1]}`;
+const CASE_WIDE_TEXT = listWords(CASE_WIDE);
 
 function renderSplits() {
   const box = $('hostSplits');

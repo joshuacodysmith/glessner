@@ -13,6 +13,7 @@ from test_analysis_relations import WINDOWS_10, add_os
 from glessner.events import Event, event_uid, load
 from glessner.export import _hosts_section, export_timeline, write_report
 from glessner.identity import HostIdentity, Identity
+from glessner.journal import JournalError
 from glessner.parsers import PARSERS, ParseContext
 from glessner.queries import QueryError, investigate, pending_for_source
 from glessner.rules import RuleError, parse
@@ -24,6 +25,7 @@ from glessner.server import (
     api_mark,
     api_meta,
     api_pending,
+    api_reject_ticked,
     api_rule,
     api_rules,
     api_suggestion,
@@ -189,6 +191,93 @@ def test_accept_reject_and_restore(app):
     assert last["action"] == "mark" and last["note"] == "Accepted suggestion from hayabusa"
     with pytest.raises(ValueError, match="already exists"):
         api_rule(app, {"op": "add", "text": morty})
+
+
+def decisions(app):
+    """The journal's suggestion decisions, in order."""
+    lines = (app.case.folder / "journal.jsonl").read_text().splitlines()
+    return [entry for entry in map(json.loads, lines) if entry["action"] == "suggestion_decision"]
+
+
+LOGONS_RULE = "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"
+
+
+def test_reject_ticked_finds_the_pending_sources_of_the_ticked_events(app):
+    """The server finds each ticked event's sources, and journals one entry for each with the events it suggests. An
+    event with no pending suggestion is skipped, an event two sources suggest leaves both, and an unticked event keeps
+    its suggestion."""
+    api_rule(app, {"op": "add", "text": LOGONS_RULE})
+    rdp, morty, machine = uid_at(app, T0), uid_at(app, T0 + 60 * SEC), uid_at(app, T0 + 61 * SEC)
+    plain = uid_at(app, T0 + 63 * SEC)   # a 4672, which no source suggests
+    assert lane_mark(app, plain) == "Unreviewed"
+    result = api_reject_ticked(app, {"uids": [morty, rdp, plain], "note": " seen before "})
+    assert (result["changed"], result["skipped"], result["sources"]) == (2, 1, ["hayabusa", "logons"])
+    made = decisions(app)
+    assert [(e["source"], e["decision"], e["note"]) for e in made] == [("hayabusa", "rejected", "seen before"),
+                                                                       ("logons", "rejected", "seen before")]
+    assert made[0]["targets"] == [rdp] and made[1]["targets"] == sorted([morty, rdp])
+    assert all("confirmed" not in e for e in made)
+    assert lane_mark(app, rdp) == lane_mark(app, morty) == "Unreviewed"
+    assert lane_mark(app, machine) == "Suggested: suspicious"   # the unticked event keeps its suggestion
+    still = pending_for_source(app.reader(), "logons")["suspicious"]
+    assert machine in still and rdp not in still and morty not in still
+    # The Event page can restore a rejection, source by source
+    api_suggestion(app, {"decision": "restore", "source": "logons", "uids": [morty]})
+    assert lane_mark(app, morty) == "Suggested: suspicious"
+
+
+def test_reject_ticked_skips_events_decided_meanwhile_and_records_the_consent(app):
+    """A confirmed request names the count the question stated. An event marked or rejected since the page drew is
+    skipped, its mark stays, and each entry records the count and how many were skipped."""
+    api_rule(app, {"op": "add", "text": LOGONS_RULE})
+    rdp, morty, desk = uid_at(app, T0), uid_at(app, T0 + 60 * SEC), uid_at(app, T0 + 874 * SEC)
+    api_mark(app, {"uids": [morty], "value": "authorized", "note": ""})
+    api_suggestion(app, {"decision": "reject", "source": "logons", "uids": [desk]})
+    before = len(decisions(app))
+    result = api_reject_ticked(app, {"uids": [rdp, morty, desk], "confirmed": {"count": 3}})
+    assert (result["changed"], result["skipped"]) == (1, 2)
+    made = decisions(app)[before:]
+    assert {e["source"]: e["targets"] for e in made} == {"hayabusa": [rdp], "logons": [rdp]}
+    assert all(e["confirmed"] == {"count": 3, "skipped": 2} for e in made)
+    assert lane_mark(app, morty) == "Authorized"
+
+
+def test_reject_ticked_shows_the_rejections_written_before_a_later_source_s_entry_fails(app, monkeypatch):
+    """The first source's rejection is on record when the second source's entry fails, so its event reads as rejected,
+    and another try journals only the second source's."""
+    morty_rule = "id: morty-logons\nsuggest: suspicious\nwhen: {field: account, equals: 'c137\\mortysmith'}\n"
+    api_rule(app, {"op": "add", "text": morty_rule})
+    rdp, morty = uid_at(app, T0), uid_at(app, T0 + 60 * SEC)
+    real = app.journal.append
+
+    def refuse_morty_logons(action, **payload):
+        if payload["source"] == "morty-logons":
+            raise JournalError("the disk is full")
+        return real(action, **payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app.journal, "append", refuse_morty_logons)
+        with pytest.raises(JournalError):
+            api_reject_ticked(app, {"uids": [rdp, morty]})
+    assert [e["source"] for e in decisions(app)] == ["hayabusa"]
+    assert lane_mark(app, rdp) == "Unreviewed" and lane_mark(app, morty) == "Suggested: suspicious"
+    result = api_reject_ticked(app, {"uids": [rdp, morty]})
+    assert (result["changed"], result["skipped"], result["sources"]) == (1, 1, ["morty-logons"])
+    assert [e["source"] for e in decisions(app)] == ["hayabusa", "morty-logons"]
+    assert lane_mark(app, morty) == "Unreviewed"
+
+
+def test_reject_ticked_with_nothing_pending_writes_nothing(app):
+    plain = uid_at(app, T0 + 63 * SEC)
+    assert api_reject_ticked(app, {"uids": [plain, plain]}) == {"changed": 0, "skipped": 1, "sources": []}
+    assert decisions(app) == []
+
+
+@pytest.mark.parametrize("body", [{}, {"uids": []}, {"uids": "abc"}, {"uids": [1]}, {"uids": ["abc"], "confirmed": 3}])
+def test_reject_ticked_refuses_a_bad_request(app, body):
+    with pytest.raises(QueryError):
+        api_reject_ticked(app, body)
+    assert decisions(app) == []
 
 
 def test_to_investigate_and_the_rules_page_count_pending_suggestions_after_a_manual_mark(app):
@@ -795,7 +884,7 @@ def test_the_report_lists_an_imports_hosts_in_order(synthetic_case):
     a = App(synthetic_case)
     try:
         text = write_report(a.con, a.case, a.identity, a.manifest, a.journal.state)[0].read_text(encoding="utf-8")
-        assert re.findall(r"\| `r9` \| import \| t \| (\w+) \| 1 \|", text) == sorted(hosts)
+        assert re.findall(r"\| `r9` \| Import \| t \| (\w+) \| 1 \|", text) == sorted(hosts)
     finally:
         a.con.close()
 

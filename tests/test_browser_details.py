@@ -20,14 +20,17 @@ from test_browser_smoke import (  # noqa: F401
     to_timeline,
 )
 from test_clock import accepted, flow
+from test_file_parsers import SI_TIMES, mft_row, write_csv
 from test_found_output_sources import FOUND, KAPE, OTHER_HOST, SYSTEM_LOG, evtxecmd_run, found_case
 from test_found_output_sources import load as load_found
 from test_pivots import RDP, load_events, pcase, pcase_events  # noqa: F401
+from test_recmd import GPT_DATA, MBR_DATA, USB_DATA, write_mounted_devices
 from test_timezones import add_zone
 
 from glessner.events import Event, load
 from glessner.imports import run_import
 from glessner.intake import intake, manifest_hashes
+from glessner.parsers import PARSERS, ParseContext
 from glessner.parsers.autoruns import BUILT
 from glessner.server import api_mark, api_rule
 
@@ -684,8 +687,8 @@ KIND_ROOM = """() => {
 }"""
 
 
-def add_logon(case, tags=False, kind=LOGON_KIND):
-    """A 4624 on DC01 whose kind reads `kind`, with a medium Hayabusa hit on it, which suggests Suspicious, and with the
+def add_logon(case, tags=False, kind=LOGON_KIND, host="DC01"):
+    """A 4624 on `host` whose kind reads `kind`, with a medium Hayabusa hit on it, which suggests Suspicious, and with the
     hit's ATT&CK tags when `tags` is true, which Hayabusa suggests too. The event's ID."""
     text = LOGON_TEXT.format(kind.removesuffix(", Security"))
     logon_event = Event(T0 + 5 * SEC, "Event Recorded", "evtx", LOGON_LOG, "401", text, record_id=401,
@@ -694,7 +697,7 @@ def add_logon(case, tags=False, kind=LOGON_KIND):
     hit = Event(T0 + 5 * SEC, "Event Recorded", "hayabusa", LOGON_LOG, "401:rule", f"{HIT_TITLE} [medium]", record_id=401,
                 log_channel="Security", rule_title=HIT_TITLE, rule_level="medium", extra=TWO_TAGS if tags else None)
     for i, (loaded, tool) in enumerate(((logon_event, "evtxecmd"), (hit, "hayabusa"))):
-        load(case.db_path, [loaded], host="DC01", tool=tool, tool_version="t", run_id=f"header-{i}",
+        load(case.db_path, [loaded], host=host, tool=tool, tool_version="t", run_id=f"header-{i}",
              replaces_sources=[], staging_dir=case.folder)
     return uid(case, f"tool = 'evtxecmd' AND source_file = '{LOGON_LOG}'")
 
@@ -740,6 +743,73 @@ def open_logon(p, logon, mark=None, tags_open=False):
         assert toggle.get_attribute("aria-expanded") == "true"
         p.locator("#details .ev-head-more .tagchip.suggested").first.wait_for()
     return p.evaluate(KIND_ROOM)
+
+
+# The width an event ID and the ellipsis after it need in the kind's font
+ID_WIDTH = """(id) => {
+    const kind = document.querySelector('#details .ev-ident .kind');
+    const probe = kind.cloneNode();
+    probe.textContent = `${id}…`;
+    probe.style.cssText = 'position: absolute; min-width: 0; flex: none; overflow: visible';
+    kind.parentNode.append(probe);
+    const width = probe.getBoundingClientRect().width;
+    probe.remove();
+    return width;
+}"""
+# The host's width in its row, its width with nothing to fit in, and the room from its start to the row's end, all in
+# the browser's own layout units
+HOST_WIDTHS = """() => {
+    const host = document.querySelector('#details .ev-ident .host');
+    const free = host.cloneNode(true);
+    free.style.position = 'absolute';
+    host.parentNode.append(free);
+    const shown = host.getBoundingClientRect(), row = host.parentNode.getBoundingClientRect();
+    const widths = [shown.width, free.getBoundingClientRect().width, row.right - shown.left];
+    free.remove();
+    return widths;
+}"""
+HEADER_WIDTHS = range(1151, 1291, 7)
+
+
+@pytest.mark.parametrize("name", ["WEB01", "INFORMANT-PC"])
+def test_a_short_host_name_stays_whole(browser, synthetic_case, name):  # noqa: F811
+    """A host name of up to 12 characters never gives up width to the kind in the two-column header. WEB01 fits inside
+    the row at every width."""
+    logon = add_logon(synthetic_case, tags=True, host=name)
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1400, "height": 720})
+        open_logon(p, logon, tags_open=True)
+        for width in HEADER_WIDTHS:
+            p.set_viewport_size({"width": width, "height": 720})
+            p.wait_for_timeout(50)
+            shown, whole, room = p.evaluate(HOST_WIDTHS)
+            assert shown == whole, (name, width, shown, whole)
+            assert name != "WEB01" or room >= whole, (width, room, whole)
+
+
+def test_a_long_host_name_leaves_the_kind_its_event_id(browser, synthetic_case):  # noqa: F811
+    """A longer host name gives up room with an ellipsis, so the kind shows a five-digit event ID at every width of the
+    two-column header, and the name's hover holds it whole. With room to spare, the name is whole."""
+    name = "WORKSTATION-FINANCE-07"
+    logon = add_logon(synthetic_case, tags=True, host=name)
+    for p in served_page(browser, synthetic_case):
+        p.set_viewport_size({"width": 1400, "height": 720})
+        open_logon(p, logon, tags_open=True)
+        assert p.locator("#details .ev-ident .host").get_attribute("title") == name
+        needs = p.evaluate(ID_WIDTH, "20001")
+        for width in HEADER_WIDTHS:
+            p.set_viewport_size({"width": width, "height": 720})
+            p.wait_for_timeout(50)
+            kind, row = p.evaluate(KIND_ROOM), box(p, ".ev-ident")
+            assert kind["width"] >= needs and kind["right"] <= row["right"] + 0.5, (width, kind, row, needs)
+        p.set_viewport_size({"width": 1151, "height": 720})
+        p.wait_for_timeout(50)
+        shown, whole, _room = p.evaluate(HOST_WIDTHS)
+        assert shown < whole
+        p.set_viewport_size({"width": 1800, "height": 720})
+        p.wait_for_timeout(50)
+        shown, whole, _room = p.evaluate(HOST_WIDTHS)
+        assert shown == whole
 
 
 def test_the_clock_chip_starts_the_summary_row(aligned_logon):
@@ -1006,6 +1076,31 @@ def test_an_event_whose_values_name_a_built_in_property_reads_as_written(browser
         assert p.evaluate("window.__app.S.focusEvent.label") == "constructor on DC01"
 
 
+# The page scripts' shared helpers: names as a list in words, whole and capped, and a table's reads of keys named after a
+# property every object has, of an empty value, and of no table
+LIST_AND_LOOKUP = """async () => {
+    const { listWords, lookup } = await import('/js/core.js');
+    const names = ['A', 'B', 'C', 'D', 'E'], table = { known: 'yes', empty: '' };
+    return {
+        words: [0, 1, 2, 3, 5].map((n) => listWords(names.slice(0, n))),
+        capped: [3, 4, 5].map((n) => listWords(names.slice(0, n), { cap: 3 })),
+        read: ['known', 'empty', 'constructor', '__proto__', 'toString', 'missing'].map((key) => lookup(table, key) ?? null),
+        none: lookup(null, 'known') ?? null,
+    };
+}"""
+
+
+def test_the_shared_helpers_list_names_with_a_serial_comma_and_read_only_a_table_s_own_keys(page):  # noqa: F811
+    """listWords joins names with "and", and three or more with a serial comma; with a cap it names the first and counts
+    the rest. lookup reads only a key the table holds itself, an empty value as written, and nothing from no table."""
+    assert page.evaluate(LIST_AND_LOOKUP) == {
+        "words": ["", "A", "A and B", "A, B, and C", "A, B, C, D, and E"],
+        "capped": ["A, B, and C", "A, B, C, and 1 more", "A, B, C, and 2 more"],
+        "read": ["yes", "", None, None, None, None],
+        "none": None,
+    }
+
+
 # Whether a text box shows its whole placeholder: as drawn, and at the narrowest width the page lets it shrink to
 PLACEHOLDER_FITS = "(i) => { i.value = i.placeholder; const fits = i.scrollWidth <= i.clientWidth; i.value = ''; return fits; }"
 NARROWEST_FITS = f"""(i) => {{
@@ -1110,3 +1205,64 @@ def test_the_record_fold_names_the_file_whose_hash_it_cites(browser, tmp_path): 
             select(p, event)
             p.wait_for_selector(f"#details[data-key='event:{event}'] .ev-facts")
             assert p.evaluate(FOLD_HASH) == [expected[name]], name
+
+
+# The MFT entry group's labels, and the value of its FnEqualsSi row
+MFT_GROUP = """() => {
+    const dts = [...document.querySelectorAll('#details .ev-facts .fieldgroup')]
+        .find((g) => g.querySelector('h3').textContent === 'MFT entry').querySelectorAll('dt');
+    const labels = [...dts].map((dt) => dt.textContent);
+    const fn = [...dts].find((dt) => dt.textContent === 'FnEqualsSi');
+    return { labels, fn: fn && fn.nextElementSibling.firstChild.textContent };
+}"""
+
+
+def test_the_mft_entry_group_names_the_fn_letters_equal_to_si(browser, synthetic_case, tmp_path):  # noqa: F811
+    """An MFT event's MFT entry group lists FnEqualsSi after SI<FN, with the letters whose $FN time equals the $SI
+    time, as the parser writes them for a row whose $FN cells are blank."""
+    when = "2020-09-19 03:30:00.0000000"
+    write_csv(tmp_path / "mftecmd.csv", [mft_row(**dict.fromkeys(SI_TIMES, when),
+                                                 SourceFile=str(synthetic_case.evidence / "DC01" / "$MFT"))])
+    events = list(PARSERS["mftecmd_csv"](ParseContext(tmp_path, synthetic_case.evidence)))
+    load(synthetic_case.db_path, events, host="DC01", tool="mftecmd", tool_version="t", run_id="mft1",
+         replaces_sources=["DC01/$MFT"], staging_dir=synthetic_case.folder)
+    event = uid(synthetic_case, "artifact = 'mft' AND source_record = '23554-14:Letter.docx'")
+    for p in served_page(browser, synthetic_case):
+        select(p, event)
+        group = p.evaluate(MFT_GROUP)
+        assert group["fn"] == "MACB"
+        assert group["labels"].index("FnEqualsSi") == group["labels"].index("SI<FN") + 1
+
+
+# The Registry value group's rows, each as its label and the value's text
+REGISTRY_GROUP = """() => [...[...document.querySelectorAll('#details .ev-facts .fieldgroup')]
+    .find((g) => g.querySelector('h3').textContent === 'Registry value').querySelectorAll('dt')]
+    .map((dt) => [dt.textContent, dt.nextElementSibling.firstChild.textContent])"""
+PLUGIN_ROW = ["HiveType", "Category", "ValueType", "ValueData", "ValueData2", "DataFormat"]   # a plugin row's own fields
+# The fields the group lists after the decode's, each given to every row the test writes
+LATER_FIELDS = {"ValueData3": "Third data", "Comment": "Last Write Timestamp is for entire key, not each individual value",
+                "Deleted": "True"}
+
+
+def test_the_registry_value_group_lists_the_mounted_devices_decode(browser, synthetic_case, tmp_path):  # noqa: F811
+    """A MountedDevices plugin row's Registry value group lists the decode's fields after the ValueData2 they are read
+    from and before ValueData3, Comment, and Deleted: an MBR volume's disk signature, offset, and sector, a GPT volume's
+    partition GUID, and a device path's bus, vendor and product, instance, and interface class GUID."""
+    hive = synthetic_case.evidence / "DESKTOP" / "Windows" / "System32" / "config" / "SYSTEM"
+    write_mounted_devices(tmp_path, str(hive), "2020-09-19 03:00:00", MBR_DATA, GPT_DATA, USB_DATA, **LATER_FIELDS)
+    events = list(PARSERS["recmd_csv"](ParseContext(tmp_path, synthetic_case.evidence)))
+    load(synthetic_case.db_path, events, host="DESKTOP", tool="recmd", tool_version="t", run_id="md1", replaces_sources=[],
+         staging_dir=synthetic_case.folder)
+    expected = {"MBR partition": {"DiskSignature": "F0424120", "PartitionOffset": "105906176", "PartitionSector": "206848"},
+                "GPT partition": {"PartitionGuid": "{01234567-89ab-cdef-8f94-9f0d0a225c7b}"},
+                "Device path": {"DeviceBus": "USBSTOR", "DeviceVendorProduct": "Disk&Ven_Acme&Prod_Stick&Rev_1.00",
+                                "DeviceInstance": "0123456789AB&0",
+                                "DeviceClassGuid": "{53f56307-b6bf-11d0-94f2-00a0c91efb8b}"}}
+    uids = {data_format: uid(synthetic_case, f"json_extract_string(extra, '$.DataFormat') = '{data_format}'")
+            for data_format in expected}
+    for p in served_page(browser, synthetic_case):
+        for data_format, fields in expected.items():
+            select(p, uids[data_format])
+            rows = dict(p.evaluate(REGISTRY_GROUP))
+            assert list(rows) == PLUGIN_ROW + list(fields) + list(LATER_FIELDS), data_format
+            assert {k: rows[k] for k in ("DataFormat", *fields)} == {"DataFormat": data_format, **fields}, data_format

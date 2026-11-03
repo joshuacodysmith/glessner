@@ -70,7 +70,7 @@ KINDS: tuple[OutputKind, ...] = (
     OutputKind("recmd", "recmd", "RECmd batch CSV", _cols("HivePath HiveType KeyPath ValueName LastWriteTimestamp"),
                "recmd_csv"),
     OutputKind("recmd_plugin", "recmd", "RECmd plugin CSV", _cols("BatchKeyPath BatchValueName"),
-               note="Details from RECmd's plugins; the batch CSV holds the timeline rows"),
+               note="Details from RECmd's plugins, loaded with the batch CSV that names them"),
     OutputKind("sbecmd", "sbecmd", "SBECmd CSV", _cols("BagPath Slot AbsolutePath ShellType"), "sbecmd_csv"),
     OutputKind("rbcmd", "rbcmd", "RBCmd CSV", _cols("SourceName FileType FileName FileSize DeletedOn"), "rbcmd_csv"),
     OutputKind("amcache", "amcacheparser", "AmcacheParser CSV", frozenset(), "amcache_csv", name=r"_Amcache_\w+\.csv$"),

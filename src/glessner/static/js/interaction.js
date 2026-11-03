@@ -1,7 +1,7 @@
 import { $, codePrefix, cut, DRAG_THRESHOLD_PX, el, fmtUs, HIT_PX, markBadge, markState, plural, ROW_H, S, showControls, WHEEL_MAX_PX, WHEEL_PX_PER_DOUBLING, WHEEL_UNIT_PX } from './core.js';
 import { cancelAnimation, densityMode, scheduleFetch, zoomAtArrow, zooms, zoomToCell } from './data.js';
 import { draw } from './draw.js';
-import { claimDetails, loadDetails, setPage } from './event_page.js';
+import { claimDetails, deselect, loadDetails, setPage } from './event_page.js';
 import { showHint } from './frame.js';
 import { jumpTo, listFind } from './pages.js';
 import { openQuickMenu } from './quick_menu.js';
@@ -74,11 +74,18 @@ export function wheelFactor(ev) {
 }
 
 export function setupCanvas() {
-  const canvas = $('lanes');
+  const canvas = $('lanes'), box = $('lanesBox'), scroller = $('scroller');
   const tip = $('tooltip');
-  canvas.addEventListener('wheel', (ev) => {
+  // What takes the wheel and the drag: the lanes, the axes over them, and the scroller's own space under the last lane.
+  // The lane labels keep scrolling the lanes. A scrollbar reports the scroller as its target too, and keeps its own wheel
+  // and press.
+  const onPanSurface = (ev) => ev.target === canvas || ev.target.matches('#axis, .zone-axis')
+    || (ev.target === scroller && ev.offsetX < scroller.clientWidth);
+  box.addEventListener('wheel', (ev) => {
+    if (!onPanSurface(ev)) return;
     ev.preventDefault();
     cancelAnimation();
+    // The axes share the lanes' left edge and scale, so the lanes' edge places the pointer over any of them.
     const rect = canvas.getBoundingClientRect();
     const frac = (ev.clientX - rect.left) / S.width;
     const span = S.view.end - S.view.start;
@@ -89,14 +96,30 @@ export function setupCanvas() {
     draw();
     scheduleFetch();
   }, { passive: false });
-  canvas.addEventListener('mousedown', (ev) => {
-    if (ev.button !== 0) return;   // the right button opens the quick-action menu and never selects or pans
+  // The press calls no preventDefault, so it still takes the focus out of a text box and closes the tag picker's list.
+  box.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0 || !onPanSurface(ev)) return;   // the right button opens the quick-action menu and never selects or pans
     cancelAnimation();
-    S.drag = { x: ev.clientX, at: [ev.offsetX, ev.offsetY], view: { ...S.view }, moved: false };
+    // Only a press on the lanes has a point for the release to hit-test.
+    S.drag = { x: ev.clientX, at: ev.target === canvas ? [ev.offsetX, ev.offsetY] : null, view: { ...S.view }, moved: false };
     canvas.style.cursor = '';
-    canvas.classList.add('dragging');
+    box.classList.add('dragging');
   });
+  // The browser's own drag, as of selected text that takes in the lanes, holds the mouse until it ends, and the page
+  // never sees the release that would end the pan.
+  box.addEventListener('dragstart', (ev) => { if (S.drag) ev.preventDefault(); });
+  // A pan ends with the window it moved to fetched. Returns the drag, so a release on the page can act as a click.
+  const endDrag = () => {
+    const drag = S.drag;
+    S.drag = null;
+    box.classList.remove('dragging');
+    if (drag.moved) scheduleFetch();
+    return drag;
+  };
+  // A pan whose release the page missed, or whose window lost the focus, ends where it is and makes no click.
+  window.addEventListener('blur', () => { if (S.drag) endDrag(); });
   window.addEventListener('mousemove', (ev) => {
+    if (S.drag && !(ev.buttons & 1)) endDrag();
     if (S.drag) {
       const dx = ev.clientX - S.drag.x;
       // A press only becomes a pan past the threshold, so a click that wobbles a pixel or two
@@ -121,10 +144,8 @@ export function setupCanvas() {
   });
   window.addEventListener('mouseup', (ev) => {
     if (!S.drag) return;
-    const drag = S.drag;
-    S.drag = null;
-    canvas.classList.remove('dragging');
-    if (drag.moved) { scheduleFetch(); return; }
+    const drag = endDrag();
+    if (drag.moved || !drag.at) return;
     // Hit-test where the press landed, which is where the analyst aimed, not where a wobble let go.
     const [px, py] = drag.at;
     const hit = hitTest(px, py);
@@ -183,10 +204,13 @@ export function showPileList(events) {
 
 export function select(uid, add) {
   if (add && S.selected.has(uid)) {
-    // A shift-click that takes an event out of the selection leaves the Event page on an event no longer selected.
-    // The page goes to the event selected last of those left, or to the opening hint when none is.
-    S.selected.delete(uid);
-    if (S.focus === uid) {
+    // A shift-click that takes an event out of the selection takes it out of the selection list too, and leaves the Event
+    // page on an event no longer selected. The page goes to the event selected last of those left, or to the opening
+    // hint when none is. Taking out the last one starts a new, empty Set and leaves the list as it was, so Back to its page
+    // brings the list back with that event still ticked.
+    if (S.selected.size === 1) S.selected = new Set();
+    else deselect(uid);
+    if (S.focus === uid || !S.selected.size) {
       S.focus = [...S.selected].pop() ?? null;
       S.windowLinks = [];
     }

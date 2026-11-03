@@ -8,9 +8,10 @@ with -S on that file, and reads the set's version from beside it.
 
 Usage: python scripts/suricata_rules.py <ET Open folder holding rules/ and version.txt> <folder holding suricata.exe>
 Writes, in <folder holding suricata.exe>/rules/: suricata.rules, classification.config (ET's, which names its
-classtypes), and et-open-version.txt. It writes nothing when the set has no rule files or no classification.config, and
-it replaces suricata.rules last, so a build that fails partway leaves the earlier rules in force. A build that fails
-also removes the temporary files it wrote.
+classtypes), and et-open-version.txt. It writes nothing when the set has no rule files or no classification.config. It
+writes all three to temporary files first, then replaces classification.config, suricata.rules, and et-open-version.txt
+in that order, so a build that fails before the rule file is replaced leaves the earlier rules in force with the
+version file still naming them. A build that fails also removes the temporary files it wrote.
 """
 
 import shutil
@@ -36,6 +37,7 @@ def main(et: Path, suricata: Path) -> int:
     active = 0
     rules_tmp = out_dir / "suricata.rules.tmp"
     classification_tmp = out_dir / "classification.config.tmp"
+    version_tmp = out_dir / "et-open-version.txt.tmp"
     try:
         with rules_tmp.open("w", encoding="utf-8", newline="\n") as out:
             for p in files:
@@ -44,14 +46,16 @@ def main(et: Path, suricata: Path) -> int:
                     out.write(line + "\n")
                     active += line.startswith(ACTIONS)
         shutil.copy2(classification, classification_tmp)
-        classification_tmp.replace(out_dir / "classification.config")
         version = (et / "version.txt").read_text(encoding="utf-8").strip() if (et / "version.txt").exists() else "unknown"
-        (out_dir / "et-open-version.txt").write_text(f"ET Open {version}\n", encoding="utf-8")
+        version_tmp.write_text(f"ET Open {version}\n", encoding="utf-8")
+        classification_tmp.replace(out_dir / "classification.config")
         rules_tmp.replace(out_dir / "suricata.rules")
+        # Each run records the version file's text as its rules version, so it changes only after the rules it names
+        version_tmp.replace(out_dir / "et-open-version.txt")
     finally:
-        # A finished build has renamed both files away, so only a build that failed has anything left to remove
-        rules_tmp.unlink(missing_ok=True)
-        classification_tmp.unlink(missing_ok=True)
+        # A finished build has renamed every temporary file away, so only a build that failed has anything to remove
+        for tmp in (rules_tmp, classification_tmp, version_tmp):
+            tmp.unlink(missing_ok=True)
     print(f"{out_dir / 'suricata.rules'}: {active:,} active rules from {len(files)} files, ET Open {version}")
     return 0
 

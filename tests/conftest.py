@@ -1,6 +1,7 @@
 """A small two-host case shaped like the Szechuan Sauce facts, built without running any tools."""
 
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -11,12 +12,15 @@ import subprocess
 import sys
 import threading
 import warnings
+import zlib
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
 from glessner.case import create_case
 from glessner.events import Event, load
+from glessner.long_paths import long_path
 from glessner.parsers import PARSERS, ParseContext
 
 T0 = 1600485708000000            # 2020-09-19 03:21:48 UTC
@@ -31,6 +35,34 @@ def logon(ts, record, source, *, user="Administrator", domain="C137", ltype="10"
                  record_id=record, message=f"{code} logon", host_name_recorded=computer, event_code=code,
                  log_channel="Security", user_name=user, user_domain=domain, logon_type=ltype if code == "4624" else "",
                  source_ip=ip, source_workstation=ws, logon_id=logon_id, extra=extra)
+
+
+def e01_segment(*sections: tuple[bytes, bytes], segment: int = 1) -> bytes:
+    """An E01 segment holding `sections`, each a type and its data, as a chain of checksummed descriptors."""
+    out = b"EVF\x09\x0d\x0a\xff\x00\x01" + segment.to_bytes(2, "little") + b"\x00\x00"
+    for kind, data in sections:
+        following = len(out) + 76 + len(data)
+        descriptor = (kind.ljust(16, b"\x00") + following.to_bytes(8, "little") + (76 + len(data)).to_bytes(8, "little")
+                      + bytes(40))
+        out += descriptor + zlib.adler32(descriptor).to_bytes(4, "little") + data
+    return out
+
+
+def e01_digest(md5: bytes, sha1: bytes) -> tuple[bytes, bytes]:
+    """An E01's digest section, with its checksum."""
+    covered = md5 + sha1 + bytes(40)
+    return b"digest", covered + zlib.adler32(covered).to_bytes(4, "little")
+
+
+def e01_hash(md5: bytes) -> tuple[bytes, bytes]:
+    """An E01's hash section, with its checksum."""
+    covered = md5 + bytes(16)
+    return b"hash", covered + zlib.adler32(covered).to_bytes(4, "little")
+
+
+def file_sha256(path: Path) -> str:
+    """A file's SHA-256 in hex, as intake records it."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def links_in(con, start, end):
@@ -54,6 +86,16 @@ def junction(link, target):
     if sys.platform != "win32":
         pytest.skip("directory junctions are made with mklink /J, on Windows")
     subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+
+
+@pytest.fixture
+def tmp_path_removed(tmp_path):
+    """Remove tmp_path after the test, passed or failed, through its extended-length path. A plain path fails past 260
+    characters unless the system enables long paths, drops a trailing dot or space from a name, and opens a device for
+    NUL, so a tool that uses plain paths, such as Remove-Item, can't delete such a file or the base temp folder that
+    holds it."""
+    yield
+    shutil.rmtree(long_path(tmp_path), ignore_errors=True)   # a file still open stays, as pytest's own removal leaves it
 
 
 def flip_a_byte(path, at=0):

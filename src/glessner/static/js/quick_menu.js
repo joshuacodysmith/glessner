@@ -206,7 +206,7 @@ export function setupQuickMenu() {
   document.addEventListener('mousedown', (ev) => { if (!menu.hidden && !menu.contains(ev.target)) closeQuickMenu(); });
   window.addEventListener('blur', () => { if (!menu.hidden) closeQuickMenu(); });
   window.addEventListener('resize', () => { if (!menu.hidden) closeQuickMenu(); });
-  $('lanes').addEventListener('wheel', () => { if (!menu.hidden) closeQuickMenu(); });
+  $('lanesBox').addEventListener('wheel', () => { if (!menu.hidden) closeQuickMenu(); });
   document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape' && !menu.hidden) closeQuickMenu(); });
   menu.addEventListener('keydown', (ev) => {
     if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(ev.key)) return;

@@ -93,6 +93,11 @@ def section(text, number):
     return rest if end < 0 else rest[:end]
 
 
+def gfm_cells(row):
+    """A table row's cells as GFM splits them: at each pipe no backslash escapes, inside a code span too."""
+    return re.split(r"(?<!\\)\|", row)[1:-1]
+
+
 def test_the_report_has_its_seven_sections_with_the_analysts_words_and_the_head(synthetic_case):
     """The report in seven sections, in order: the Summary as written; each finding with its severity,
     techniques, supporting events as entries of the timeline or not, its caveats, and a retired one named and left out;
@@ -129,7 +134,7 @@ def test_the_report_has_its_seven_sections_with_the_analysts_words_and_the_head(
         timeline = section(text, 3)
         assert ("1. **2020-09-19 03:21:48.000000 UTC, DC01, Malicious.** 4624 logon\n   - Finding: 1. RDP from the internet\n"
                 "   - Mark note: RDP from the internet\n") in timeline
-        assert ("2. **2020-09-19 03:22:48.000000 UTC, DC01, Suspicious.** 4624 logon\n   - Source: evtxecmd t, run `r1`"
+        assert ("2. **2020-09-19 03:22:48.000000 UTC, DC01, Suspicious.** 4624 logon\n   - Source: EvtxECmd t, run `r1`"
                 in timeline)
         assert "\n### What the marked evidence does not prove\n" in timeline
         assert f"- **Logon events 4624 and 4625** (2 marked): {_md(logon['text'])} Sources: " in timeline
@@ -142,7 +147,7 @@ def test_the_report_has_its_seven_sections_with_the_analysts_words_and_the_head(
         integrity = section(text, 6)
         assert "No intake manifest exists, so evidence hashes were not checked." in integrity
         assert "Journal: " in integrity and "consistent: each names the one before it." in integrity
-        assert "| `r1` | evtxecmd | t | DC01 | 5 |  |" in section(text, 7) and "Written by glessner " in section(text, 7)
+        assert "| `r1` | EvtxECmd | t | DC01 | 5 |  |" in section(text, 7) and "Written by glessner " in section(text, 7)
         written = entries(synthetic_case)[-1]
         assert (written["kind"], written["rows"], written["scope"]) == ("report", 2, {"marks": "flagged"})
         assert f"Journal head when written: `{written['journal_head']}` (entry #{written['head_seq']})" in integrity
@@ -277,6 +282,32 @@ def test_indicators_come_only_from_malicious_marks_and_parsed_fields(synthetic_c
         app.con.close()
 
 
+def test_a_pipe_in_an_indicator_value_stays_in_its_cell(synthetic_case, tmp_path):
+    """GFM ends a table cell at a pipe even inside a code span. A Suricata http record whose Host holds one, marked
+    Malicious, gives a Domain row whose Value escapes the pipe, so the row keeps its six cells. indicators.csv keeps the
+    value as recorded."""
+    host = "update.example.com|cdn"
+    out = tmp_path / "eve_run"
+    out.mkdir()
+    (out / "eve.json").write_text(json.dumps({**EVE[2], "http": {**EVE[2]["http"], "hostname": host}}) + "\n",
+                                  encoding="utf-8")
+    load(synthetic_case.db_path, PARSERS["suricata_eve"](ParseContext(out, synthetic_case.evidence, (NETWORK_CAPTURE,))),
+         host="network", tool="suricata", tool_version="8.0.7", run_id="r6", replaces_sources=[NETWORK_CAPTURE],
+         staging_dir=out)
+    app = App(synthetic_case, for_work=True)
+    try:
+        (uid,) = [r[0] for r in app.con.execute("SELECT event_uid FROM events WHERE tool = 'suricata'").fetchall()]
+        api_mark(app, {"uids": [uid], "value": "malicious"})
+        listed = section(Path(api_report(app, {})["path"]).read_text(encoding="utf-8"), 4).splitlines()
+        (row,) = [line for line in listed if line.startswith("| Domain | ")]
+        cells = [cell.strip() for cell in gfm_cells(row)]
+        assert len(cells) == 6 and cells[:3] == ["Domain", r"`update.example.com\|cdn`", "1"] and cells[5] == ""
+        with Path(api_indicators(app, {})["path"]).open(encoding="utf-8", newline="") as f:
+            assert ("Domain", host) in {(r["type"], r["value"]) for r in csv.DictReader(f)}
+    finally:
+        app.con.close()
+
+
 SYSTEM_TOOL_NOTE = "In the Windows folder: may be a system tool the attacker used. Check before you block it."
 POWERSHELL = "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe"
 
@@ -313,9 +344,10 @@ def test_a_windows_system_tool_stays_among_the_indicators_with_a_note_on_its_row
 
 def test_the_note_marks_a_file_in_the_windows_system_folders_whatever_its_case_slashes_or_drive(synthetic_case):
     """The Windows folder's own files and everything below its System32, SysWOW64, and Sysnative folders count, on any
-    drive, with either slash after a drive or SYSVOL, in any case, and as an MFT, a prefetch file, or a variable writes
-    them. The Windows folder's other folders, which a dropped file can sit in, and look-alike names do not, and neither
-    does a name with no folder, a path with no root, or one that starts with a single forward slash."""
+    drive, with either slash after a drive or SYSVOL, in any case, as an MFT, a prefetch file, or a variable writes
+    them, and through a device-namespace or volume GUID path. The Windows folder's other folders, which a dropped file
+    can sit in, and look-alike names do not, and neither does a name with no folder, a path with no root, or one that
+    starts with a single forward slash."""
     noted = [
         "C:\\Windows\\System32\\cmd.exe", "c:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\powershell.exe",
         "c:/windows/system32/cmd.exe", "C:/Windows\\SysWOW64/cmd.exe", "D:\\Windows\\Sysnative\\cmd.exe",
@@ -328,12 +360,17 @@ def test_the_note_marks_a_file_in_the_windows_system_folders_whatever_its_case_s
         "SYSVOL\\Windows\\System32\\services.exe", "sysvol\\windows\\explorer.exe", "SYSVOL/Windows/System32/services.exe",
         "sysvol/windows\\explorer.exe", "\\??\\C:\\Windows\\System32\\cmd.exe",
         "\\SystemRoot\\System32\\drivers\\evil.sys", "%windir%\\system32\\cmd.exe", "This PC\\C:\\Windows\\System32\\cmd.exe",
-        "C:\\Windows\\\\System32\\cmd.exe"]
+        "C:\\Windows\\\\System32\\cmd.exe",
+        # The Win32 device namespace's prefix and a volume GUID path
+        "\\\\.\\C:\\Windows\\System32\\cmd.exe",
+        "\\\\?\\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}\\Windows\\System32\\cmd.exe",
+        "\\\\.\\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}\\Windows\\explorer.exe"]
     plain = [
         "C:\\Windows\\Temp\\evil.exe", "C:\\Windows\\Tasks\\evil.exe", "C:\\Users\\Public\\Windows\\System32\\cmd.exe",
         "C:\\Temp\\cmd.exe", "C:\\Windows\\System32x\\cmd.exe", "C:\\Windowsold\\System32\\cmd.exe", "cmd.exe",
         "C:\\Program Files\\Windows\\cmd.exe", "SYSVOL\\Temp\\Windows\\cmd.exe", "SYSVOLX\\Windows\\System32\\cmd.exe",
         "\\Device\\HarddiskVolume3\\Temp\\cmd.exe", "\\??\\C:\\Users\\Public\\cmd.exe",
+        "\\\\?\\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}\\Windows\\Temp\\cmd.exe", "\\\\.\\C:\\Temp\\cmd.exe",
         # A path that starts with one forward slash is a URL or Unix path, as in Suricata's file names, and one with no root
         # names no volume: neither says which folder it is in
         "/Windows/System32/cmd.exe", "Windows\\System32\\cmd.exe", "SYSVOL/Temp/Windows/cmd.exe"]
@@ -628,8 +665,9 @@ def both_reports(app):
 def test_the_method_table_gives_each_run_s_rule_set_and_lists_the_tool_files_of_each_distinct_set_once(synthetic_case):
     """The Rules column follows Events. A run's label is what its record holds; a tool run of a tool whose registry entry
     has a rules_label, with no tool_files, says "not recorded"; found output, a run with no record, and a tool with no
-    rules_label and no label say nothing, and so does an import, which no registry entry names. Under the table each
-    distinct set of tool files is listed once with the runs that recorded it, a folder by its path and a /."""
+    rules_label and no label say nothing, and so does an import, which no registry entry names. Each tool goes by the name
+    the Case overview gives it, the import as Import. Under the table each distinct set of tool files is listed once with
+    the runs that recorded it, a folder by its path and a /."""
     from test_overview import run_record
 
     load_eve(synthetic_case)
@@ -651,13 +689,13 @@ def test_the_method_table_gives_each_run_s_rule_set_and_lists_the_tool_files_of_
             method = method_part(text)
             assert METHOD_HEAD in method
             rows = {line.split("|")[1].strip(" `"): line for line in method.splitlines() if line.startswith("| `r")}
-            assert rows["r1"] == "| `r1` | evtxecmd | t | DC01 | 5 | Maps, 456 maps |  |"
-            assert rows["r2"] == "| `r2` | evtxecmd | t | DESKTOP | 3 | Maps, 456 maps |  |"
-            assert rows["r3"].endswith("| recmd | t | DC01 | 2 | rules not recorded |  |")
-            assert rows["r4"].endswith("| recmd | t | DESKTOP | 2 | DFIRBatch.reb 2.22 |  |")
-            assert rows["r5"].endswith("| hayabusa | t | DC01 | 1 |  |  |")
-            assert rows["r6"] == "| `r6` | suricata | 8.0.7 | network | 6 | ET Open 11310 |  |"
-            assert rows["r7"] == "| `r7` | import | t | network | 1 |  |  |"
+            assert rows["r1"] == "| `r1` | EvtxECmd | t | DC01 | 5 | Maps, 456 maps |  |"
+            assert rows["r2"] == "| `r2` | EvtxECmd | t | DESKTOP | 3 | Maps, 456 maps |  |"
+            assert rows["r3"].endswith("| RECmd | t | DC01 | 2 | rules not recorded |  |")
+            assert rows["r4"].endswith("| RECmd | t | DESKTOP | 2 | DFIRBatch.reb 2.22 |  |")
+            assert rows["r5"].endswith("| Hayabusa | t | DC01 | 1 |  |  |")
+            assert rows["r6"] == "| `r6` | Suricata | 8.0.7 | network | 6 | ET Open 11310 |  |"
+            assert rows["r7"] == "| `r7` | Import | t | network | 1 |  |  |"
             _, _, files_part = method.partition("Files each tool ran with")
             assert files_part.startswith(", as its runs recorded them, by SHA-256. A path that ends in / is a folder, hashed "
                                          "as the lines `sha256sum` prints for its files, by their paths in the folder with "
@@ -687,7 +725,7 @@ def test_the_method_table_gives_each_run_s_tool_check_in_the_tools_page_s_words(
             cells = {run: check_cell(row) for run, row in method_rows(text).items()}
             assert cells == {"r1": "Matches pin", "r2": "Differs from pin", "r3": "Not pinned", "r4": "No manifest",
                              "r5": "Pins unreadable"}
-            assert method_rows(text)["r2"] == "| `r2` | evtxecmd | t | DESKTOP | 3 | rules not recorded | Differs from pin |"
+            assert method_rows(text)["r2"] == "| `r2` | EvtxECmd | t | DESKTOP | 3 | rules not recorded | Differs from pin |"
     finally:
         app.con.close()
 
@@ -711,7 +749,7 @@ def test_the_method_table_leaves_the_tool_check_empty_when_a_run_has_none_and_sh
             rows = method_rows(text)
             assert {run: check_cell(row) for run, row in rows.items()} == {
                 "r1": "", "r2": "", "r3": r"needs\|review \*now\*", "r4": "Unknown", "r5": "", "r6": "Unknown"}
-            assert rows["r2"] == "| `r2` | evtxecmd | t | DESKTOP | 3 |  |  |"   # no record at all
+            assert rows["r2"] == "| `r2` | EvtxECmd | t | DESKTOP | 3 |  |  |"   # no record at all
     finally:
         app.con.close()
 
@@ -742,8 +780,8 @@ def test_the_report_has_no_tool_check_line_unless_a_run_recorded_a_difference(sy
 
 
 def test_the_report_counts_one_differing_run_and_names_its_tool(synthetic_case, tmp_path):
-    """One run whose check differs gives the line after the journal's lines, in the singular, with the sentence that says
-    where the checks are shown."""
+    """One run whose check differs gives the line after the journal's lines, in the singular, naming its tool as the Case
+    overview does, with the sentence that says where the checks are shown."""
     from test_overview import recorded_checks, run_record
 
     checks = recorded_checks(tmp_path / "fake_tools")
@@ -753,7 +791,7 @@ def test_the_report_counts_one_differing_run_and_names_its_tool(synthetic_case, 
     try:
         for text in both_reports(app):
             integrity = integrity_part(text)
-            assert integrity.endswith(f"\nTool check: 1 run used tool files that differed from the pin: evtxecmd. "
+            assert integrity.endswith(f"\nTool check: 1 run used tool files that differed from the pin: EvtxECmd. "
                                       f"{CHECK_WHERE}\n")
             assert integrity.index("Journal: ") < integrity.index("Tool check:")
             assert integrity.count("Tool check:") == 1
@@ -777,7 +815,7 @@ def test_the_report_counts_every_differing_run_and_names_each_tool_once(syntheti
     app = App(synthetic_case, for_work=True)
     try:
         for text in both_reports(app):
-            assert (f"\nTool check: 4 runs used tool files that differed from the pin: evtxecmd, hayabusa, and recmd. "
+            assert (f"\nTool check: 4 runs used tool files that differed from the pin: EvtxECmd, Hayabusa, and RECmd. "
                     f"{CHECK_WHERE}\n") in integrity_part(text)
             assert {run: check_cell(row) for run, row in method_rows(text).items()} == {
                 "r1": "Differs from pin", "r2": "Matches pin", "r3": "Differs from pin", "r4": "Differs from pin",
@@ -798,7 +836,7 @@ def test_the_report_names_two_tools_with_and_and_counts_a_run_of_a_tool_it_does_
     try:
         for text in both_reports(app):
             assert "r8" not in method_part(text)
-            assert (f"\nTool check: 2 runs used tool files that differed from the pin: evtxecmd and recmd. "
+            assert (f"\nTool check: 2 runs used tool files that differed from the pin: EvtxECmd and RECmd. "
                     f"{CHECK_WHERE}\n") in integrity_part(text)
     finally:
         app.con.close()
@@ -824,7 +862,7 @@ def test_the_report_counts_a_differing_run_whose_events_a_rerun_replaced_and_say
             cells = {run: check_cell(row) for run, row in method_rows(text).items()}
             assert "r1" not in cells and cells["r9"] == "Matches pin"
             assert "Differs from pin" not in method_part(text)
-            assert (f"\nTool check: 1 run used tool files that differed from the pin: evtxecmd. {CHECK_WHERE}\n"
+            assert (f"\nTool check: 1 run used tool files that differed from the pin: EvtxECmd. {CHECK_WHERE}\n"
                     in integrity_part(text))
     finally:
         app.con.close()
@@ -843,6 +881,54 @@ def test_the_report_escapes_a_tool_name_in_the_tool_check_line(synthetic_case, t
             assert (r"Tool check: 1 run used tool files that differed from the pin: evil\|\*\_\[U+202E\]tool. "
                     f"{CHECK_WHERE}\n") in integrity_part(text)
             assert "\u202e" not in text
+    finally:
+        app.con.close()
+
+
+def test_the_method_table_escapes_the_run_tool_and_version_a_run_record_gives(synthetic_case):
+    """A rebuild loads a run's tool and version from its run.json, which can hold anything. The Method table writes the
+    Tool and Version cells through the report's Markdown escape and escapes a pipe in the Run cell's code span, so the row
+    keeps its seven cells, the Markdown characters are escaped, and a bidi control is written as its code point. The
+    Source line of the run's marked event names the tool and the version the same way."""
+    from conftest import logon
+    from test_overview import ODD_TOOL
+
+    odd = logon(T0 + 900 * SEC, 1, "DC01/Windows/System32/winevt/Logs/Odd.evtx")
+    load(synthetic_case.db_path, [odd], host="DC01", tool=ODD_TOOL, tool_version="1|*_\u202e", run_id="r|9",
+         replaces_sources=[], staging_dir=synthetic_case.folder)
+    app = App(synthetic_case, for_work=True)
+    try:
+        api_mark(app, {"uids": [uid_at(app, T0 + 900 * SEC, ODD_TOOL)], "value": "suspicious"})
+        for text in both_reports(app):
+            (row,) = [line for line in method_part(text).splitlines() if "evil" in line]
+            assert row == r"| `r\|9` | evil\|\*\_\[U+202E\]tool | 1\|\*\_\[U+202E\] | DC01 | 1 |  |  |"
+            assert len(gfm_cells(row)) == 7
+            assert r"   - Source: evil\|\*\_\[U+202E\]tool 1\|\*\_\[U+202E\], run `r|9`, evtx `" in section(text, 3)
+            assert "\u202e" not in text
+    finally:
+        app.con.close()
+
+
+def test_a_run_id_is_written_through_the_code_span_escape_wherever_the_report_names_it(synthetic_case):
+    """A run's ID holds its host's name, which can hold a backtick or a bidi control. The Source line of the run's marked
+    event and the list of files each tool ran with write it as the Method table's Run cell does: a backtick as ', and a
+    bidi control as its code point, so neither ends the code span or turns the text around it."""
+    from conftest import logon
+    from test_overview import run_record
+
+    run_id, at = "r`9\u202e", T0 + 900 * SEC + 7
+    odd = logon(at, 1, "DC01/Windows/System32/winevt/Logs/Odd.evtx")
+    load(synthetic_case.db_path, [odd], host="DC01", tool="evtxecmd", tool_version="1", run_id=run_id,
+         replaces_sources=[], staging_dir=synthetic_case.folder)
+    run_record(synthetic_case, run_id, "evtxecmd", "DC01", "ok", 1, tool_files=MAPS)
+    app = App(synthetic_case, for_work=True)
+    try:
+        api_mark(app, {"uids": [uid_at(app, at)], "value": "suspicious"})
+        for text in both_reports(app):
+            assert "run `r'9[U+202E]`, evtx `" in section(text, 3)
+            assert "- Run `r'9[U+202E]`:" in text
+            assert "\u202e" not in text
+            assert "r`9" not in text
     finally:
         app.con.close()
 

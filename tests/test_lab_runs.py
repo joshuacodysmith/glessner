@@ -4,15 +4,19 @@ Skipped when the lab collection or tools are absent. Takes about three minutes o
 whole collection, EvtxECmd on DC01 twice.
 """
 
+import csv
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import warnings
-from pathlib import Path
+from collections import Counter, defaultdict
+from datetime import UTC, datetime, timedelta
+from pathlib import Path, PureWindowsPath
 
 import pytest
+import yaml
 from conftest import links_in
 
 from glessner.analysis import build_identity, build_tables
@@ -20,9 +24,11 @@ from glessner.case import create_case, open_case
 from glessner.events import connect
 from glessner.intake import intake
 from glessner.journal import Journal
+from glessner.parsers.common import DETAILS_NOTE
+from glessner.parsers.recmd import LASTWRITE, PLUGINS
 from glessner.relations import outside_sources
-from glessner.runner import plan_runs, rebuild, run
-from glessner.tools import detect, load_registry
+from glessner.runner import compose_batch, plan_runs, rebuild, run
+from glessner.tools import REGISTRY_DIR, VERSION_LINE, detect, load_registry
 
 TRIAGE = Path("D:/DFIR-Lab/datasets/szechuan-sauce/triage")
 TOOLS = Path("D:/DFIR-Lab/tools")
@@ -80,11 +86,71 @@ def test_all_runs_succeed_with_evidence_intact(loaded_case):
     assert all(r.loaded_rows > 0 for r in records)
 
 
-def test_golden_row_counts_match_the_tools_csv(loaded_case):
-    """Parsers that emit one event per record load exactly as many rows as the tool wrote."""
-    import csv
-    import sys
+def utc_us(text: str | None) -> int | None:
+    """A UTC time as RECmd writes it, "2020-09-18 05:41:06.6858875", in epoch microseconds, or None for an empty cell,
+    other text, or a time before 1971."""
+    head, _, fraction = (text or "").partition(".")
+    try:
+        when = datetime.strptime(head, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+    if when.year < 1971 or (fraction and not fraction.isdigit()):
+        return None
+    return int(when.timestamp()) * 1_000_000 + int(fraction[:6].ljust(6, "0"))
 
+
+def unpadded_us(text: str | None) -> int | None:
+    """The time in epoch microseconds meant by a time RECmd wrote from a FILETIME's halves joined as hex without the
+    low half's leading zeros (Plugin.unpadded): the hex digits after the high half's 7 are the low half's. None for
+    other text, a number of 8 hex digits or fewer, or a meant time before 1971."""
+    head, _, fraction = (text or "").partition(".")
+    try:
+        when = datetime.strptime(head, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    if len(fraction) != 7 or not fraction.isdigit():
+        return None
+    joined = (when - datetime(1601, 1, 1)) // timedelta(seconds=1) * 10**7 + int(fraction)
+    low_digits = (joined.bit_length() + 3) // 4 - 7
+    if not 1 < low_digits < 8:
+        return None
+    filetime = (joined >> 4 * low_digits) << 32 | joined & (16**low_digits - 1)
+    us = filetime // 10 - 11_644_473_600_000_000
+    return us if us >= int(datetime(1971, 1, 1, tzinfo=UTC).timestamp()) * 1_000_000 else None
+
+
+def usable_entry_times(output: Path) -> Counter:
+    """The entry times a RECmd run's plugin CSVs hold in the columns the parser's table times, counted by ts_desc
+    without the parser: each plugin CSV's rows zipped in order with the batch rows that name it, and each such time
+    from 1971 on, or meant from 1971 on where RECmd wrote it unpadded (unpadded_us), less a time that is the last write
+    of the list key holding the entry as a value (Plugin.batch_key_times) and equals its row's LastWrite."""
+    with (output / "recmd.csv").open(encoding="utf-8-sig", newline="") as f:
+        naming = defaultdict(list)
+        for row in csv.DictReader(f):
+            if row["PluginDetailFile"]:
+                naming[PureWindowsPath(row["PluginDetailFile"]).name].append(row)
+    usable = Counter()
+    for name, rows in naming.items():
+        spec = PLUGINS.get(Path(name).stem.rpartition("_")[2])
+        if spec is None or not spec.times:
+            continue
+        (path,) = output.glob(f"*/{name}")
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            details = list(csv.DictReader(f))
+        for row, detail in zip(rows, details, strict=True):
+            written = utc_us(row["LastWriteTimestamp"])
+            usable.update(ts_desc for column, ts_desc in spec.times.items()
+                          if (ts := utc_us(detail.get(column))
+                              or (unpadded_us(detail.get(column)) if column in spec.unpadded else None)) is not None
+                          and (ts != written or column not in spec.batch_key_times))
+    return usable
+
+
+def test_golden_row_counts_match_the_tools_csv(loaded_case):
+    """Parsers that emit one event per record load exactly as many rows as the tool wrote. RECmd's give one LastWrite
+    event per row of its batch CSV, and beside them the entries' own times from its plugins' CSVs, as many of each
+    meaning as those CSVs hold usable times, counted apart from the parser (usable_entry_times). The run's note counts
+    them, with no row that failed to match its plugin's detail row."""
     csv.field_size_limit(sys.maxsize // 4)
     case, _, records = loaded_case
     one_to_one = {"evtxecmd": "evtxecmd.csv", "hayabusa": "hayabusa.csv", "recmd": "recmd.csv"}
@@ -95,7 +161,17 @@ def test_golden_row_counts_match_the_tools_csv(loaded_case):
         out = case.runs_folder / r.run_id / "output" / one_to_one[r.tool]
         with out.open(encoding="utf-8-sig", errors="replace", newline="") as f:
             tool_rows = sum(1 for _ in csv.DictReader(f))
-        assert r.loaded_rows == tool_rows, (r.run_id, r.loaded_rows, tool_rows)
+        if r.tool == "recmd":
+            ((written,),) = query(case, "SELECT count(*) FROM events WHERE run_id = ? AND ts_desc = ?", r.run_id, LASTWRITE)
+            entries = Counter(dict(query(case, "SELECT ts_desc, count(*) FROM events WHERE run_id = ? AND ts_desc <> ? "
+                                               "GROUP BY ts_desc", r.run_id, LASTWRITE)))
+            assert (written, written + entries.total()) == (tool_rows, r.loaded_rows), (r.run_id, written, tool_rows)
+            assert entries == usable_entry_times(out.parent), r.run_id
+            (note,) = [n for n in r.notes if n.startswith(DETAILS_NOTE)]
+            assert entries and note.startswith(f"{DETAILS_NOTE}{entries.total():,} entry times became events."), note
+            assert "didn't match" not in note, note
+        else:
+            assert r.loaded_rows == tool_rows, (r.run_id, r.loaded_rows, tool_rows)
         checked += 1
     assert checked == 6
 
@@ -230,3 +306,17 @@ def test_a_second_build_gives_the_same_events(loaded_case):
             con.close()
     finally:
         remove_case_folder(folder)
+
+
+def test_no_recmd_addition_duplicates_a_dfirbatch_2_22_entry():
+    """No addition has the hive type, key path, and value name of a DFIRBatch.reb 2.22 entry, compared without case as
+    compose_batch compares them, so the composed batch is DFIRBatch.reb's text, with every entry kept, and then the
+    additions."""
+    base = (TOOLS / "EZTools/RECmd/RECmd/BatchExamples/DFIRBatch.reb").read_text(encoding="utf-8-sig")
+    additions = (REGISTRY_DIR / "recmd_additions.reb").read_text(encoding="utf-8")
+    assert VERSION_LINE.search(base).group(1) == "2.22"
+    composed = compose_batch(base, additions)
+    assert composed.startswith(base)
+    added = len(yaml.safe_load(additions)["Keys"])
+    assert added == 10
+    assert len(yaml.safe_load(composed)["Keys"]) == len(yaml.safe_load(base)["Keys"]) + added

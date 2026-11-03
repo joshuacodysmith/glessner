@@ -37,10 +37,15 @@ class ParseContext:
     # For a parser that counts what it makes no event of (parsers.COUNTS_SKIPPED): a count for each file it read, in the
     # order read, 0 for a file it made an event of every row or line of
     skipped: list[int] = field(default_factory=list)
+    # For a load of output found in the evidence: the files the parser may read below its inputs, those intake hashed
+    # without error as the tool's detail output in a folder just below an input's, such as RECmd's plugin CSVs
+    # (runner.detail_files)
+    beside: tuple[Path, ...] = ()
 
 
 LOCAL_TIME_NOTE = "Local times read in "   # a note the next load replaces (runner.load_output)
 SKIPPED_NOTE = "No event was made of "   # likewise: a count of the lines or rows a parser dropped
+DETAILS_NOTE = "Plugin details: "   # likewise: what RECmd's plugin CSVs added, and what they didn't
 
 
 def output_paths(ctx: ParseContext, kind: str, name: str) -> list[Path]:
@@ -145,8 +150,9 @@ def _canonical_ip(text: str) -> str:
 
 
 _PATH_PREFIXES = re.compile(
-    r"^(?:This PC\\)?(?:\\\\\?\\|\\\?\?\\)?"             # LNK shell path, Win32 long-path prefix, NT's \??\
-    r"(?:\\VOLUME\{[^}]*\}|\\Device\\HarddiskVolume\d+|[A-Za-z]:|\.(?=\\|$))?",  # prefetch volume, NT device, drive, MFT root
+    r"^(?:This PC\\)?(?:\\\\[?.]\\|\\\?\?\\)?"           # LNK shell path, Win32 file (\\?\) or device (\\.\) prefix, NT's \??\
+    # A prefetch volume (\VOLUME{...}) or a volume GUID after a prefix (Volume{GUID}), NT device, drive, MFT root
+    r"(?:\\?VOLUME\{[^}]*\}|\\Device\\HarddiskVolume\d+|[A-Za-z]:|\.(?=\\|$))?",
     re.IGNORECASE)
 
 
@@ -180,7 +186,8 @@ def file_key(path: str | None) -> str:
 
     Prefetch writes \\VOLUME{...}\\WINDOWS\\SYSTEM32\\CMD.EXE, the MFT .\\Windows\\System32\\cmd.exe, LNK
     files C:\\Windows\\System32\\cmd.exe or This PC\\C:\\..., and event logs C:\\Windows\\System32\\cmd.exe.
-    All become \\windows\\system32\\cmd.exe. The volume is dropped, so a key cannot tell C: from D:. A path that starts
+    All become \\windows\\system32\\cmd.exe, and so do \\\\.\\C:\\Windows\\System32\\cmd.exe and
+    \\\\?\\Volume{...}\\Windows\\System32\\cmd.exe. The volume is dropped, so a key cannot tell C: from D:. A path that starts
     with a folder variable or \\SystemRoot has it written out first (expand_folder).
     Text that is not a path, such as "Applications\\Microsoft Edge", gives "". So does text that starts with one slash, a
     URL path or a Unix path such as /coreupdater.exe: read as a Windows path it would be a file at a volume root, and

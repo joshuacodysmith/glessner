@@ -520,3 +520,100 @@ def test_a_case_yaml_that_can_t_be_read_is_a_case_error_naming_the_file(tmp_path
     assert str(case.folder / "case.yaml") in capsys.readouterr().err
     with pytest.raises(CaseError, match=r"case.yaml"):
         start_open(None, {"folder": str(case.folder)})
+
+
+def ewf_segment(number: int) -> bytes:
+    """An EWF segment's first bytes: its signature, then its number at offset 9."""
+    return b"EVF\x09\x0d\x0a\xff\x00\x01" + number.to_bytes(2, "little") + b"\x00\x00header" + b"\x00" * 64
+
+
+def raw_ntfs_volume() -> bytes:
+    data = bytearray(4096)
+    data[3:11] = b"NTFS    "
+    data[510:512] = b"\x55\xaa"
+    return bytes(data)
+
+
+def as_older_intake(case, paths) -> None:
+    """Rewrite the manifest as an intake before disk images were recognized wrote it: each of `paths` unidentified."""
+    lines = [json.loads(line) for line in case.manifest_path.read_text().splitlines()]
+    for e in lines:
+        if e["path"] in paths:
+            e.update(artifact=None, method="unidentified", detail="")
+    case.manifest_path.write_text("".join(json.dumps(e) + "\n" for e in lines))
+
+
+def test_older_intake_reads_image_names_again(tmp_path, evidence):
+    """A case taken in before disk images were recognized shows its images without a new intake: their names are read
+    again, in memory, and the manifest stays as it was."""
+    from glessner.intake import current_entries
+
+    (evidence / "images").mkdir()
+    (evidence / "images" / "pc.E01").write_bytes(ewf_segment(1))
+    (evidence / "images" / "volume.dd").write_bytes(raw_ntfs_volume())
+    (evidence / "images" / "disk.vhdx").write_bytes(b"vhdxfile" + b"\x00" * 64)
+    images = {"images/pc.E01": "E01 segment 1", "images/volume.dd": "raw image, NTFS volume", "images/disk.vhdx": "VHDX"}
+    case = create_case(tmp_path / "case", "Old", evidence, "cody")
+    intake(case)
+    assert {e.path: e.detail for e in read_manifest(case) if e.artifact == "disk_image"} == images
+    as_older_intake(case, images)
+    before = case.manifest_path.read_bytes()
+    entries = {e.path: e for e in current_entries(case)}
+    assert {path: (entries[path].artifact, entries[path].detail) for path in images} == {
+        path: ("disk_image", detail) for path, detail in images.items()}
+    assert entries["hashes.json"].artifact is None
+    assert case.manifest_path.read_bytes() == before
+
+
+def test_ewf_segment_names_past_e09_are_read_again(tmp_path, evidence):
+    """EWF names its segments .E01 to .E99 and then .EAA on, L01 and SMART (.s01) the same, and Ex01 and Lx01 .Ex01 and
+    .Lx01 on; each segment's name is read again, and each reads as its own segment by its number. SMART writes E01's
+    signature."""
+    from glessner.intake import current_entries
+
+    segments = {"pc.E02": 2, "pc.E10": 10, "pc.E99": 99, "pc.EAA": 100, "pc.EBC": 128, "usb.s01": 1, "usb.s02": 2,
+                "usb.sAA": 100}
+    (evidence / "pc").mkdir()
+    for name, number in segments.items():
+        (evidence / "pc" / name).write_bytes(ewf_segment(number))
+    (evidence / "pc" / "usb.Lx01").write_bytes(b"LEF2\x0d\x0a\x81\x00" + b"\x00" * 64)
+    for name in ("usb.L02", "usb.LAB", "pc.Ex02", "usb.Lx02", "laptop.ad3"):
+        (evidence / "pc" / name).write_bytes(b"\x00" * 64)   # read again, and still unidentified
+    details = {**{name: f"E01 segment {number}" for name, number in segments.items()}, "usb.Lx01": "Lx01"}
+    case = create_case(tmp_path / "case", "Old", evidence, "cody")
+    intake(case)
+    as_older_intake(case, {f"pc/{name}" for name in details})
+    entries = {e.path: e for e in current_entries(case)}
+    assert {name: entries[f"pc/{name}"].detail for name in details} == details
+
+    from glessner.identify import image_name
+
+    assert all(image_name(name.lower()) for name in (*details, "usb.L02", "usb.LAB", "pc.Ex02", "usb.Lx02", "laptop.ad3",
+                                                      "pc.E01", "disk.vhd", "disk.qcow2", "disk.vmdk", "Winserpart.001"))
+    assert not any(image_name(name) for name in ("ntuser.dat", "security.evtx", "notes.txt", "disk.002", "pc.e1"))
+
+
+def test_no_tool_plans_a_run_for_a_disk_image(tmp_path):
+    """No registry tool reads a disk image, so no run plans one, nor does a tool copy one along with its input."""
+    import sys
+
+    from glessner.runner import plan_runs
+    from glessner.tools import DetectedTool, load_registry
+
+    ev = tmp_path / "evidence"
+    config = ev / "WS01" / "Windows" / "System32" / "config"
+    config.mkdir(parents=True)
+    (config / "SYSTEM").write_bytes(b"regf" + b"\x00" * 100)
+    (ev / "WS01" / "pc.E01").write_bytes(ewf_segment(1))
+    (ev / "WS01" / "volume.img").write_bytes(raw_ntfs_volume())
+    case = create_case(tmp_path / "case", "Images", ev, "cody")
+    intake(case)
+    images = {e.path for e in read_manifest(case) if e.artifact == "disk_image"}
+    assert images == {"WS01/pc.E01", "WS01/volume.img"}
+    planned = set()
+    for spec in load_registry().values():
+        assert "disk_image" not in spec.handles and "disk_image" not in spec.copy_also, spec.id
+        for plan in plan_runs(case, DetectedTool(spec, Path(sys.executable), "1.0")):
+            planned.update(plan.inputs)
+    assert "WS01/Windows/System32/config/SYSTEM" in planned
+    assert not planned & images

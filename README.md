@@ -8,7 +8,7 @@ Glessner is pre-alpha. Read [Limits](#limits) before you rely on it for a case.
 
 ## What it does
 
-You point Glessner at a folder holding a collection, with one top-level folder per host, as KAPE and most collection scripts produce. Glessner then does the following:
+You point Glessner at a folder holding a collection, with one top-level folder per host, as KAPE and most collection scripts produce. To start from a disk image, get that folder first, as [disk_images.md](disk_images.md) shows. Glessner then does the following:
 
 - Hashes every file into a manifest and identifies each artifact by its header. It never writes to the evidence folder, and it re-hashes the files each tool run read. From case format 4, the journal records the SHA-256, size, and line count of `manifest.jsonl` itself at intake and at each `intake --add`, and `verify`, `close`, and the report compare the file with that record.
 - Runs the installed tools that read the evidence: EvtxECmd, RECmd, MFTECmd, PECmd, LECmd, JLECmd, SBECmd, AmcacheParser, SrumECmd, RBCmd, SQLECmd, WxTCmd, Hayabusa, and Suricata on packet captures. It logs each exact command line and records each tool's version. From case format 4, each run also records its rule or map set and the SHA-256 of its executable, of each `.dll` beside it, of the executable's `runtimeconfig.json` and `deps.json`, and of the rule, map, plugin, and configuration files the run names, and of SQLECmd's `runtimes` folder, which holds its native SQLite library. It also records a tool check: whether those files match the pin you made of the tool (`glessner tools CASE --pin`, or the Tools page). The check reads `matches`, `differs`, `not pinned`, `no manifest`, or `unreadable`. A run whose files differ still runs, and the Tools page, the job's step line, and `glessner run` say so. The report's Method table shows the tool check of each run whose events the case holds, and the report and the Case overview add a line when any run's tool files differed from the pin.
@@ -166,7 +166,11 @@ Glessner runs these tools and bundles none of them. Each is under its own licens
 | Hayabusa | Yamato Security | AGPL-3.0, with its rules under the Detection Rule License 1.1 |
 | Suricata | OISF | GPL-2.0 |
 
+The two maps in [registry/sqlecmd_maps/](registry/sqlecmd_maps/) adapt SQLECmd's `Windows_ChromiumBrowser_Downloads.smap`, by Andrew Rathbun and Reece394, and the `IdentifyQuery` of its `Windows_ChromiumBrowser_HistoryVisits.smap`, by Andrew Rathbun. Each carries SQLECmd's MIT license notice in its header.
+
 Suricata's alerts need a rule set, such as ET Open, which you download separately under its own terms. `scripts/suricata_rules.py` builds the rule file Glessner's Suricata runs use from an unpacked ET Open set.
+
+The builder scripts that get a triage folder from a disk image run Plaso in Docker Desktop, from Git Bash. The app doesn't run them. [disk_images.md](disk_images.md) gives each one's license, including the paid Docker Desktop subscription that larger businesses and government entities need.
 
 The ATT&CK technique list is MITRE's Enterprise ATT&CK v20.0. © 2026 The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation. `src/glessner/attack_techniques.json` carries MITRE's license, and `scripts/attack_list.py` builds the file again from a later release.
 
@@ -192,6 +196,7 @@ Joshua Cody Smith designed Glessner and directed its build. AI coding agents wro
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | What each release holds |
 | [setup.md](setup.md) | Setting up the app and its tools on a fresh Windows machine |
+| [disk_images.md](disk_images.md) | Getting a triage folder from a disk image with the builder scripts, and what that step leaves out |
 | [known_limitations.md](known_limitations.md) | What the app doesn't do yet, or doesn't do well |
 | [scope.md](scope.md) | What the app does, what is planned, and what it leaves out |
 | [glossary.md](glossary.md) | The names for every part of the page and the data, including the search syntax |
@@ -202,8 +207,8 @@ Joshua Cody Smith designed Glessner and directed its build. AI coding agents wro
 | [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/) | The feedback form and the bug report form for issues, with blank issues turned off |
 | [LICENSE](LICENSE) | The MIT license |
 | [src/glessner/](src/glessner/) | The app: the Python package, the page's modules, and its data files |
-| [registry/](registry/) | One YAML file per tool, which tells the app how to find, run, and read it, and the list of other known tools |
-| [scripts/](scripts/) | `check_journal.py`, which checks a case journal's chain without the app; `suricata_rules.py`; `attack_list.py`; and `lint.py` |
+| [registry/](registry/) | One YAML file per tool, which tells the app how to find, run, and read it, the list of other known tools, the app's RECmd additions, and its two SQLECmd maps |
+| [scripts/](scripts/) | `check_journal.py`, which checks a case journal's chain without the app; `suricata_rules.py`; `attack_list.py`; `lint.py`; and the builders that get a triage folder from a disk image, with their helpers and filters, which [disk_images.md](disk_images.md) describes |
 | [tests/](tests/) | The test suite, with `tests/perf/` for performance checks run by hand |
 | [docs/screenshots/](docs/screenshots/) | The screenshots in this file |
 | `pyproject.toml`, `uv.lock`, `.python-version` | The Python package, its dependencies, the Python version, and the pytest and ruff settings |

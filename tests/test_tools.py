@@ -1,6 +1,8 @@
 import dataclasses
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -311,10 +313,18 @@ def test_the_registry_names_the_tool_files_no_argument_names_and_how_each_set_is
     specs = load_registry()
     assert {s.id: s.tool_files for s in specs.values() if s.tool_files} == {
         "hayabusa": ("rules", "config"), "evtxecmd": ("Maps",), "sqlecmd": ("Maps", "runtimes"),
-        "recmd": ("Plugins",)}
+        "recmd": ("Plugins", "BatchExamples\\DFIRBatch.reb")}
     assert {s.id: s.rules_label["kind"] for s in specs.values() if s.rules_label} == {
         "hayabusa": "git", "evtxecmd": "count", "sqlecmd": "count", "recmd": "version_line"}
     assert specs["suricata"].rules and specs["suricata"].rules_label is None
+    assert {s.id: tuple(s.compose) for s in specs.values() if s.compose} == {"recmd": ("batch_file",),
+                                                                             "sqlecmd": ("maps_dir",)}
+    composed = specs["recmd"].compose["batch_file"]
+    assert (composed.tool, composed.app) == ("BatchExamples\\DFIRBatch.reb", REGISTRY_DIR / "recmd_additions.reb")
+    assert composed.tool in specs["recmd"].tool_files and composed.app.is_file()
+    maps = specs["sqlecmd"].compose["maps_dir"]
+    assert (maps.tool, maps.app) == ("Maps", REGISTRY_DIR / "sqlecmd_maps")
+    assert maps.tool in specs["sqlecmd"].tool_files and maps.app.is_dir()
 
 
 @pytest.mark.parametrize("label", [
@@ -352,6 +362,91 @@ def test_an_outputs_entry_that_is_not_a_pattern_or_a_group_of_them_is_refused(tm
     (tmp_path / "sbecmd.yaml").write_text(yaml.safe_dump(entry), encoding="utf-8")
     with pytest.raises(ValueError, match=r"sbecmd\.yaml: outputs"):
         load_registry(tmp_path)
+
+
+@pytest.mark.parametrize("compose, problem", [
+    ({"rules_file": {"tool": "a", "app": "b"}}, "compose has 'rules_file', not one of"),
+    ({"batch_file": {"tool": "a"}}, "compose's batch_file needs a tool path and an app path"),
+    ({"batch_file": {"tool": "a", "app": "b", "label": {"kind": "git", "path": "b", "text": "{value}"}}},
+     r"compose's batch_file label needs a kind, one of \['count', 'version_line'\]"),
+    ({"batch_file": {"tool": "a", "app": "b", "label": {"kind": "count", "path": "b", "text": "no value"}}},
+     "compose's batch_file label needs"),
+    (["batch_file"], "compose must map"),
+])
+def test_a_compose_entry_without_a_known_kind_a_tool_and_an_app_is_refused(tmp_path, compose, problem):
+    entry = yaml.safe_load((REGISTRY_DIR / "recmd.yaml").read_text(encoding="utf-8"))
+    entry["compose"] = compose
+    (tmp_path / "recmd.yaml").write_text(yaml.safe_dump(entry), encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"recmd\.yaml: {problem}"):
+        load_registry(tmp_path)
+
+
+ADDITIONS_FILE = REGISTRY_DIR / "recmd_additions.reb"
+# The SHA-256 of each version of the additions, read with LF line endings, since a checkout may write CRLF
+ADDITIONS_SHA256 = {"1": "f2333032c10588d9ed44eb29e30eeb5793e4d71f6d4506f16e59717f8a9d786d"}
+# Each addition: its hive type, key path, value name ("" for every value of the key), and description
+RECMD_ADDITIONS = [
+    ("SOFTWARE", r"Microsoft\Windows NT\CurrentVersion", "CurrentVersion", "Windows Version"),
+    ("SOFTWARE", r"Microsoft\Internet Explorer", "svcVersion", "Internet Explorer Version"),
+    ("SOFTWARE", r"Microsoft\Windows NT\CurrentVersion\NetworkCards\*", "", "Network Cards"),
+    ("SOFTWARE", r"Clients\Mail", "(default)", "Default Mail Client"),
+    ("SOFTWARE", r"Classes\mailto\shell\open\command", "", "Mailto Handler"),
+    ("SOFTWARE", r"Microsoft\Windows Search\Databases\Windows", "FileName", "Windows Search Index"),
+    ("NTUSER", r"Software\Microsoft\Windows\CurrentVersion\Explorer\CD Burning", "DefaultToMastered", "CD Burning"),
+    ("NTUSER", r"Software\Google\Drive", "", "Google Drive"),
+    ("UsrClass", r"GoogleDrive.*\shell\open\command", "", "Google Drive File Types"),
+    ("SOFTWARE", r"Microsoft\Windows NT\CurrentVersion\Print\Printers\*", "Name", "Installed Printers"),
+]
+
+
+def test_additions_name_ten_values():
+    """An addition's description is part of the event IDs of its rows, so each stays as it first shipped."""
+    keys = yaml.safe_load(ADDITIONS_FILE.read_text(encoding="utf-8"))["Keys"]
+    assert [(k["HiveType"], k["KeyPath"], k.get("ValueName", ""), k["Description"]) for k in keys] == RECMD_ADDITIONS
+
+
+def test_additions_hash_is_pinned_to_its_version():
+    """A run's rule set names the additions by their version alone, so each version is one text: a change to the file
+    comes with a new version, and its hash here."""
+    data = ADDITIONS_FILE.read_bytes().replace(b"\r\n", b"\n")
+    version = tools.VERSION_LINE.search(data.decode("utf-8")).group(1)
+    assert hashlib.sha256(data).hexdigest() == ADDITIONS_SHA256.get(version), f"version {version}"
+
+
+def test_recmd_rules_label_names_the_additions_version(tmp_path):
+    """The label reads DFIRBatch.reb's version from the tool's folder and the additions' from the registry folder, and
+    without DFIRBatch.reb it names no set."""
+    folder = tmp_path / "RECmd"
+    batch = folder / "BatchExamples" / "DFIRBatch.reb"
+    batch.parent.mkdir(parents=True)
+    batch.write_text("Description: DFIR RECmd Batch File\nVersion: 2.22\nKeys:\n", encoding="utf-8")
+    exe = folder / "RECmd.exe"
+    assert tools.rules_label(load_registry()["recmd"], exe) == "DFIRBatch.reb 2.22 with Glessner additions 1"
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    shutil.copy(REGISTRY_DIR / "recmd.yaml", registry)
+    (registry / "recmd_additions.reb").write_text("Description: later\nVersion: 2\nKeys:\n", encoding="utf-8")
+    assert tools.rules_label(load_registry(registry)["recmd"], exe) == "DFIRBatch.reb 2.22 with Glessner additions 2"
+    batch.unlink()
+    assert tools.rules_label(load_registry()["recmd"], exe) == ""
+
+
+def test_recmd_tool_files_record_dfirbatch_by_its_path_and_hash(tmp_path):
+    """RECmd's arguments name the batch composed in the run's output folder, not DFIRBatch.reb, so its registry entry
+    lists DFIRBatch.reb in tool_files: a run records its SHA-256 under its path in the tool's folder,
+    BatchExamples/DFIRBatch.reb, beside the executable and the Plugins folder, and a pin holds the same files."""
+    from test_tool_files import run_argv
+
+    folder = tmp_path / "tools" / "RECmd"
+    batch = b"Description: DFIR RECmd Batch File\nVersion: 2.22\nKeys:\n"
+    for rel, data in {"RECmd.exe": b"MZ", "BatchExamples/DFIRBatch.reb": batch, "Plugins/one.dll": b"MZ plugin"}.items():
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_bytes(data)
+    tool = DetectedTool(load_registry()["recmd"], folder / "RECmd.exe", "2026.10.2")
+    recorded = tools.tool_files(tool, run_argv(tmp_path, tool, {}))
+    assert recorded["BatchExamples/DFIRBatch.reb"] == hashlib.sha256(batch).hexdigest()
+    assert set(recorded) == {"BatchExamples/DFIRBatch.reb", "Plugins/", "RECmd.exe"}
+    assert tools.pin_files(tool).hashes == recorded
 
 
 def pin_states(case, found, cache=None):
