@@ -473,20 +473,28 @@ def _unlock(fd: int) -> None:
 # ---------- What the Tools page shows ----------
 
 class Taken(NamedTuple):
-    """A tool's files as hashed for the page: its executable, when, and either the listing and links or the error."""
+    """A tool's files as hashed for the page: its executable, when, either the listing and links or the error, and the
+    rule set named at that moment (tools.rules_label), so a git label's commit and files part describe one checkout."""
     executable: str
     taken: str
     listing: ToolListing
     links: tuple[str, ...]
     error: str
+    rules: str
 
 
 def _take(tool: DetectedTool) -> Taken:
     try:
         pin = take_pin(tool)
     except OSError as exc:
-        return Taken(str(tool.executable), utc_now(), ToolListing({}, {}), (), str(exc))
-    return Taken(str(tool.executable), utc_now(), pin.listing, pin.links, "")
+        return Taken(str(tool.executable), utc_now(), ToolListing({}, {}), (), str(exc),
+                     tools.rules_label(tool.spec, tool.executable))
+    return _taken_pin(tool, pin)
+
+
+def _taken_pin(tool: DetectedTool, pin: Pin) -> Taken:
+    rules = tools.rules_label(tool.spec, tool.executable, pin.listing.hashes)
+    return Taken(str(tool.executable), utc_now(), pin.listing, pin.links, "", rules)
 
 
 class _Kept(NamedTuple):
@@ -530,7 +538,7 @@ class PinCache:
 
     def put(self, tool: DetectedTool, pin: Pin) -> None:
         """Keep the files of a pin just made as the tool's. A hash that began before this and ends after it isn't kept."""
-        taken = Taken(str(tool.executable), utc_now(), pin.listing, pin.links, "")
+        taken = _taken_pin(tool, pin)
         with self._lock:
             self._items[tool.spec.id] = _Kept(next(self._count), taken)
 

@@ -3,11 +3,8 @@
 // keeps its later state. Notes are retracted rather than undone, and stay on record.
 
 import { $, api, codePrefix, el, fmtUs, markBadge, plural, post, S, setStatus } from './core.js';
-import { refreshCounts } from './counts.js';
-import { fetchView } from './data.js';
-import { button, claimDetails, detailsClaims, headAfter, headCopy, pageAction, setPage, showingPage } from './event_page.js';
+import { button, claimDetails, detailsClaims, headAfter, headCopy, pageAction, reloadTimeline, reportWrite, setPage, showingPage } from './event_page.js';
 import { renderHosts } from './hosts.js';
-import { reloadLanes } from './lanes.js';
 import { jumpTo, showRules } from './pages.js';
 
 const PANEL_OPEN = { hosts: () => { const p = $('hostsPanel'); p.hidden = false; renderHosts(); }, rules: () => showRules() };
@@ -145,11 +142,11 @@ async function confirmUndo(r, box) {
     ...(plan.changed ? [el('div', { class: 'actions' }, note,
       button(`Undo ${n(plan.changed)}`, async () => {
         noteClaims();   // from this click, only a page asked for after it holds the trail's redraw
-        try { await post('/api/undo', { seq: r.seq, note: note.value }); }
+        let res;
+        try { res = await post('/api/undo', { seq: r.seq, note: note.value }); }
         catch (err) { setStatus(`Undo failed: ${err.message}`); return; }
         box.hidden = true;
-        setStatus(`Undid #${r.seq}: ${n(plan.changed)} ${back}`);
-        await afterChange();
+        await afterChange(`Undid #${r.seq}: ${n(plan.changed)} ${back}`, res.server_ms);
       }, { class: 'undo' }),
       button('Cancel', () => closeBox(box)))] : [button('Close', () => closeBox(box))]));
   box.hidden = false;
@@ -162,12 +159,11 @@ function confirmRetract(r, box) {
     el('p', { class: 'muted' }, 'The note stays on record, struck through, with who retracted it and when.'),
     el('div', { class: 'actions' }, button('Retract', async () => {
       noteClaims();   // from this click, only a page asked for after it holds the trail's redraw
-      const uid = await noteTarget(r.seq);
-      try { await post('/api/note_retract', { uid, note_seq: r.seq }); }
+      let res;
+      try { res = await post('/api/note_retract', { uid: await noteTarget(r.seq), note_seq: r.seq }); }
       catch (err) { setStatus(`Retract failed: ${err.message}`); return; }
       box.hidden = true;
-      setStatus(`Retracted note #${r.seq}`);
-      await afterChange();
+      await afterChange(`Retracted note #${r.seq}`, res.server_ms);
     }, { class: 'undo' }), button('Cancel', () => closeBox(box))));
   box.hidden = false;
 }
@@ -215,18 +211,13 @@ export async function retractNote(uid, noteSeq) {
 
 // The timeline and counts follow an undo or retraction the server has just answered, and then the trail settles. The
 // Details panel stays on the trail, which redraws itself; reloading the focused event here as well raced it for the panel.
-// A reload that fails says so on the status line, in place of the change's own line.
-async function afterChange() {
+// `text` says what was written, on the status line at once and again after the reload's redraw, with `ms` the server's
+// time for it; a reload that fails says so after it (reportWrite).
+async function afterChange(text, ms) {
   answered += 1;
-  try {
-    await reloadLanes();
-    await fetchView();
-    refreshCounts();
-  } catch (err) {
-    setStatus(`The timeline didn't reload: ${err.message}`);
-  } finally {
-    settleTrail();
-  }
+  setStatus(text);
+  reportWrite(text, ms, await reloadTimeline());
+  settleTrail();
 }
 
 // The Event page's History: the newest entries for this event, with a way into the full trail. Returns the rows, so the

@@ -16,6 +16,8 @@ from __future__ import annotations
 import html
 import re
 from collections.abc import Iterator
+from itertools import dropwhile
+from unicodedata import bidirectional
 from xml.etree import ElementTree
 
 from ..event_xml import detail, endpoint, sysmon_network
@@ -53,6 +55,7 @@ MAP_PACKAGE = "AuthenticationPackageName:"   # the part a 4624 map writes for th
 # it, as in "\u200e9/\u200e17/\u200e2020 9:43 AM". Elsewhere such marks can disguise a name, and the pages show them.
 DATE_MARKS = re.compile("[\u200e\u200f]")
 MARK = DATE_MARKS.pattern
+RIGHT_TO_LEFT = ("R", "AL")   # the bidi classes of right-to-left letters
 # The date forms below are the ones Windows writes for the locales named, with a mark before each part. Only a weekday
 # or a month is any word; the words that join the parts are the few each form spells out.
 WORD = MARK + r"[^\W\d_]+(?:-[^\W\d_]+)?"   # a weekday or a month, such as quinta-feira
@@ -73,14 +76,18 @@ ROMANCE = f"(?:{WORD},? )?{DAY}{DE_MONTH}{MARK}?[^\\W\\d_]+{DE}{YEAR}"   # jueve
 # The year, month, and day, each followed by a mark and the character for it (ja-JP, zh-CN, zh-TW), or by the Korean
 # syllable for it and a space, then the weekday (ko-KR, with a mark before each syllable, and ko-KP, without)
 CJK = f"{YEAR}{MARK}\u5e74{MARK}\\d{{1,2}}{MARK}\u6708{DAY}{MARK}\u65e5"
+# The same with no mark before each character, then the weekday (zh-Hans-HK, zh-Hans-MO)
+CJK_WEEKDAY = f"{YEAR}\u5e74{MARK}\\d{{1,2}}\u6708{DAY}\u65e5{WORD}"
 KOREAN = f"{YEAR}{MARK}?\ub144 {MARK}\\d{{1,2}}{MARK}?\uc6d4 {DAY}{MARK}?\uc77c {WORD}"
 # The time has no marks: 9:43 PM, 21:43:21, 9:43:21 p. m., with a space or a narrow no-break space before the AM or PM,
-# or with the AM or PM first, as ko-KR and zh-TW write it in their own words
+# or with the AM or PM first, as ko-KR and zh-TW write it in their own words, and zh-Hans-HK and zh-Hans-MO write it with
+# no space after their words. After the time, el-GR, the Arabic locales, fa-IR, and vi-VN write it in their own words.
 CLOCK = r"\d{1,2}:\d{2}(?::\d{2})?"
 DESIGNATOR = r"[AaPp]\.? ?[Mm]\.?"
+DESIGNATOR_AFTER = f"(?:{DESIGNATOR}|\u03c0\u03bc|\u03bc\u03bc|\u0635|\u0645|\u0642\\.\u0638|\u0628\\.\u0638|SA|CH)"
 DESIGNATOR_FIRST = f"(?:{DESIGNATOR}|\uc624\uc804|\uc624\ud6c4|\u4e0a\u5348|\u4e0b\u5348)"
-TIME = f"(?: (?:{CLOCK}(?:[ \u202f]{DESIGNATOR})?|{DESIGNATOR_FIRST} {CLOCK}))?"
-MARKED_DATE = re.compile(f"(?:{NUMBERS}|{WORDS}|{ROMANCE}|{CJK}|{KOREAN}){TIME}")
+TIME = f"(?: (?:{CLOCK}(?:[ \u202f]{DESIGNATOR_AFTER})?|{DESIGNATOR_FIRST} {CLOCK}|[\u4e0a\u4e0b]\u5348{CLOCK}))?"
+MARKED_DATE = re.compile(f"(?:{NUMBERS}|{WORDS}|{ROMANCE}|{CJK}|{CJK_WEEKDAY}|{KOREAN}){TIME}")
 MAP_PART = re.compile(r"([A-Za-z][\w ]{0,40}: )(.*)", re.DOTALL)   # a map's "Label: value"
 # Windows' names for the rights a 5145 or 4663 lists as %% codes. EvtxECmd's map names a single code but writes
 # "Unknown code (%%1537 | %%4423 ...)" for a list, so these names are what tell a share's writes from its reads.
@@ -196,7 +203,8 @@ def event_from_row(row: dict[str, str], ctx: ParseContext, xml_reader: bool = Fa
             plain = _unmarked_date(value)
             if plain == value and name == "Data":
                 # EvtxECmd joins unnamed values into one with ", ", such as an unexpected shutdown's time and date
-                plain = ", ".join(_unmarked_date(part) for part in value.split(", "))
+                joined = ", ".join(_unmarked_date(part) for part in value.split(", "))
+                plain = value if _out_of_order_on_screen(joined) else joined
             if plain != value:
                 fields[name] = unmarked[value] = plain
         # Text that another field keeps, marks and all, keeps them in the message too.
@@ -388,10 +396,21 @@ def _dated(name: str, provider: str) -> bool:
     return "Date" in name or "Time" in name or (provider in UNNAMED_DATES and UNNAMED.match(name) is not None)
 
 
+def _out_of_order_on_screen(text: str) -> bool:
+    """Whether a right-to-left letter comes before a digit. With no mark before the digit, a browser draws it in the
+    letter's run, so the parts of a date change order. The pages draw each mark as its code point, which holds them in
+    the order written."""
+    return any(c.isdigit() for c in dropwhile(lambda c: bidirectional(c) not in RIGHT_TO_LEFT, text))
+
+
 def _unmarked_date(value: str) -> str:
     """A value that is a date, with or without a time, with a mark before each part of the date, as Windows writes one
-    for the reader's locale, without its marks. Any other value is returned as it is."""
-    return DATE_MARKS.sub("", value) if MARKED_DATE.fullmatch(value) else value
+    for the reader's locale, without its marks, unless that would put it out of order on screen (_out_of_order_on_screen).
+    Any other value is returned as it is."""
+    if not MARKED_DATE.fullmatch(value):
+        return value
+    plain = DATE_MARKS.sub("", value)
+    return value if _out_of_order_on_screen(plain) else plain
 
 
 def _unmarked_part(part: str, unmarked: dict[str, str]) -> str:

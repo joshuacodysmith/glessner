@@ -32,6 +32,7 @@ from glessner.imports import run_import
 from glessner.intake import intake, manifest_hashes
 from glessner.parsers import PARSERS, ParseContext
 from glessner.parsers.autoruns import BUILT
+from glessner.parsers.lecmd import EXTRA_COLUMNS
 from glessner.server import api_mark, api_rule
 
 pytestmark = pytest.mark.browser
@@ -1232,6 +1233,26 @@ def test_the_mft_entry_group_names_the_fn_letters_equal_to_si(browser, synthetic
         group = p.evaluate(MFT_GROUP)
         assert group["fn"] == "MACB"
         assert group["labels"].index("FnEqualsSi") == group["labels"].index("SI<FN") + 1
+
+
+# The Shortcut (LNK) group's rows, each as its label and the value's text
+SHORTCUT_GROUP = """() => [...[...document.querySelectorAll('#details .ev-facts .fieldgroup')]
+    .find((g) => g.querySelector('h3').textContent === 'Shortcut (LNK)').querySelectorAll('dt')]
+    .map((dt) => [dt.textContent, dt.nextElementSibling.firstChild.textContent])"""
+
+
+def test_the_shortcut_group_lists_every_column_the_parser_keeps(browser, synthetic_case, tmp_path):  # noqa: F811
+    """A shortcut's Shortcut (LNK) group lists each column the parser keeps from LECmd's output."""
+    kept = {column: f"{column} value" for column in EXTRA_COLUMNS}
+    write_csv(tmp_path / "lecmd.csv", [{"SourceFile": str(synthetic_case.evidence / "DC01" / "x.lnk"),
+                                        "TargetCreated": "2020-09-19 03:00:00", **kept}])
+    events = list(PARSERS["lecmd_csv"](ParseContext(tmp_path, synthetic_case.evidence)))
+    load(synthetic_case.db_path, events, host="DC01", tool="lecmd", tool_version="t", run_id="lnk1", replaces_sources=[],
+         staging_dir=synthetic_case.folder)
+    event = uid(synthetic_case, "artifact = 'lnk'")
+    for p in served_page(browser, synthetic_case):
+        select(p, event)
+        assert dict(p.evaluate(SHORTCUT_GROUP)) == kept
 
 
 # The Registry value group's rows, each as its label and the value's text

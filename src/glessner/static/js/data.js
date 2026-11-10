@@ -84,10 +84,12 @@ export function showData({ data, fetchMs, span_s, view = S.view }) {
                 total_ms: Math.round(fetchMs + drawMs), span_s };
   window.__timings.push(rec);
   // A window the drawn data wasn't for is itself the last action; a redraw of the same window keeps the earlier one, so a
-  // mark's line outlasts the redraw that follows it
+  // mark's line outlasts the redraw that follows it, without any word that the timeline didn't reload (reportWrite)
   if (!sameWindow(view, S.shownWindow)) {
     S.shownWindow = { start: view.start, end: view.end };
     S.lastAction = { text: 'Window moved', ms: data.server_ms };
+  } else if (S.lastAction?.onLoad) {
+    S.lastAction = S.lastAction.onLoad;
   }
   refreshViewStatus();
 }

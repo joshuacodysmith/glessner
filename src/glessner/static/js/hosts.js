@@ -179,8 +179,6 @@ export async function confirmRoles(names) {
 // all come from the server. Each control that a change takes away hands the focus to the one that replaces it, as the
 // clock's Align buttons do.
 
-const listed = (names, shown = 3) => (names.length > shown
-  ? `${names.slice(0, shown).join(', ')}, and ${names.length - shown} more` : names.join(', '));
 // The control of one host's notice or line, found by data attributes, since a host folder's name can hold anything.
 const splitControl = (host, role) => [...$('hostSplits').querySelectorAll(`[data-control="${role}"]`)]
   .find((b) => b.dataset.host === host);
@@ -227,7 +225,7 @@ function renderSplits() {
       el('div', { class: 'actions' }, yes,
         button('Cancel', () => { confirm.hidden = true; opener.setAttribute('aria-expanded', 'false'); opener.focus(); })));
     return el('div', { class: 'split-done', 'data-host': s.host },
-      el('span', {}, `${s.host} is split by recorded computer into ${plural(s.lanes.length, 'new host')}: ${listed(s.lanes, 6)}`),
+      el('span', {}, `${s.host} is split by recorded computer into ${plural(s.lanes.length, 'new host')}: ${listWords(s.lanes, { cap: 6 })}`),
       el('span', { class: 'muted' }, ` (#${s.entries.map((e) => e.seq).join(', #')}, ${last.who}, ${fmtAt(last.at)})`), ' ',
       opener, confirm);
   });
@@ -259,7 +257,7 @@ async function previewSplit(host, box, opener) {
       .map((h, i) => el('th', { class: i > 1 ? 'num' : '' }, h)))),
     el('tbody', {}, ...p.groups.map((g) => el('tr', {},
       el('td', {}, g.lane, ...(g.note ? [el('div', { class: 'muted' }, `Renamed: ${g.note}`)] : [])),
-      el('td', {}, listed(g.names)), number(g.events), number(g.hayabusa), number(g.files)))));
+      el('td', {}, listWords(g.names, { cap: 3 })), number(g.events), number(g.hayabusa), number(g.files)))));
   const happens = [
     // What the evidence allows, said plainly: a split moves event logs only, and those give no OS or IP address.
     'Each new host gets its own lane, role guess, and names, and an OS and a clock check where its evidence allows. ' +
@@ -302,8 +300,8 @@ function refs(m) {
 }
 
 function stays(host, s) {
-  const computers = s.computers.map((c) => `${listed(c.names, 2)} (${plural(c.events, 'event')}) stays on ${host}: ` +
-                                            `it has ${c.reason}.`);
+  const computers = s.computers.map((c) => `The computer recorded as ${listWords(c.names, { cap: 2 })} (${plural(c.events, 'event')}) ` +
+                                            `stays on ${host}: it has ${c.reason}.`);
   const other = s.rows.filter((r) => !['evtx', 'hayabusa'].includes(r.artifact));
   const hits = s.rows.filter((r) => r.artifact === 'hayabusa').reduce((n, r) => n + r.count, 0);
   const words = other.map((r) => plural(r.count, `${artifactName(r.artifact)} event`));

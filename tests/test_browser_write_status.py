@@ -8,7 +8,15 @@ from urllib.parse import urlsplit
 import pytest
 from conftest import SEC, T0
 from test_browser_investigate import uid_at
-from test_browser_smoke import RECORD_REQUESTS, browser, case_menu, clock_page, refused_with, served_page  # noqa: F401
+from test_browser_smoke import (  # noqa: F401
+    RECORD_REQUESTS,
+    browser,
+    case_menu,
+    clock_page,
+    mark_and_note_an_event,
+    refused_with,
+    served_page,
+)
 
 from glessner.audit import read_entries
 from glessner.journal import JOURNAL_FILE
@@ -21,6 +29,12 @@ HOSTS_CHANGED = f"The hosts changed, but {RELOAD_FAILED}"
 # The reads that follow a write and can fail, each with the message its refusal gives: the lanes and the window's data
 RELOADS = {"lanes": ("/api/lanes", LANES_FAILED), "view": ("/api/view", "the view failed")}
 LOGONS = "id: logons\nsuggest: suspicious\nwhen: {field: event_code, equals: '4624'}\n"
+# The audit trail's changes: the entry each acts on, the buttons that open and confirm it, its status line, and what the
+# trail shows once it has drawn the change
+TRAIL_CHANGES = {
+    "undo": ("Malicious", "Undo", "Undo 1 event", "Undid #{seq}: 1 event back to how it was", "correction: accident"),
+    "retraction": ("a note to retract", "Retract", "Retract", "Retracted note #{seq}", "Retracted by #"),
+}
 
 
 def refuse(p, path, message):
@@ -133,10 +147,12 @@ def test_an_accepted_suggestion_is_written_when_the_timeline_does_not_reload_aft
         p.errors[:] = [e for e in p.errors if reread not in e]
 
 
-def test_a_tag_is_written_when_the_timeline_does_not_reload_after_it(browser, synthetic_case):  # noqa: F811
-    """With a View on, a tag reads the lanes again. A tag from the Event page's picker whose answer comes, and whose lanes
-    then fail to load, says what was tagged and that the timeline didn't reload, and the page shows the tag's chip. A tag
-    the server refuses first reads as failed, and the journal then holds the one tag."""
+@pytest.mark.parametrize("reload", RELOADS)
+def test_a_tag_is_written_when_the_timeline_does_not_reload_after_it(browser, synthetic_case, reload):  # noqa: F811
+    """With a View on, a tag reads the lanes again as well as the window's data. A tag from the Event page's picker whose
+    answer comes, and whose lanes or window's data then fail to load, says what was tagged and that the timeline didn't
+    reload, and the page shows the tag's chip. A tag the server refuses first reads as failed, and the journal then holds
+    the one tag."""
     uids = {}
     for p in served_page(browser, synthetic_case, setup=lambda app: uids.update(rdp=uid_at(app, T0))):
         p.evaluate("() => import('/js/view.js').then((m) => m.addViewValue({ host: 'DC01' }))")
@@ -149,14 +165,91 @@ def test_a_tag_is_written_when_the_timeline_does_not_reload_after_it(browser, sy
         assert status_naming(p, "refused") == "Tag failed: the tag was refused"
         unrefuse(p, refused, "/api/tag")
         assert journal(synthetic_case, "tag") == []
-        refuse(p, "/api/lanes", LANES_FAILED)
+        reread, failed = fail_reload(p, reload)
         tag_lateral_movement(p)
-        said = f"Tagged one event: Lateral Movement; {RELOAD_FAILED}"
-        assert status_naming(p, LANES_FAILED).split(" | ")[0] == said   # the View's notes follow the action
+        said = f"Tagged one event: Lateral Movement; {failed}"
+        assert status_naming(p, failed).split(" | ")[0] == said   # the View's notes follow the action
         details.locator(".tagchip.tactic", has_text="Lateral Movement").wait_for()
         assert p.locator("#status").inner_text().split(" | ")[0] == said
         assert [e["add"] for e in journal(synthetic_case, "tag")] == [["tactic:TA0008"]]
-        p.errors[:] = [e for e in p.errors if "/api/lanes" not in e]
+        p.errors[:] = [e for e in p.errors if reread not in e]
+
+
+def open_trail_change(p, change):
+    """Open the audit trail, and on it the confirm of the undo or retraction `change` names in TRAIL_CHANGES. Returns the
+    button that confirms it, the status line it should leave, and what the trail shows once it has drawn the change."""
+    entry, opens, confirms, said, drawn = TRAIL_CHANGES[change]
+    details = p.locator("#details")
+    case_menu(p, "auditButton")
+    row = details.locator(".audit-row", has_text=entry).first
+    seq = row.locator(".seq").inner_text().lstrip("#")
+    row.get_by_role("button", name=opens).click()
+    confirm = row.locator(".audit-confirm").get_by_role("button", name=confirms)
+    return confirm, said.format(seq=seq), details.get_by_text(drawn).first
+
+
+@pytest.mark.parametrize("change", TRAIL_CHANGES)
+def test_an_undo_or_a_retraction_keeps_its_line_once_the_timeline_has_reloaded(browser, synthetic_case, change):  # noqa: F811
+    """The window's data that follows an undo or a retraction doesn't take the status line back to the action before it."""
+    for p in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        confirm, said, drawn = open_trail_change(p, change)
+        confirm.click()
+        drawn.wait_for()
+        assert p.locator("#status").inner_text().startswith(said)
+
+
+def test_a_retraction_whose_note_cannot_be_found_reads_as_failed(browser, synthetic_case):  # noqa: F811
+    """Retract on the audit trail first reads which event the note is on. With that read refused, the status line says the
+    retract failed, the confirm stays open, and nothing is written; another click goes through."""
+    for p in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        confirm, said, drawn = open_trail_change(p, "retraction")
+        refused = refuse(p, "/api/audit_events", "the read was refused")
+        confirm.click()
+        assert status_naming(p, "refused") == "Retract failed: the read was refused"
+        assert confirm.is_visible() and journal(synthetic_case, "note_retract") == []
+        unrefuse(p, refused, "/api/audit_events")
+        confirm.click()
+        drawn.wait_for()
+        assert p.locator("#status").inner_text().startswith(said)
+
+
+@pytest.mark.parametrize("reload", RELOADS)
+@pytest.mark.parametrize("write", ["mark", "undo"])
+def test_a_write_stops_saying_the_timeline_did_not_reload_when_the_window_s_data_loads(browser, synthetic_case, write, reload):  # noqa: F811
+    """A write's line says the timeline didn't reload only until the window's data next loads: then it says what was
+    written, with the write's server time. A mark and an undo share the line."""
+    path, message = RELOADS[reload]
+    failed = f"the timeline didn't reload: {message}"
+    for p in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        if write == "mark":
+            go, said = search_logons(p).get_by_role("button", name="Mark 6 Suspicious"), "Marked 6 events Suspicious"
+        else:
+            go, said, _ = open_trail_change(p, "undo")
+        refused = refuse(p, path, message)
+        go.click()
+        assert status_naming(p, failed) == f"{said}; {failed}"
+        unrefuse(p, refused, path)
+        assert p.evaluate("() => window.__app.fetchView()") == ""
+        assert p.locator("#status").inner_text().startswith(f"{said} · ")
+
+
+@pytest.mark.parametrize("reload", RELOADS)
+@pytest.mark.parametrize("change", TRAIL_CHANGES)
+def test_an_undo_or_a_retraction_is_written_when_the_timeline_does_not_reload_after_it(browser, synthetic_case, change, reload):  # noqa: F811
+    """An undo or a retraction on the audit trail, with the lanes or the window's data refused after it, says what was
+    written and that the timeline didn't reload, and the trail draws the change. Lanes that fail don't keep the window's
+    data and the counts from following."""
+    for p in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
+        confirm, said, drawn = open_trail_change(p, change)
+        reread, failed = fail_reload(p, reload)
+        p.evaluate(RECORD_REQUESTS)
+        confirm.click()
+        assert status_naming(p, failed) == f"{said}; {failed}"
+        drawn.wait_for()
+        assert p.locator("#status").inner_text() == f"{said}; {failed}"
+        asked = p.evaluate("() => window.__asked")
+        assert all(any(path.startswith(read) for path in asked) for read in ("/api/view", "/api/counts"))
+        p.errors[:] = [e for e in p.errors if reread not in e]
 
 
 @pytest.mark.parametrize("reload", RELOADS)

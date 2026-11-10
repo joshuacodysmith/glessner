@@ -6,17 +6,17 @@ Each tool is optional. Glessner runs the installed tools that have evidence to r
 
 The commands are for Windows PowerShell, which comes with Windows. Paste the blocks into one PowerShell window, in order. Step 1 has you open a new window once, after uv is installed. Only Npcap's installer needs administrator rights.
 
-The steps for uv, Glessner, Hayabusa, Npcap, and Suricata were tested on 2026-10-21 on a fresh Windows 11 installation, build 26100, with the versions below. The steps for Eric Zimmerman's 2026.10 tools and the .NET 10 runtime have not yet been run on a fresh machine.
+Each step was tested in [Windows Sandbox](https://learn.microsoft.com/en-us/windows/security/application-security/application-isolation/windows-sandbox/) on Windows 11, build 26100, with the versions below. Microsoft describes the sandbox as being as clean as a new installation of Windows each time it runs. The steps for Hayabusa, Npcap, and Suricata were tested on 2026-10-21, and the steps for uv, Glessner, Eric Zimmerman's tools, and the .NET 10 runtime on 2026-11-06.
 
 ## What you install
 
 | Part | Version tested | What it's for | Download |
 |---|---|---|---|
-| uv | 0.13.4 | Installs Python and the app's dependencies, and runs the app | 15.2 MB |
-| Python | 3.14.8 | Runs the app. uv installs it | 23.3 MB |
+| uv | 0.13.7 | Installs Python and the app's dependencies, and runs the app | 15.2 MB |
+| Python | 3.14.10 | Runs the app. uv installs it | 23.3 MB |
 | Glessner | This repository | The app, and its Python packages, which uv installs | About 4 MB, then 65 MB of packages |
-| Eric Zimmerman's tools | 2026.10 | Event logs, registry, $MFT and $J, Prefetch, LNK files, jump lists, shellbags, Amcache, SRUM, Recycle Bin, browser history, notifications, and the Windows Timeline | 12 zips, 49.5 MB |
-| .NET 10 runtime | 10.0.13 | Runs AmcacheParser, RBCmd, SQLECmd, and WxTCmd | 37.0 MB |
+| Eric Zimmerman's tools | 2026.10 | Event logs, registry, $MFT and $J, Prefetch, LNK files, jump lists, shellbags, Amcache, SRUM, Recycle Bin, browser history, notifications, and the Windows Timeline | 12 zips, 49.4 MB |
+| .NET 10 runtime | 10.0.14 | Runs AmcacheParser, RBCmd, SQLECmd, and WxTCmd | 37.0 MB |
 | Hayabusa | 4.1.0 | Sigma and Hayabusa rule hits on event logs | 44.8 MB |
 | Npcap | 1.89 | Lets Suricata read capture files | 1.3 MB |
 | Suricata | 8.0.7 | Network records and alerts from packet captures | 36.7 MB |
@@ -206,17 +206,17 @@ Each installed tool shows its version and the executable Glessner found. With ev
 ```text
 Tools folder: C:\Tools
   AmcacheParser 2026.10.1  C:\Tools\EZTools\AmcacheParser\AmcacheParser.exe  Not pinned
-  Windows event XML 0.3.0      C:\Glessner\.venv\Scripts\python.exe
+  Windows event XML 0.4.0      C:\Glessner\.venv\Scripts\python.exe
   EvtxECmd   2026.10.2  C:\Tools\EZTools\EvtxECmd\EvtxeCmd\EvtxECmd.exe  Not pinned
   Hayabusa   4.1.0      C:\Tools\hayabusa-4.1.0\hayabusa-4.1.0-win-x64.exe  Not pinned
-  JLECmd     2026.10.5  C:\Tools\EZTools\JLECmd\JLECmd.exe  Not pinned
-  LECmd      2026.10.3  C:\Tools\EZTools\LECmd\LECmd.exe  Not pinned
+  JLECmd     2026.10.6  C:\Tools\EZTools\JLECmd\JLECmd.exe  Not pinned
+  LECmd      2026.10.4  C:\Tools\EZTools\LECmd\LECmd.exe  Not pinned
   MFTECmd    2026.10.6  C:\Tools\EZTools\MFTECmd\MFTECmd.exe  Not pinned
   MFTECmd ($J) 2026.10.6  C:\Tools\EZTools\MFTECmd\MFTECmd.exe  Not pinned
   PECmd      2026.10.3  C:\Tools\EZTools\PECmd\PECmd.exe  Not pinned
   RBCmd      2026.10.1  C:\Tools\EZTools\RBCmd\RBCmd.exe  Not pinned
-  RECmd      2026.10.2  C:\Tools\EZTools\RECmd\RECmd\RECmd.exe  Not pinned
-  SBECmd     2026.10.2  C:\Tools\EZTools\SBECmd\SBECmd.exe  Not pinned
+  RECmd      2026.10.3  C:\Tools\EZTools\RECmd\RECmd\RECmd.exe  Not pinned
+  SBECmd     2026.10.3  C:\Tools\EZTools\SBECmd\SBECmd.exe  Not pinned
   SQLECmd    2026.10.3  C:\Tools\EZTools\SQLECmd\SQLECmd\SQLECmd.exe  Not pinned
   SrumECmd   2026.10.1  C:\Tools\EZTools\SrumECmd\SrumECmd.exe  Not pinned
   Suricata   8.0.7      C:\Tools\suricata-8.0.7\PFiles\Suricata\suricata.exe  Not pinned

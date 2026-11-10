@@ -14,7 +14,7 @@ Each write-up gives the dataset, how the check ran, each item's state, the gaps 
 | [otrf_apt29_day1.md](otrf_apt29_day1.md) | [OTRF Security Datasets](https://github.com/OTRF/Security-Datasets), APT29 Day 1: Windows events from four machines, exported as JSON, and packet captures and Zeek logs of two of them | 19, 6, 0 of 25 | After v0.2.0, run on 2026-10-22 |
 | [cfreds_data_leakage.md](cfreds_data_leakage.md) | [The Data Leakage Case](https://cfreds-archive.nist.gov/data_leakage_case/data-leakage-case.html), from NIST's CFReDS project: a Windows 7 PC, two USB drives, and a CD-R | 26, 21, 10 of 57, plus 3 out of scope | After v0.2.0, run on 2026-10-22 |
 
-[How each item is scored](#how-each-item-is-scored) defines the states and the form of a score. Each score measures the build the check ran on, before the fixes its gaps led to. v0.1.0 is the first build with a version number. [CHANGELOG.md](../CHANGELOG.md) lists each release's changes. The Szechuan and MTA write-ups give each gap's state in v0.2.0, and the EVTX, APT29, and CFReDS write-ups give it in v0.3.0.
+[How each item is scored](#how-each-item-is-scored) defines the states and the form of a score. Each score measures the build the check ran on, before the fixes its gaps led to. v0.1.0 is the first build with a version number. [CHANGELOG.md](../CHANGELOG.md) lists each release's changes. Each write-up gives each gap's state in v0.4.0.
 
 A check shows that the evidence for each answer is present and readable in the app. It doesn't show that an analyst who doesn't know the answer would find it. [known_limitations.md](../known_limitations.md#what-has-been-checked) lists what else hasn't been shown.
 
@@ -56,11 +56,12 @@ A score gives the reached, partly reached, and missed counts of the items in sco
 
 ## Gap states
 
-Each gap in a write-up has one state. Item states measure the build the check ran on, and gap states say where each gap stands in the release the write-up names. A gap can be fixed while the item it lowered keeps its state until the check runs again. A gap built after that release says so in its state, such as "Planned in v0.3.0, and built since for the next release".
+Each gap in a write-up has one state. Item states measure the build the check ran on, and gap states say where each gap stands in the release the write-up names. A gap can be fixed while the item it lowered keeps its state until the check runs again. A gap built after that release says so in its state, such as "Planned in v0.4.0, and built since for the next release".
 
 | State | Meaning | Example |
 |---|---|---|
 | Fixed | The named release fixes it. A gap whose remedy is documentation is fixed by the release that carries the documentation. | Szechuan gap 1, Suricata flow times, fixed in v0.1.0 |
+| Partly fixed | The named release fixes part of it, and the state says what is left. | CFReDS gap 15, a network adapter's interface ID, partly fixed in v0.4.0 |
 | Planned | A fix or documentation is chosen and not built. | MTA gap 1, a reader for the Sguil alert export |
 | Superseded | Another gap's fix covers it, and the state names that gap. | MTA gap 10, every event's host reading `network`, which gap 5's assignment of flows to hosts covers |
 | Open | Deferred, or not yet decided. | Szechuan gap 9, a suggestion for timestomped files |

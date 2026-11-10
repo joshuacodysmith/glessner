@@ -154,6 +154,8 @@ _PATH_PREFIXES = re.compile(
     # A prefetch volume (\VOLUME{...}) or a volume GUID after a prefix (Volume{GUID}), NT device, drive, MFT root
     r"(?:\\?VOLUME\{[^}]*\}|\\Device\\HarddiskVolume\d+|[A-Za-z]:|\.(?=\\|$))?",
     re.IGNORECASE)
+# \\.\, \\?\, or \??\ before none of what names a file: a drive, a volume, a UNC path, or a GLOBALROOT path
+_OTHER_DEVICE = re.compile(r"^(?:\\\\[?.]|\\\?\?)\\(?![A-Za-z]:|Volume\{|HarddiskVolume|UNC\\|GLOBALROOT\\)", re.IGNORECASE)
 
 
 # The folders a path can start with as a variable, as the key writes them out. A user's
@@ -191,7 +193,10 @@ def file_key(path: str | None) -> str:
     with a folder variable or \\SystemRoot has it written out first (expand_folder).
     Text that is not a path, such as "Applications\\Microsoft Edge", gives "". So does text that starts with one slash, a
     URL path or a Unix path such as /coreupdater.exe: read as a Windows path it would be a file at a volume root, and
-    none of the 99 such keys on Szechuan matched a file. //server/share is a UNC path and keeps its key.
+    none of the 99 such keys on Szechuan matched a file. //server/share is a UNC path and keeps its key. A device that
+    names no file after \\\\.\\, \\\\?\\, or \\??\\, such as \\\\?\\pipe\\x or \\\\.\\PhysicalDrive0, gives "" too: as
+    \\pipe\\x it would join a file at C:\\pipe\\x. After those prefixes, UNC\\, GLOBALROOT\\, and a HarddiskVolume name a
+    file, so each keeps its path as its key, the same whichever prefix it has.
     """
     if not path:
         return ""
@@ -200,6 +205,8 @@ def file_key(path: str | None) -> str:
         return ""
     text = expand_folder(text.replace("/", "\\"))
     if not (text.startswith(("\\", ".\\", "This PC\\")) or re.match(r"^[A-Za-z]:\\", text)):
+        return ""
+    if _OTHER_DEVICE.match(text):
         return ""
     rest = _PATH_PREFIXES.sub("", text, count=1)
     if not rest.startswith("\\"):

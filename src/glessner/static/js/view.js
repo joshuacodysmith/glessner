@@ -267,11 +267,20 @@ export async function toggleViewPanel(open) {
   resize();
   scheduleFetch();
   if (panel.hidden) return;
-  try {
-    const [marks, tags] = await Promise.all([api('/api/marks'), api('/api/tags')]);
-    S.markCounts = marks.counts;
-    S.tagCounts = tags;
-  } catch (err) { setStatus(err.message); }
+  try { await readViewCounts(); } catch (err) { setStatus(err.message); }
+  renderViewPanel();
+}
+
+async function readViewCounts() {
+  const [marks, tags] = await Promise.all([api('/api/marks'), api('/api/tags')]);
+  S.markCounts = marks.counts;
+  S.tagCounts = tags;
+}
+
+// The open panel's counts follow a write. A read that fails leaves the old counts, and the write's line on the status line.
+export async function refreshViewCounts() {
+  if ($('viewPanel').hidden) return;
+  try { await readViewCounts(); } catch (_) { /* the panel keeps its old counts */ }
   renderViewPanel();
 }
 

@@ -197,6 +197,8 @@ def _message(kind: str, rec: dict) -> str:
                 f"{fi.get('size', '?')} bytes) {ends}")
     if kind == "flow":
         fl = rec.get("flow") or {}
+        state = f", {fl['state']}" if fl.get("state") else ""
+        reason = f", ended by {fl['reason']}" if fl.get("reason") else ""
         return (f"Flow {proto} {ends}, {fl.get('bytes_toserver', 0)} bytes to server, "
-                f"{fl.get('bytes_toclient', 0)} to client")
+                f"{fl.get('bytes_toclient', 0)} to client{state}{reason}")
     return f"{kind} {proto} {ends}".strip()

@@ -17,6 +17,7 @@ import time
 import warnings
 from collections import Counter
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from conftest import DC_LOG, SEC, T0, BrowserRelaunched, SharedBrowser, close_first, junction, logon, registry
@@ -2027,11 +2028,13 @@ def test_tools_page_names_the_rule_set_the_skipped_rows_and_the_runtime_of_each_
         eve.write_text(eve_lines(ids) + '{"timestamp": "2024', encoding="utf-8")
     specs, detected = fake_tool_case(synthetic_case, tmp_path)
     fake, exe = specs["fake"], detected["fake"].executable
-    label = {"kind": "count", "path": "Maps", "text": "{value}"}
+    (tmp_path / "Maps").mkdir()
+    (tmp_path / "Maps" / "a.map").write_bytes(b"a")
+    label = {"kind": "count", "path": str(tmp_path / "Maps" / "*.map"), "text": "Maps, {value} map"}
     labeled = fake.__class__(**{**fake.__dict__, "dotnet": 9, "rules_label": label})
     ruleful = fake.__class__(**{**fake.__dict__, "id": "other", "name": "Other", "rules": {"file": "rules/x.rules"}})
     cache = ({"fake": labeled, "other": ruleful},
-             {"fake": DetectedTool(labeled, exe, "1.0", dotnet_root=str(tmp_path), rules="Maps, 456 maps"),
+             {"fake": DetectedTool(labeled, exe, "1.0", dotnet_root=str(tmp_path)),
               "other": DetectedTool(ruleful, exe, "1.0")})
     for host, fields in (("DC01", {"rules": "Maps, 456 maps", "tool_files": {"Fake.exe": "ab" * 32}, "rows_skipped": 2,
                                    "rows_without_time": 3}),
@@ -2045,7 +2048,7 @@ def test_tools_page_names_the_rule_set_the_skipped_rows_and_the_runtime_of_each_
         case_menu(page, "toolsButton")
         page.wait_for_selector("#details[data-page='tools'] .tools-table .ok")
         row = lambda n: page.locator("#details .tools-table:not(.tools-outputs) tbody tr").nth(n).locator("td")  # noqa: B023
-        assert row(0).nth(1).locator("div").all_inner_texts() == ["Rules: Maps, 456 maps", ".NET 9, from the tools folder"]
+        assert row(0).nth(1).locator("div").all_inner_texts() == ["Rules: Maps, 1 map", ".NET 9, from the tools folder"]
         status = row(0).nth(3)
         assert status.locator(".ok").inner_text().endswith(" UTC: 20 events, 3 without a time, 2 skipped")
         assert status.locator(".muted").inner_text() == "Maps, 456 maps; rules not recorded"
@@ -2613,6 +2616,8 @@ def test_hosts_panel_splits_a_mixed_host_keeps_and_undoes(browser, tmp_path):
         go.click()
         p.wait_for_selector("#hostSplits .split-done")
         p.wait_for_function("() => document.getElementById('status').textContent === 'Split LAB into 3 new hosts'")
+        assert p.locator("#hostSplits .split-done span").first.inner_text() == (
+            "LAB is split by recorded computer into 3 new hosts: DC1, MSEDGEWIN10, and PC01")
         assert notice.count() == 0
         p.wait_for_function(f"() => ({focused})() === 'Undo split of LAB'")
         p.wait_for_function("() => window.__app.S.lanes.some((l) => l.keys.includes('PC01'))")
@@ -2648,6 +2653,24 @@ def test_hosts_panel_splits_a_mixed_host_keeps_and_undoes(browser, tmp_path):
         kept.locator(".split-preview h3").wait_for()
         entries = read_entries(case.folder / JOURNAL_FILE)
         assert [e["op"] for e in entries if e["action"] == "host_split"] == ["split", "undo", "keep"]
+
+
+def test_a_split_preview_names_a_computer_that_stays_under_two_names_as_one(browser, tmp_path):
+    """A name beside its qualified form is one computer. The split's preview says that computer stays on the host, in the
+    singular, whichever names it has."""
+    from test_splits import lab_case, security
+
+    folder = SimpleNamespace(evidence=tmp_path / "evidence")
+    names = [security(folder, 1, 4688, "LAB", "LM/LAB_Security.evtx", 7),
+             security(folder, 1, 4688, "LAB.corp.local", "LM/LAB_System.evtx", 8)]
+    case, _ = lab_case(tmp_path, extra_rows=names)
+    for p in served_page(browser, case):
+        case_menu(p, "hostsButton")
+        notice = p.locator("#hostSplits .split-notice")
+        notice.get_by_role("button", name="Split LAB by recorded computer…").click()
+        notice.locator(".split-preview h3").wait_for()
+        assert ("The computer recorded as LAB and LAB.corp.local (2 events) stays on LAB: it has the host folder's name."
+                in notice.locator(".split-preview").inner_text())
 
 
 def window_text(start_ms, end_ms):
@@ -3941,8 +3964,8 @@ def test_a_confirm_opened_while_the_trail_redraws_stays_open_until_it_closes(bro
 
 def test_an_undo_whose_timeline_reload_fails_says_so_and_draws_the_trail(browser, synthetic_case):
     """The timeline reloads after an undo, and the audit trail then draws again to show it. When the reload fails, the
-    status line says the timeline didn't reload and why, in place of the undo's own line, and the trail still draws. The
-    reload of the lanes is refused here."""
+    status line says what was undone, that the timeline didn't reload, and why, and the trail still draws. The reload of
+    the lanes is refused here."""
     for page in served_page(browser, synthetic_case, setup=mark_and_note_an_event):
         details = page.locator("#details")
         case_menu(page, "auditButton")
@@ -3954,4 +3977,5 @@ def test_an_undo_whose_timeline_reload_fails_says_so_and_draws_the_trail(browser
         page.unroute("**/api/lanes?*")
         page.errors[:] = [e for e in page.errors if "/api/lanes" not in e]   # that refusal was the point
         details.locator(".correction-tag").first.wait_for()
-        assert page.locator("#status").inner_text() == "The timeline didn't reload: the lanes failed"
+        status = page.locator("#status").inner_text()
+        assert status.startswith("Undid #") and status.endswith("; the timeline didn't reload: the lanes failed")

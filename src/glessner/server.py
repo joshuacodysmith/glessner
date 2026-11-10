@@ -81,7 +81,6 @@ from .imports import (
     ROLES,
     TIME_FORMATS,
     MappingError,
-    case_year,
     check_mapping_name,
     importable,
     preview,
@@ -110,6 +109,7 @@ from .journal import (
     Journal,
     JournalError,
     analyst,
+    named_who,
     rekey_map,
     renamed,
     side_stamp,
@@ -1128,7 +1128,7 @@ def api_tags(app: App, query: dict) -> dict:
 def _event_tags(app: App, uid: str) -> tuple[list[dict], list[dict]]:
     """An event's tags and suggested tags. Read without the lock, so the journal's tags are copied before the loop: a
     tag journaled meanwhile would change the dict as it is read and make the Event page answer 500."""
-    applied = [{"key": k, "kind": tag_kind(k), "label": tag_label(k), **_technique(k), **info}
+    applied = [{"key": k, "kind": tag_kind(k), "label": tag_label(k), **_technique(k), **named_who(info)}
                for k, info in list(app.journal.state.tags.get(uid, {}).items())]
     applied.sort(key=lambda t: (tactic_order(t["key"]), t["kind"] != "technique", t["label"]))
     suggested = [{"key": r[0], "kind": r[1], "label": r[2], **_technique(r[0]), **({"origin": r[3]} if r[3] else {})}
@@ -1476,9 +1476,9 @@ def _unplaced_message(state, seq: int, uid: str) -> str:
 def _named_note(note: dict) -> dict:
     """A note as the Event page lists it: a copy whose `who`, and its retraction's, read as the audit trail names them
     (journal.analyst). The journal's state keeps them as written."""
-    named = {**note, "who": analyst(note)}
+    named = named_who(note)
     if retracted := note.get("retracted"):
-        named["retracted"] = {**retracted, "who": analyst(retracted)}
+        named["retracted"] = named_who(retracted)
     return named
 
 
@@ -1508,7 +1508,8 @@ def api_event(app: App, query: dict) -> dict:
                            for u in unplaced(app.journal.state).get(uid, [])]
     details["notes"] = [_named_note(n) for n in app.journal.state.notes.get(uid, [])]
     state = app.journal.state
-    details["followup"] = state.followed.get(uid)   # Followed up: {seq, at, who}, kept when the mark changes
+    # Followed up: {seq, at, who}, kept when the mark changes
+    details["followup"] = named_who(tick) if (tick := state.followed.get(uid)) else None
     # A rejected suggestion's note, by source
     details["rejection_notes"] = {source: note for (target, source), note in state.decision_notes.items()
                                   if target == uid}
@@ -1906,7 +1907,7 @@ def _rules_payload(app: App) -> dict:
     for source, info in sorted(app.suggestion_report.items()):
         stored = app.journal.state.rules.get(source)
         matched, pending = counts.get(source, (0, 0))
-        rules.append({"id": source, "text": stored["text"] if stored else "", "who": stored["who"] if stored else SYSTEM,
+        rules.append({"id": source, "text": stored["text"] if stored else "", "who": analyst(stored) if stored else SYSTEM,
                       "editable": stored is not None, **info, "matched": matched, "pending": pending})
     return {"rules": rules}
 
@@ -2142,7 +2143,7 @@ def api_investigate(app: App, query: dict) -> dict:
         item["rows"] = worklist_rows(ev, app.identity, app.pivot_windows, app.time_window_seconds)
         tick = state.followed.get(item["uid"])
         mark = state.marks.get(item["uid"])
-        item["followup"] = {**tick, "after_mark": bool(mark and mark.seq > tick["seq"])} if tick else None
+        item["followup"] = {**named_who(tick), "after_mark": bool(mark and mark.seq > tick["seq"])} if tick else None
     _mark_info(app, items)
     payload = _rules_payload(app)
     if not offset:
@@ -2419,7 +2420,7 @@ def api_exports_page(app: App, query: dict) -> dict:
     malicious = _malicious_uids(con)
     findings = list(state.findings.values())   # one snapshot: a finding added on another request thread changes the dict
     runs = con.execute("SELECT count(DISTINCT run_id) FROM events").fetchone()[0]
-    files = [{**f, "short": short(f.get("sha256") or ""), "words": file_words(f)} for f in reversed(list(state.files))]
+    files = [{**named_who(f), "short": short(f.get("sha256") or ""), "words": file_words(f)} for f in reversed(list(state.files))]
     return {"summary": str(state.settings.get("report_summary") or ""),
             "findings": sum(1 for f in findings if not f["retired"]),
             "retired": sum(1 for f in findings if f["retired"]),
@@ -2459,8 +2460,8 @@ def api_findings_page(app: App, query: dict) -> dict:
                             f"(SELECT v FROM {id_table(con, 'finding_kinds', f['targets'])})").fetchall()
         findings.append({"id": fid, "number": number, "title": f["title"], "severity": f["severity"],
                          "narrative": f["narrative"], "techniques": f["techniques"],
-                         "technique_flags": attack.flags(f["techniques"]), "added": f["added"],
-                         "edited": f["edited"], "retired": f["retired"], "total": len(f["targets"]),
+                         "technique_flags": attack.flags(f["techniques"]),
+                         **{k: f[k] and named_who(f[k]) for k in ("added", "edited", "retired")}, "total": len(f["targets"]),
                          "events": _listed_events(app, "finding_events", f["targets"]),
                          "caveats": caveats_for([dict(zip(CAVEAT_COLUMNS, row, strict=True)) for row in kinds])})
         if not f["retired"]:
@@ -2622,7 +2623,7 @@ def api_imports(app: App, query: dict) -> dict:
 
 def api_import_preview(app: App, body: dict) -> dict:
     return preview(app.case, str(body.get("path", "")), body.get("mapping"), _zones(app),   # MappingError is a ValueError
-                   year_hint=case_year(app.case, app.reader()))   # a cursor: app.con is for use under app.lock
+                   reader=app.reader())   # a cursor: app.con is for use under app.lock
 
 
 def api_import(app: App, body: dict) -> dict:

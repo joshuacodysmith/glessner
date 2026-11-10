@@ -27,7 +27,7 @@ import duckdb
 
 from .accounts import name_sids
 from .events import SPLIT_TOOLS, id_table, insert_columns, sql_literal
-from .journal import State
+from .journal import State, named_who
 
 TOOLS_SQL = ", ".join(sql_literal(t) for t in SPLIT_TOOLS)
 LOG_TOOLS_SQL = "'evtxecmd', 'event_xml'"   # the event log readers; Hayabusa's rows are hits on their records
@@ -401,7 +401,7 @@ def split_list(state: State) -> list[dict]:
     out = []
     for host, info in sorted(state.split_info.items()):
         lanes = sorted(set(state.splits.get(host, {}).values()))
-        out.append({"host": host, "lanes": lanes, "entries": info,
+        out.append({"host": host, "lanes": lanes, "entries": [named_who(entry) for entry in info],
                     "edits": {lane: edits for lane in lanes if (edits := _edits_left(state, lane))}})
     return out
 
@@ -409,7 +409,7 @@ def split_list(state: State) -> list[dict]:
 def kept_list(state: State, identity, found: dict[str, list[Machine]]) -> list[dict]:
     """The hosts kept as one host whose logs still record several computers, so the Hosts panel can still offer the
     split: each host, its computers, and the Keep entry."""
-    return [{"host": host, "computers": len(found.get(host, [])), "entry": info}
+    return [{"host": host, "computers": len(found.get(host, [])), "entry": named_who(info)}
             for host, info in sorted(state.kept_info.items())
             if host in identity.hosts and host not in identity.mixed and len(found.get(host, [])) >= 2]
 

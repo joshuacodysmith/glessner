@@ -47,7 +47,7 @@ def test_verify_of_a_manifest_whose_only_file_intake_could_not_read_names_it_and
 def test_verify_of_one_hashed_file_still_says_it_matches(synthetic_case, capsys):
     with_one_file(synthetic_case)
     assert main(["verify", str(synthetic_case.folder)]) == 0
-    assert capsys.readouterr().out.startswith("All evidence files match the manifest.\n")
+    assert capsys.readouterr().out.startswith("All evidence files match the intake manifest.\n")
 
 
 def test_close_of_a_manifest_that_lists_no_file_says_so_and_records_it_as_before(synthetic_case, capsys):

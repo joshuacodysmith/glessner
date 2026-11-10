@@ -13,7 +13,7 @@ from pcap_maker import write_pcap
 
 from glessner import tools
 from glessner.case import create_case
-from glessner.events import connect
+from glessner.events import EventIds, connect
 from glessner.intake import intake
 from glessner.parsers import PARSERS, ParseContext
 from glessner.runner import RunError, build_argv, plan_runs, read_runs, run
@@ -104,6 +104,24 @@ def test_flows_sit_at_their_start_and_late_records_at_their_flows(tmp_path):
                                                                          "10.42.85.10:62414")
 
 
+@pytest.mark.parametrize(("more", "ending"), [
+    ({"state": "established", "reason": "shutdown"}, ", established, ended by shutdown"),
+    ({"state": "closed"}, ", closed"),
+    ({"reason": "timeout"}, ", ended by timeout"),
+    ({"state": "", "reason": None}, ""),
+    ({}, ""),
+])
+def test_a_flows_message_gives_its_state_and_end_reason_and_its_id_doesnt_depend_on_them(tmp_path, more, ending):
+    """The ID doesn't depend on these fields, so a rebuild keeps every mark on the flow."""
+    flow = {"timestamp": "2020-09-19T04:58:07.470323+0700", "flow_id": 7, "event_type": "flow", "src_ip": "10.42.85.10",
+            "src_port": 62414, "dest_ip": "203.0.113.9", "dest_port": 443, "proto": "TCP", "app_proto": "failed",
+            "flow": {"start": "2020-09-19T09:25:18.000000+0700", "bytes_toserver": 51044, "bytes_toclient": 932653, **more}}
+    (tmp_path / "eve.json").write_text(json.dumps(flow) + "\n", encoding="utf-8")
+    [event] = PARSERS["suricata_eve"](ParseContext(tmp_path, Path("D:/Evidence"), ("NET/c.pcap",)))
+    assert event.message == f"Flow TCP 10.42.85.10:62414 -> 203.0.113.9:443, 51044 bytes to server, 932653 to client{ending}"
+    assert EventIds()("NET", event)[0] == "fa678b98abaae6797f6be83e595eac1c"
+
+
 def suricata_install(tmp_path, with_rules=True):
     folder = tmp_path / "tools" / "suricata" / "PFiles" / "Suricata"
     (folder / "rules").mkdir(parents=True)
@@ -130,7 +148,7 @@ def test_registry_entry_loads_the_rule_set_beside_the_tool_and_needs_npcap(tmp_p
     folder = suricata_install(tmp_path)
     monkeypatch.setattr(tools, "npcap_folder", lambda: tmp_path)   # Npcap present; the version check fails harmlessly
     found = tools.detect([spec], tmp_path / "tools")["suricata"]
-    assert (found.rules, found.missing) == ("ET Open 11310", "")
+    assert (tools.rules_label(spec, found.executable), found.missing) == ("ET Open 11310", "")
     assert tools.tool_env(found)["PATH"].startswith(str(tmp_path))
     case = capture_case(tmp_path)
     (plan,) = plan_runs(case, found)
@@ -142,7 +160,8 @@ def test_registry_entry_loads_the_rule_set_beside_the_tool_and_needs_npcap(tmp_p
 
     (folder / "rules" / "suricata.rules").unlink()   # without a rule set it runs without rules
     bare = tools.detect([spec], tmp_path / "tools")["suricata"]
-    assert bare.rules == "" and "-S" not in build_argv(case, plan_runs(case, bare)[0], tmp_path / "out", {})
+    assert tools.rules_label(spec, bare.executable) == ""
+    assert "-S" not in build_argv(case, plan_runs(case, bare)[0], tmp_path / "out", {})
 
     monkeypatch.setattr(tools, "npcap_folder", lambda: None)   # no Npcap: no version check, and no run
     blocked = tools.detect([spec], tmp_path / "tools")["suricata"]

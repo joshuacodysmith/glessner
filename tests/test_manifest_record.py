@@ -15,13 +15,15 @@ from rekey_cases import set_format
 from test_custody import report_section
 from test_format3 import entries_of, journal_path, opened, wait
 
+from glessner import cli as cli_module
 from glessner import heads
 from glessner import intake as intake_module
 from glessner import rekey as rekey_module
 from glessner.audit import KINDS, describe, lookups, read_entries
 from glessner.case import CaseError, copy_case, open_case
 from glessner.cli import main
-from glessner.intake import UNRECORDED_MANIFEST, ManifestCheck, ManifestEntry, add_new, intake, manifest_text
+from glessner.export import _evidence_check
+from glessner.intake import UNRECORDED_MANIFEST, Check, ManifestCheck, ManifestEntry, add_new, intake, manifest_text
 from glessner.journal import Journal, JournalError, check, unvouched_words
 from glessner.overview import _manifest_row
 from glessner.rekey import upgraded_copy
@@ -403,6 +405,63 @@ def test_close_on_a_manifest_emptied_after_its_record_names_manifest_jsonl_as_li
     trail = described(case, close)
     assert trail.startswith(f"Closed the case. No evidence file was checked: {UNRECORDED_MANIFEST}, lists none. "), trail
     assert "the intake manifest" not in trail
+
+
+def test_verify_and_the_report_on_a_manifest_line_edited_to_match_a_swapped_file_name_manifest_jsonl(recorded_case, capsys):
+    """The re-hash finds no evidence problem, so verify and the report say the evidence matches manifest.jsonl, not the
+    intake manifest, as close does, and the sentence on its record follows."""
+    case = recorded_case
+    swapped = case.evidence / "DC01" / "a.txt"
+    old = sha(swapped.read_bytes())
+    swapped.write_text("fifth", encoding="utf-8")   # the length the manifest line gives
+    case.manifest_path.write_bytes(case.manifest_path.read_bytes().replace(old.encode(), sha(b"fifth").encode()))
+    capsys.readouterr()
+    assert main(["verify", str(case.folder)]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith(f"All evidence files match {UNRECORDED_MANIFEST}.\nmanifest.jsonl differs from its record"), out
+    assert "the intake manifest" not in out
+    section = report_section(case)
+    assert re.search(rf"was re-hashed when this report was written, and all match {re.escape(UNRECORDED_MANIFEST)}\. "
+                     "manifest.jsonl differs from its record", section), section
+    assert "the intake manifest" not in section
+
+
+def test_verify_and_the_report_on_a_manifest_emptied_after_its_record_say_manifest_jsonl_lists_none(recorded_case, capsys):
+    case = recorded_case
+    case.manifest_path.write_bytes(b"")
+    capsys.readouterr()
+    assert main(["verify", str(case.folder)]) == 1
+    assert capsys.readouterr().out.startswith(f"No evidence file to check: {UNRECORDED_MANIFEST}, lists none.\n")
+    section = report_section(case)
+    assert f"No evidence file was re-hashed when this report was written: {UNRECORDED_MANIFEST}, lists none." in section
+    assert "the intake manifest" not in section
+
+
+def test_verify_says_the_files_intake_hashed_match_manifest_jsonl_when_intake_could_not_read_others(recorded_case, monkeypatch,
+                                                                                                    capsys):
+    case = recorded_case
+    differing(case)
+    real = cli_module.check_files
+    monkeypatch.setattr(cli_module, "check_files", lambda *args, **kwargs: replace(real(*args, **kwargs), unverified=["b.bin"]))
+    capsys.readouterr()
+    assert main(["verify", str(case.folder)]) == 1
+    assert re.match(rf"The \d+ evidence files intake hashed match {re.escape(UNRECORDED_MANIFEST)}\. 1 evidence file could not",
+                    capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("state", ["grew", "differs"])
+def test_each_sentence_of_the_report_s_re_hash_names_manifest_jsonl_when_it_fails_its_record(state):
+    manifest = ManifestCheck(state, 7)
+    changed = _evidence_check(Check(["a.txt: changed"], 2, [], manifest))
+    assert f"2) was re-hashed when this report was written. 1 do not match {UNRECORDED_MANIFEST}: a.txt: changed." in changed
+    skipped = _evidence_check(Check([], 2, ["b.bin"], manifest))
+    assert f"re-hashed when this report was written, and none differs from {UNRECORDED_MANIFEST}. " in skipped
+
+
+def test_the_report_s_re_hash_names_the_intake_manifest_when_manifest_jsonl_matches_its_record():
+    manifest = ManifestCheck("matches", 7)
+    assert "and all match the intake manifest. manifest.jsonl matches" in _evidence_check(Check([], 2, [], manifest))
+    assert "1 do not match the intake manifest: a.txt" in _evidence_check(Check(["a.txt"], 2, [], manifest))
 
 
 def test_a_record_after_the_head_vouches_for_nothing(recorded_case, capsys):

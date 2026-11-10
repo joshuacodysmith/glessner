@@ -371,6 +371,10 @@ def test_the_note_marks_a_file_in_the_windows_system_folders_whatever_its_case_s
         "C:\\Program Files\\Windows\\cmd.exe", "SYSVOL\\Temp\\Windows\\cmd.exe", "SYSVOLX\\Windows\\System32\\cmd.exe",
         "\\Device\\HarddiskVolume3\\Temp\\cmd.exe", "\\??\\C:\\Users\\Public\\cmd.exe",
         "\\\\?\\Volume{3f2504e0-4f89-11d3-9a0c-0305e82c3301}\\Windows\\Temp\\cmd.exe", "\\\\.\\C:\\Temp\\cmd.exe",
+        # A device that names no file, and a GLOBALROOT path, whose key holds its device
+        "\\\\.\\pipe\\Windows\\explorer.exe", "\\\\.\\PhysicalDrive0", "\\\\?\\pipe\\Windows\\explorer.exe",
+        "\\??\\pipe\\Windows\\explorer.exe", "\\\\.\\Windows\\explorer.exe",
+        "\\\\.\\GLOBALROOT\\Device\\HarddiskVolume3\\Windows\\explorer.exe",
         # A path that starts with one forward slash is a URL or Unix path, as in Suricata's file names, and one with no root
         # names no volume: neither says which folder it is in
         "/Windows/System32/cmd.exe", "Windows\\System32\\cmd.exe", "SYSVOL/Temp/Windows/cmd.exe"]

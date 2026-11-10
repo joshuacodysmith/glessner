@@ -948,15 +948,11 @@ def test_a_run_notes_each_link_its_tool_files_leave_out(case, tmp_path, monkeypa
 
 
 def test_a_run_records_its_rule_set_as_it_is_when_the_tool_starts(case, tmp_path):
-    """Detection, which the server keeps, names the set too, but the rules may be updated after it."""
-    from glessner.tools import rules_label
-
+    """The server keeps a detected tool, and the rules may be updated after detection."""
     tool = with_spec(fake_spec(tmp_path), rules_label=git_rules(tmp_path / "rules", "1" * 40))
-    detected = replace(tool, rules=rules_label(tool.spec, tool.executable))
     files = folder_sha256(tmp_path / "rules")[:8]
-    assert detected.rules == f"Fake rules 1111111, files {files}"
     git_rules(tmp_path / "rules", "2" * 40)   # an update of the rules after detection
-    record = run_mode(case, detected, "ok")
+    record = run_mode(case, tool, "ok")
     updated = f"Fake rules 2222222, files {files}"
     assert (record.status, record.rules, saved_record(case, record)["rules"]) == ("ok", updated, updated)
 
@@ -982,11 +978,10 @@ def test_a_run_in_a_case_below_format_4_records_none_of_format_4_s_keys(case, tm
     both."""
     tool = with_spec(fake_spec(tmp_path), rules_label=git_rules(tmp_path / "rules", "1" * 40))
     named = f"Fake rules 1111111, files {folder_sha256(tmp_path / 'rules')[:8]}"
-    detected = replace(tool, rules=named)   # as detection names it
-    at_4 = run_mode(case, detected, "ok")
+    at_4 = run_mode(case, tool, "ok")
     assert at_4.rules == named and "tool_files" in saved_record(case, at_4)
     below = format3_case(case)
-    record = run_mode(below, detected, "ok")
+    record = run_mode(below, tool, "ok")
     assert (record.status, record.rules, record.tool_files) == ("ok", "", None)
     assert not FORMAT_4_KEYS & set(saved_record(below, record))
 

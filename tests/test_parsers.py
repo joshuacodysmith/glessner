@@ -752,6 +752,17 @@ def test_bidi_marks_leave_a_windows_date_and_stay_elsewhere(tmp_path):
     # A CJK date with no mark before its characters, then with none before only the year's, the month's, or the day's
     f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5", f"{LRM}2020\u5e74{LRM}9{LRM}\u6708{LRM}17{LRM}\u65e5",
     f"{LRM}2020{LRM}\u5e74{LRM}9\u6708{LRM}17{LRM}\u65e5", f"{LRM}2020{LRM}\u5e74{LRM}9{LRM}\u6708{LRM}17\u65e5",
+    # The zh-Hans-HK form with a space before its weekday, and with no mark before its weekday
+    f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5 {LRM}\u661f\u671f\u56db",
+    f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5\u661f\u671f\u56db",
+    # The ja-JP form, a mark before each character, with a weekday no Windows form writes after it
+    f"{LRM}2020{LRM}\u5e74{LRM}9{LRM}\u6708{LRM}17{LRM}\u65e5{LRM}\u661f\u671f\u56db",
+    # Words run into the time other than the two zh-Hans-HK writes
+    f"{LRM}17/{LRM}9/{LRM}2020 evil9:43", f"{LRM}17/{LRM}9/{LRM}2020 PM9:43",
+    # Words after the time: outside the closed list, in lower case where Windows writes capitals, with a part of one
+    # missing, with no space before one, and with more after one
+    f"{LRM}17/{LRM}9/{LRM}2020 9:43 XY", f"{LRM}17/{LRM}9/{LRM}2020 9:43 sa", f"{LRM}17/{LRM}9/{LRM}2020 9:43 \u0642\u0638",
+    f"{LRM}17/{LRM}9/{LRM}2020 9:43SA", f"{LRM}17/{LRM}9/{LRM}2020 9:43\u03c0\u03bc", f"{LRM}17/{LRM}9/{LRM}2020 9:43 CH evil",
     # A Korean date with no weekday
     f"{LRM}2020{LRM}\ub144 {LRM}9{LRM}\uc6d4 {LRM}17{LRM}\uc77c",
     # Words outside the closed lists: a connector other than de, and an AM or PM before the time
@@ -761,6 +772,13 @@ def test_bidi_marks_stay_in_text_that_is_not_a_windows_date(text):
     from glessner.parsers.evtxecmd import _unmarked_date
 
     assert _unmarked_date(text) == text
+
+
+GREEK_THURSDAY = "\u03a0\u03ad\u03bc\u03c0\u03c4\u03b7"
+GREEK_SEPTEMBER = "\u03a3\u03b5\u03c0\u03c4\u03b5\u03bc\u03b2\u03c1\u03af\u03bf\u03c5"
+ARABIC_SEPTEMBER = "\u0633\u0628\u062a\u0645\u0628\u0631"
+PERSIAN_THURSDAY = "\u067e\u0646\u062c\u0634\u0646\u0628\u0647"
+PERSIAN_SHAHRIVAR = "\u0634\u0647\u0631\u06cc\u0648\u0631"
 
 
 @pytest.mark.parametrize(("text", "shown"), [
@@ -795,6 +813,23 @@ def test_bidi_marks_stay_in_text_that_is_not_a_windows_date(text):
     # The same date and weekday, with no mark before each syllable
     pytest.param(f"{LRM}2020\ub144 {LRM}9\uc6d4 {LRM}17\uc77c {LRM}\ubaa9\uc694\uc77c",
                  "2020\ub144 9\uc6d4 17\uc77c \ubaa9\uc694\uc77c", id="ko-KP long"),
+    # 2020, 9, and 17, with no mark before their characters, then Thursday, then AM and the time with no space
+    pytest.param(f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5{LRM}\u661f\u671f\u56db \u4e0a\u53489:43:21",
+                 "2020\u5e749\u670817\u65e5\u661f\u671f\u56db \u4e0a\u53489:43:21", id="zh-Hans-HK long"),
+    # The same date and weekday, then PM and the time with no space
+    pytest.param(f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5{LRM}\u661f\u671f\u56db \u4e0b\u53489:43:21",
+                 "2020\u5e749\u670817\u65e5\u661f\u671f\u56db \u4e0b\u53489:43:21", id="zh-Hans-MO long"),
+    pytest.param(f"{LRM}2020\u5e74{LRM}9\u6708{LRM}17\u65e5{LRM}\u661f\u671f\u56db",
+                 "2020\u5e749\u670817\u65e5\u661f\u671f\u56db", id="zh-Hans-HK long, no time"),
+    pytest.param(f"{LRM}17/{LRM}9/{LRM}2020 \u4e0b\u53489:43", "17/9/2020 \u4e0b\u53489:43", id="zh-Hans-HK short"),
+    # Then the time and PM
+    pytest.param(f"{LRM}{GREEK_THURSDAY}, {LRM}17 {LRM}{GREEK_SEPTEMBER} {LRM}2020 9:43:21 \u03bc\u03bc",
+                 f"{GREEK_THURSDAY}, 17 {GREEK_SEPTEMBER} 2020 9:43:21 \u03bc\u03bc", id="el-GR long"),
+    pytest.param(f"{LRM}17/{LRM}9/{LRM}2020 9:43:21 \u03c0\u03bc", "17/9/2020 9:43:21 \u03c0\u03bc", id="el-GR short"),
+    pytest.param(f"{LRM}17/{LRM}09/{LRM}2020 09:43:21 \u0635", "17/09/2020 09:43:21 \u0635", id="ar-EG short"),
+    pytest.param(f"{LRM}27/{LRM}06/{LRM}1399 09:43:21 \u0642.\u0638", "27/06/1399 09:43:21 \u0642.\u0638", id="fa-IR short"),
+    pytest.param(f"{LRM}17/{LRM}09/{LRM}2020 9:43:21 SA", "17/09/2020 9:43:21 SA", id="vi-VN short, morning"),
+    pytest.param(f"{LRM}17/{LRM}09/{LRM}2020 9:43:21 CH", "17/09/2020 9:43:21 CH", id="vi-VN short, afternoon"),
     # AM, then the time
     pytest.param(f"{LRM}2020-{LRM}09-{LRM}17 \uc624\uc804 9:43", "2020-09-17 \uc624\uc804 9:43", id="ko-KR short"),
     pytest.param(f"{LRM}jueves, {LRM}17{LRM} de {LRM}septiembre{LRM} de {LRM}2020 21:43:21",
@@ -820,6 +855,25 @@ def test_bidi_marks_leave_each_form_of_a_windows_date(text, shown):
     from glessner.parsers.evtxecmd import _unmarked_date
 
     assert _unmarked_date(text) == shown
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param(f"{LRM}17 {LRM}{ARABIC_SEPTEMBER}, {LRM}2020 09:43:21 \u0645", id="ar-EG long, PM after the time"),
+    pytest.param(f"{LRM}17 {LRM}{ARABIC_SEPTEMBER}, {LRM}2020 09:43:21", id="ar-EG long, 24-hour time"),
+    pytest.param(f"{LRM}17 {LRM}{ARABIC_SEPTEMBER}, {LRM}2020", id="ar-EG long, no time"),
+    pytest.param(f"{RLM}17 {RLM}{ARABIC_SEPTEMBER}, {RLM}2020", id="ar-EG long, right-to-left marks"),
+    pytest.param(f"{LRM}{PERSIAN_THURSDAY}, {LRM}27 {LRM}{PERSIAN_SHAHRIVAR} {LRM}1399 09:43:21 \u0628.\u0638", id="fa-IR long"),
+    pytest.param(f"{LRM}17 {LRM}\u0633\u062a\u0645\u0628\u0631, {LRM}2020 9:43:21 PM", id="ur-PK long"),
+    pytest.param(f"{LRM}27 {LRM}\u0648\u0696\u06cc {LRM}1399", id="ps-AF long"),
+    pytest.param(f"{LRM}17 {LRM}\u0710\u071d\u0720\u0718\u0720, {LRM}2020 09:43:21", id="syr-SY long"),
+    pytest.param(f"{LRM}17 {LRM}\u05e1\u05e4\u05d8\u05de\u05d1\u05e8 {LRM}2020", id="a Hebrew month, no weekday"),
+])
+def test_bidi_marks_stay_in_a_date_where_a_right_to_left_letter_comes_before_a_digit(text):
+    """With no mark before the digit, a browser draws it in the letter's run, so the date's parts change order on screen.
+    A form whose only such letter follows its digits, such as ar-EG's short form, loses its marks (above)."""
+    from glessner.parsers.evtxecmd import _unmarked_date
+
+    assert _unmarked_date(text) == text
 
 
 CRAFTED = f"{LRM}Mallory {LRM}12 {LRM}2024"   # a name built in the shape of a marked date
@@ -929,6 +983,20 @@ def test_bidi_marks_leave_the_date_among_evtxecmds_joined_unnamed_values(tmp_pat
     (shutdown,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
     assert shutdown.extra == {"Data": shown}
     assert shutdown.message == f"6008 Unexpected system shutdown | Timestamp: {shown.strip()}"
+
+
+def test_bidi_marks_stay_in_joined_unnamed_values_where_a_right_to_left_letter_comes_before_a_digit(tmp_path):
+    """An unexpected shutdown's time comes before its date, and in Arabic its PM ends the time, so the date's digits follow
+    that letter."""
+    written = f"09:43:21 \u0645, {LRM}17/{LRM}09/{LRM}2020, , , 520643, "
+    write_csv(tmp_path / "evtxecmd.csv", [*EVTX_COLUMNS, "RenderingInfo"], [
+        {**system_row(1, 6008, "Unexpected system shutdown", {}), "Provider": "EventLog",
+         "PayloadData1": f"Timestamp: {written}",
+         "Payload": json.dumps({"EventData": {"Data": written}}, ensure_ascii=False)},
+    ])
+    (shutdown,) = PARSERS["evtxecmd_csv"](ParseContext(tmp_path, EVIDENCE))
+    assert shutdown.extra == {"Data": written}
+    assert shutdown.message == f"6008 Unexpected system shutdown | Timestamp: {written.strip()}"
 
 
 def test_bidi_marks_written_as_entities_leave_a_date_in_rows_from_before_2026_10(tmp_path):

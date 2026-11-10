@@ -733,7 +733,8 @@ def left_run_warning(run_id: str, counts: str) -> str:
     return (f"Warning: the upgrade to case format 4 left the events of run {run_id} with the IDs an earlier build gave "
             "them, as its journal entry says. This rebuild gives them new IDs, or leaves out a run whose output it can't "
             f"load, so {counts} on those events will then refer to events that no longer exist. Mark those events again "
-            "once a rebuild has loaded them.")
+            "once a rebuild has loaded them. A run this rebuild leaves out stays out of every rebuild until you rerun its "
+            "tool or restore its output.")
 
 
 def test_a_rebuild_warns_of_the_references_on_the_events_of_a_run_the_format_4_step_left(tmp_path, monkeypatch, capsys):
@@ -760,6 +761,44 @@ def test_a_rebuild_warns_of_the_references_on_the_events_of_a_run_the_format_4_s
     assert not set(before) & set(suricata_rows(case))
     assert main(["rebuild", str(case.folder)]) == 0
     assert "Warning" not in capsys.readouterr().out
+
+
+def test_a_rebuild_that_leaves_out_a_run_whose_output_changed_says_what_brings_it_back(tmp_path, monkeypatch, capsys):
+    """The output changed after it was loaded, so the step left the run and every rebuild leaves it out. The warning
+    comes first and names the way back, then the rebuild says why it left the run out. Restoring the output loads it."""
+    case = linked_case_at_format_3(tmp_path, monkeypatch)
+    before, [run] = suricata_rows(case), read_runs(case)
+    mark_one(case, sorted(before)[0])
+    original = (case.evidence / EVE_A).read_bytes()
+    (case.evidence / EVE_A).write_bytes(original + b"{}")
+    upgraded(open_case(case.folder))
+    capsys.readouterr()
+    assert main(["rebuild", str(case.folder)]) == 1
+    warning, left_out, *_ = capsys.readouterr().out.splitlines()
+    assert warning == left_run_warning(run.run_id, "1 mark")
+    assert left_out.startswith(f"{run.run_id}: Rebuild at ") and " left it out: " in left_out and not suricata_rows(case)
+    (case.evidence / EVE_A).write_bytes(original)
+    assert main(["rebuild", str(case.folder)]) == 0 and suricata_rows(case)
+
+
+def test_a_case_kept_below_format_4_keeps_its_ids_at_a_rebuild_with_nothing_to_warn_of(tmp_path, monkeypatch, capsys):
+    """case.yaml set back to format 3 by hand and a broken journal keep a case at format 3 with the step's entry in its
+    journal. Its rebuild loads found output under the names its rows carry, so no ID changes."""
+    case = linked_case_at_format_3(tmp_path, monkeypatch)
+    before, [run] = suricata_rows(case), read_runs(case)
+    mark_one(case, sorted(before)[0])
+    Journal(case).append("note", target=sorted(before)[0], text="first look")
+    os.rmdir(tmp_path / "evidence")
+    upgraded(open_case(case.folder))
+    assert set(steps_to_4(case)[0]["skipped_runs"]) == {run.run_id}
+    junction(tmp_path / "evidence", tmp_path / "moved")
+    settings = case.folder / "case.yaml"
+    settings.write_text(settings.read_text(encoding="utf-8").replace("case_format: 4", "case_format: 3"), encoding="utf-8")
+    journal_path(case).write_bytes(journal_path(case).read_bytes().replace(b"first look", b"other look"))
+    capsys.readouterr()
+    assert main(["rebuild", str(case.folder)]) == 0
+    assert "Warning" not in capsys.readouterr().out
+    assert suricata_rows(case) == before and settings_of(case)["case_format"] == 3
 
 
 def test_a_rebuild_while_the_evidence_is_still_offline_warns_and_leaves_the_run_out(tmp_path, monkeypatch, capsys):

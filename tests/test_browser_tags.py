@@ -1,19 +1,44 @@
 """The tag picker's technique box on the ATT&CK list, in a real browser: it picks only listed techniques, a revoked ID
 typed names its replacement, Hayabusa's revoked ID is suggested as its replacement, and an older tag off the list is
-flagged and can be removed. They drive the installed Microsoft Edge through Playwright, as test_browser_smoke does,
-and are skipped without it."""
+flagged and can be removed. Also the View panel's counts following a change. They drive the installed Microsoft Edge
+through Playwright, as test_browser_smoke does, and are skipped without it."""
 
 import pytest
 from conftest import DC_LOG, T0
-from test_browser_smoke import browser, served_page  # noqa: F401
+from test_browser_smoke import browser, case_menu, served_page  # noqa: F401
 
 from glessner.events import Event, load
+from glessner.server import api_tag
 
 pytestmark = pytest.mark.browser
 EVENT = "#details[data-page='event']"
 OLD_RULE = Event(ts_us=T0, ts_desc="Event Recorded", artifact="hayabusa", source_file=DC_LOG, source_record="101:old",
                  record_id=101, message="Old rule [high]", log_channel="Security", rule_title="Old rule",
                  rule_level="high", extra={"MitreTactics": "LatMov", "MitreTags": "T1086 ¦ T9999"})
+
+
+def test_the_view_panel_s_counts_follow_a_tag_s_undo_and_a_mark(browser, synthetic_case):  # noqa: F811
+    """With the View panel open, an undo of a tag from the audit trail takes the tag out of the panel's Tactics and tags,
+    which lists only the tags in use, and a mark changes the panel's count of that mark."""
+    found = {}
+
+    def tagged(app):
+        found["uid"] = app.con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' LIMIT 1").fetchone()[0]
+        api_tag(app, {"uids": [found["uid"]], "add": ["tag:beachhead"]})
+
+    for p in served_page(browser, synthetic_case, setup=tagged):
+        p.locator("#viewButton").click()
+        panel = p.locator("#viewPanel")
+        panel.get_by_role("button", name="Tactics and tags").click()
+        row = panel.locator(".vrow", has_text="beachhead")
+        row.wait_for()
+        case_menu(p, "auditButton")
+        entry = p.locator("#details .audit-row", has_text="beachhead").first
+        entry.get_by_role("button", name="Undo").click()
+        entry.locator(".audit-confirm").get_by_role("button", name="Undo 1 event").click()
+        row.wait_for(state="detached")
+        p.evaluate("(uid) => import('/js/event_page.js').then((m) => m.applyMark('Suspicious', '', [uid]))", found["uid"])
+        panel.locator(".vrow", has_text="Suspicious").locator(".n", has_text="1").wait_for()
 
 
 def test_the_tag_picker_picks_only_listed_techniques_and_an_old_tag_is_flagged(browser, synthetic_case):  # noqa: F811

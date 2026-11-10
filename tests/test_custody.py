@@ -105,7 +105,7 @@ def test_a_copy_keeps_the_custody_record(tmp_path, capsys):
     for case in (source, copy):
         assert main(["verify", str(case.folder)]) == 0
         output = capsys.readouterr().out
-        assert "All evidence files match the manifest." in output and "Consistent: each of the " in output, output
+        assert "All evidence files match the intake manifest." in output and "Consistent: each of the " in output, output
 
     flip_a_byte(evidence / "NOTES.txt")
     checks = [check_files(case, reason="manual full verification") for case in (source, copy)]

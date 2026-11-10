@@ -1,7 +1,7 @@
 import { HISTORY_LIMIT, loadHistory, retractNote } from './audit.js';
 import { clockFolds, clockHover, clockNote, setPairLink } from './clock.js';
 import { askSelection, CONFIRM_ABOVE, markWord } from './confirm.js';
-import { $, api, codePrefix, el, fmtAt, fmtUs, LISTED_EVENTS, lookup, MARK_VALUE, markBadge, marked, MARKS, plural, post, reportAction, S, setStatus } from './core.js';
+import { $, api, codePrefix, el, fmtAt, fmtUs, LISTED_EVENTS, lookup, MARK_VALUE, markBadge, marked, MARKS, plural, post, reportAction, S, setStatus, toolName } from './core.js';
 import { refreshCounts } from './counts.js';
 import { fetchView } from './data.js';
 import { draw } from './draw.js';
@@ -14,7 +14,7 @@ import { groupReviewOf, reviewBar } from './review.js';
 import { addToSearch, runSearch } from './search.js';
 import { tagZone } from './tags.js';
 import { eventLabel, eventShort, trailBar, trailEvent, trailPivot, trailText } from './trail.js';
-import { addressToggle, ADDRESS_FIELDS, viewToggle } from './view.js';
+import { addressToggle, ADDRESS_FIELDS, refreshViewCounts, viewToggle } from './view.js';
 import { hostLocalText } from './zones.js';
 
 // ---------- Event page, in the Details panel ----------
@@ -31,8 +31,10 @@ export const ARTIFACT_DETAILS = {
                      'ZoneIdContents', 'ReparseTarget', 'EntryNumber', 'SequenceNumber', 'ParentEntryNumber']],
   prefetch: ['Prefetch', ['RunCount', 'Hash', 'Size', 'Version', 'FilesLoadedCount', 'Volume0Name', 'Volume0Serial', 'Note',
                           'ParsingError']],
-  lnk: ['Shortcut (LNK)', ['LocalPath', 'NetworkPath', 'CommonPath', 'Arguments', 'WorkingDirectory', 'RelativePath', 'FileSize',
-                           'DriveType', 'VolumeLabel', 'VolumeSerialNumber', 'MachineID', 'MachineMACAddress', 'MACVendor']],
+  lnk: ['Shortcut (LNK)', ['LocalPath', 'NetworkPath', 'CommonPath', 'TargetIDAbsolutePath', 'Arguments', 'WorkingDirectory',
+                           'RelativePath', 'FileSize', 'FileAttributes', 'DriveType', 'VolumeLabel', 'VolumeSerialNumber',
+                           'TargetMFTEntryNumber', 'TargetMFTSequenceNumber', 'MachineID', 'MachineMACAddress', 'MACVendor',
+                           'VolumeDroid', 'FileDroid', 'VolumeDroidBirth', 'FileDroidBirth']],
   // The MountedDevices decode's fields follow the ValueData2 they are read from
   registry: ['Registry value', ['HiveType', 'Category', 'ValueType', 'ValueData', 'ValueData2', 'DataFormat', 'DiskSignature',
                                 'PartitionOffset', 'PartitionSector', 'PartitionGuid', 'DeviceBus', 'DeviceVendorProduct',
@@ -872,7 +874,7 @@ export async function loadDetails(uid, ts = null) {
       ['Computer name recorded', ev.host_name_recorded, vv('computer', ev.host_name_recorded)],
       ...(ev.split ? [['Host', ev.host, vv('host', ev.host)], ['Host folder', ev.origin_host]]
                    : [['Host folder', ev.host, vv('host', ev.host)]]),
-      ['Tool', [ev.tool, ev.tool_version].filter(Boolean).join(' '), vv('tool', ev.tool)],
+      ['Tool', [toolName(ev.tool), ev.tool_version].filter(Boolean).join(' '), vv('tool', ev.tool)],
       ['Run', ev.run_id, vv('run', ev.run_id)], ['Artifact', ev.artifact, vv('artifact', ev.artifact)],
       ['Evidence file', ev.source_file, vv('file', ev.source_file)],
       citedHashRow(ev), ['Source record', ev.source_record],
@@ -971,8 +973,10 @@ function provenanceLine(ev) {
     hover = `${plural(n, 'line')} of verification.jsonl could not be read, so a problem ${n === 1 ? 'it holds' : 'they hold'} ` +
             `with this file is not counted. No check that could be read has found the file changed ${recorded}.`;
   }
+  const tool = part('tool', 'Read by ', bold([toolName(ev.tool), ev.tool_version].filter(Boolean).join(' ') || 'unknown'), ev.run_id ? `, run ${ev.run_id}` : '');
+  if (ev.tool) tool.title += `. Tool ID: ${ev.tool}`;
   return el('div', { class: 'prov', 'aria-label': 'Provenance' },
-    part('tool', 'Read by ', bold([ev.tool, ev.tool_version].filter(Boolean).join(' ') || 'unknown'), ev.run_id ? `, run ${ev.run_id}` : ''),
+    tool,
     part('file', 'from ', bold(ev.source_file || '(no file)', ev.source_file), ev.source_record ? ', record ' : '',
          ...(ev.source_record ? [bold(ev.source_record.length > 40 ? `${ev.source_record.slice(0, 40)}…` : ev.source_record, ev.source_record)] : [])),
     part('sha', 'SHA-256 ', ...sha, el('span', { class: `prov-check ${p.state}`, title: hover }, p.text)),
@@ -1001,24 +1005,28 @@ async function goToStep(i) {
 // it answers only while the panel shows it and no page was asked for since. A list's mark or tag redraws the list instead.
 export const focusedPageAction = () => (S.focus ? pageAction(`event:${S.focus}`) : () => false);
 
-// The timeline and counts follow a write the server has answered: the lanes, the window's data, and the counts. The write
-// is done once its answer arrives, so a reload that fails doesn't fail it, and lanes that don't reload don't keep the
-// window's data and the counts from following. Returns the message of the lanes' failure, else of the window's data's, or
-// '' when both reloaded. A window whose data fails to load also says so on the status line (data.loadView), which the
-// write's line then replaces.
+// The timeline and counts follow a write the server has answered: the lanes, the window's data, the case's counts, and an
+// open View panel's. The write is done once its answer arrives, so a reload that fails doesn't fail it, and lanes that
+// don't reload don't keep the window's data and the counts from following. Returns the message of the lanes' failure, else
+// of the window's data's, or '' when both reloaded. A window whose data fails to load also says so on the status line
+// (data.loadView), which the write's line then replaces.
 export async function reloadTimeline() {
   let failed = '';
   try { await reloadLanes(); } catch (err) { failed = err.message; }
   const viewFailed = await fetchView();
   refreshCounts();
+  refreshViewCounts();
   return failed || viewFailed;
 }
 
 // The status line's last action for a write, set after the redraw so that it stays. With the message of a reload that
-// failed (reloadTimeline), it says so after what was written, and has no server time, which is the write's.
+// failed (reloadTimeline), it says so after what was written, and has no server time, which is the write's. That lasts
+// until the window's data next loads, when the line says only what was written (data.showData).
 export function reportWrite(text, ms, reloadError = '') {
-  if (reloadError) reportAction(`${text}; the timeline didn't reload: ${reloadError}`, null);
-  else reportAction(text, ms);
+  if (reloadError) {
+    reportAction(`${text}; the timeline didn't reload: ${reloadError}`, null);
+    S.lastAction.onLoad = { text, ms };
+  } else reportAction(text, ms);
 }
 
 // Returns whether the mark was written, so a list keeps its ticks and note after one that failed: a mark counts as

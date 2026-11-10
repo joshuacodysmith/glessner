@@ -22,6 +22,7 @@ ZERO = "0" * 64
 FIRST_CHAINED = 3   # the first case format whose journal has the chain
 CASE_FORMAT = 4     # the case format this script checks up to; only the step from 3 to 4 carries a rekey to it
 SIDE_FILE = re.compile(r"journal_torn_[^\\/]+\.bin")
+CHUNK = 4 * 1024 * 1024   # how much of a --file to hold at once: an export can be larger than memory
 
 
 def unique(pairs):
@@ -172,15 +173,43 @@ def read(path):
         return f.read()
 
 
+def pieces(path):
+    with open(path, "rb") as f:
+        while piece := f.read(CHUNK):
+            yield piece
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    for piece in pieces(path):
+        digest.update(piece)
+    return digest.hexdigest()
+
+
+def line_ending_sha256(path):
+    """The SHA-256 of the file with each CR LF turned to LF, and with each LF of that turned to CR LF. A CR that ends a
+    piece waits for the next, so a CR LF split between two pieces is turned too."""
+    lf, crlf = hashlib.sha256(), hashlib.sha256()
+    held = b""
+    for piece in pieces(path):
+        data = held + piece
+        data, held = (data[:-1], b"\r") if data.endswith(b"\r") else (data, b"")
+        data = data.replace(b"\r\n", b"\n")
+        lf.update(data)
+        crlf.update(data.replace(b"\n", b"\r\n"))
+    lf.update(held)
+    crlf.update(held)
+    return {lf.hexdigest(), crlf.hexdigest()}
+
+
 def recorded(path, records):
-    """The first file_written entry holding the file's SHA-256, as (line, seq), or None and why there's none."""
-    data = read(path)
-    sha = hashlib.sha256(data).hexdigest()
+    """The first file_written entry holding the file's SHA-256, as (line, seq), or None and why there's none. The file is
+    read in pieces, and read again for its line endings only when no entry has its SHA-256."""
+    sha = file_sha256(path)
     for n, seq, h in records:
         if h == sha:
             return (n, seq), None
-    lf = data.replace(b"\r\n", b"\n")
-    turned = {hashlib.sha256(d).hexdigest() for d in (lf, lf.replace(b"\n", b"\r\n"))}
+    turned = line_ending_sha256(path)
     other = next((seq for _, seq, h in records if h in turned), None)
     return None, ("no entry has this file's SHA-256: it changed after it was written (a change of line endings "
                   "counts), the app stopped before it recorded the file, or another case wrote it"

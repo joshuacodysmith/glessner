@@ -341,7 +341,7 @@ def _rule_leads(con: duckdb.DuckDBPyConnection, state: State, report: dict[str, 
         leads.append({"id": f"rule:{rule_id}", "kind": "suggestions", "level": "suggestion", "rule": rule_id,
                       "title": title,
                       "why": description or f"The rule {rule_id} has no description; the Rules page shows what it matches.",
-                      "chips": [f"rule: {rule_id}", "built in" if stored.get("builtin") else f"added by {stored.get('who', '')}"],
+                      "chips": [f"rule: {rule_id}", "built in" if stored.get("builtin") else f"added by {analyst(stored)}"],
                       "hosts": found["hosts"], "first": found["first"], "count": n, "open": pending,
                       "worked": pending == 0, "action": "suggestions"})
     return leads

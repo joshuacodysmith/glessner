@@ -15,7 +15,7 @@ This is an open-answer check. Glessner was run on the dataset's Lateral Movement
 
 [glossary.md](../glossary.md) defines terms such as lane, pivot, and mark.
 
-**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number, with Hayabusa 4.1.0. Each gap's state under Gaps found says where the gap stands in v0.3.0, and a fixed gap names the release that fixed it.
+**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number, with Hayabusa 4.1.0. Each gap's state under Gaps found says where the gap stands in v0.4.0, and a fixed gap names the release that fixed it.
 
 **Evidence.** The samples sit loose in one folder, not one folder per host. The case was made with `new-case --host LAB`, then `intake` and `run --all`. EvtxECmd and Hayabusa finished in 12 seconds.
 

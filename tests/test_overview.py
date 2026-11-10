@@ -3,6 +3,7 @@ marks, decisions, clock, runs, and log clears are known, so every figure is chec
 
 import json
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import duckdb
 import pytest
@@ -29,16 +30,21 @@ from glessner.server import (
     api_audit,
     api_case_state,
     api_event,
+    api_exports_page,
     api_filter,
+    api_findings_page,
     api_host,
+    api_investigate,
     api_lanes,
     api_lead_events,
     api_mark,
     api_overview,
     api_report,
+    api_rules,
     api_selected,
     api_shown_counts,
 )
+from glessner.splits import kept_list, split_list
 
 MIN = 60 * SEC
 C1 = T0 + 62 * SEC + 30 * MIN          # 30 minutes after 104 exactly: still the first DC01 cluster
@@ -659,6 +665,61 @@ def test_the_event_page_and_a_listed_row_read_a_who_under_the_seal_that_is_not_a
         assert (row["mark"], row["mark_who"]) == ("Suspicious", listed)
         kept = app.journal.state.notes[uid][0]
         assert (kept["who"], kept["retracted"]["who"], app.journal.state.marks[uid].who) == (who, who, who)
+    finally:
+        app.con.close()
+
+
+@pytest.mark.parametrize(("who", "listed"), [(["cody", "ann"], '["cody", "ann"]'), ({"by": "cody"}, '{"by": "cody"}'),
+                                              (5, "5"), (None, "null")], ids=["list", "object", "number", "null"])
+def test_the_other_pages_read_a_who_under_the_seal_that_is_not_a_string(overview_case, who, listed):
+    """A follow-up, a tag, a finding, a rule, a written file, a host's role, a split, and a Keep as one host on lines
+    under the seal can each hold a who that is not a string. Each page names it as the audit trail does, by its JSON text.
+    The journal's state keeps the who as written."""
+    folder = overview_case.folder
+    con = duckdb.connect(str(overview_case.db_path), read_only=True)
+    try:
+        uid = con.execute("SELECT event_uid FROM events WHERE tool = 'evtxecmd' ORDER BY ts_us LIMIT 1").fetchone()[0]
+    finally:
+        con.close()
+    failed_logons = "{field: event_code, equals: '4625'}"
+    lines = [{"action": "mark", "targets": [uid], "value": "suspicious", "note": ""},
+             {"action": "followup", "targets": [uid], "done": True},
+             {"action": "tag", "targets": [uid], "add": ["tag:seen"]},
+             {"action": "finding", "op": "add", "title": "Held", "severity": "high"},
+             {"action": "finding", "op": "edit", "finding": 4, "title": "Changed"},
+             {"action": "finding", "op": "add", "title": "Gone", "severity": "low"},
+             {"action": "finding", "op": "retire", "finding": 6, "reason": "wrong"},
+             {"action": "rule_add", "id": "seen", "text": f"id: seen\nsuggest: suspicious\nwhen: {failed_logons}\n"},
+             {"action": "file_written", "path": "exports/a.csv", "kind": "marked", "rows": 1, "sha256": "ab" * 32},
+             {"action": "host_role", "host": "DC01", "role": "Workstations"},
+             {"action": "host_split", "op": "split", "host": "OTHER", "routes": {"a.corp": "A"}},
+             {"action": "host_split", "op": "keep", "host": "DESKTOP", "computers": ["a.corp", "b.corp"]}]
+    under_seal = [{"seq": seq, "at": AT, "who": who, **line} for seq, line in enumerate(lines, 1)]
+    (folder / "journal.jsonl").write_bytes(chained([], before=unchained(*under_seal)))
+    forget(folder)
+    app = App(overview_case)
+    try:
+        event = api_event(app, {"uid": [uid]})["event"]
+        assert (event["followup"]["who"], event["tags"][0]["who"]) == (listed, listed)
+        (item,) = (i for i in api_investigate(app, {})["items"] if i["uid"] == uid)
+        assert item["followup"]["who"] == listed
+        held, gone = api_findings_page(app, {})["findings"]
+        assert (held["added"]["who"], held["edited"]["who"], gone["retired"]["who"]) == (listed, listed, listed)
+        assert gone["edited"] is None and gone["retired"]["reason"] == "wrong"
+        (rule,) = (r for r in api_rules(app, {})["rules"] if r["id"] == "seen")
+        assert rule["who"] == listed
+        (lead,) = (x for x in api_overview(app, {})["leads"] if x.get("rule") == "seen")
+        assert f"added by {listed}" in lead["chips"]
+        (file,) = api_exports_page(app, {})["files"]
+        assert file["who"] == listed
+        (dc,) = (h for h in app.identity.hosts.values() if h.host == "DC01")
+        assert dc.role_by == listed
+        state = app.journal.state
+        assert [e["who"] for s in split_list(state) for e in s["entries"]] == [listed]
+        found = {"DESKTOP": ["a.corp", "b.corp"]}
+        assert [k["entry"]["who"] for k in kept_list(state, SimpleNamespace(hosts={"DESKTOP"}, mixed={}), found)] == [listed]
+        assert (state.followed[uid]["who"], state.tags[uid]["tag:seen"]["who"], state.files[0]["who"]) == (who, who, who)
+        assert (state.findings[4]["added"]["who"], state.rules["seen"]["who"]) == (who, who)
     finally:
         app.con.close()
 

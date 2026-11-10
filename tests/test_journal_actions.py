@@ -3,6 +3,7 @@ the heads shown after them, verify --journal with --expect-head and --file, Inte
 break on record, the report under app.lock, and the writes through case.write_atomically. Journals are synthetic; the
 cases are conftest's."""
 
+import importlib.util
 import json
 import os
 import re
@@ -15,7 +16,7 @@ import time
 from pathlib import Path
 
 import pytest
-from chain_fixtures import add, lines, run_checker, sha
+from chain_fixtures import CHECKER, add, lines, run_checker, sha
 from test_rekey_journal import evtx_uids, new_id, rekey
 from test_server import login, request
 
@@ -429,7 +430,8 @@ def test_verify_says_a_case_below_format_3_has_no_chain_yet(synthetic_case, caps
     with_evidence(synthetic_case)
     as_format(synthetic_case.folder, 2, unchained(note(1)))
     code, out = verify(capsys, synthetic_case)
-    assert code == 0 and "All evidence files match the manifest." in out and "no hash chain yet: this case is format 2" in out
+    assert code == 0 and "All evidence files match the intake manifest." in out
+    assert "no hash chain yet: this case is format 2" in out
     code, out = verify(capsys, synthetic_case, "--journal")
     assert code == 1 and "no hash chain yet" in out
     assert case_module.open_case(synthetic_case.folder).settings.case_format == 2   # verify upgraded nothing
@@ -518,6 +520,42 @@ def test_verify_file_reads_the_file_in_pieces_and_turns_a_line_end_two_pieces_sp
     assert code == 0 and f"Entry #{entry['seq']} records this file, at or before the head this computer recorded" in said
     code, said = verify(capsys, synthetic_case, "--journal", "--file", str(exports / "converted.csv"))
     assert code == 1 and f"With its line endings converted back, it matches entry #{entry['seq']}." in said, said
+
+
+@pytest.mark.parametrize("piece", [1, 5, 1 << 20])
+@pytest.mark.parametrize("ending", [b"\n", b"\r\n"])
+def test_the_standalone_checker_reads_a_file_in_pieces_and_turns_a_line_end_two_pieces_split(synthetic_case, monkeypatch,
+                                                                                             capsys, ending, piece):
+    """As verify --file does: the checker never holds the file whole, and names a copy with its line endings converted
+    the other way, however the pieces fall."""
+    exports = synthetic_case.folder / "exports"
+    data = b"".join(b"row %d,value%s" % (i, ending) for i in range(40))
+    other = data.replace(b"\r\n", b"\n") if ending == b"\r\n" else data.replace(b"\n", b"\r\n")
+    (exports / "timeline.csv").write_bytes(data)
+    (exports / "converted.csv").write_bytes(other)
+    (exports / "never.csv").write_bytes(data + b"\r")
+    entry = Journal(synthetic_case).append("file_written", path="exports/timeline.csv", kind="timeline", format="csv",
+                                           rows=40, bytes=len(data), sha256=sha(data))
+    spec = importlib.util.spec_from_file_location("check_journal", CHECKER)
+    checker = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(checker)
+    journal, whole = str(journal_path(synthetic_case)), checker.read
+
+    def refused(path):
+        if path != journal:
+            raise MemoryError
+        return whole(path)
+
+    monkeypatch.setattr(checker, "read", refused)
+    monkeypatch.setattr(checker, "CHUNK", piece)
+    capsys.readouterr()
+    assert checker.check(journal, head_of(entry), str(exports / "timeline.csv")) == 0
+    assert f"entry #{entry['seq']} records this file, at or before the expected head" in capsys.readouterr().out
+    assert checker.check(journal, head_of(entry), str(exports / "converted.csv")) == 1
+    assert f"With its line endings converted back, it matches entry #{entry['seq']}" in capsys.readouterr().out
+    assert checker.check(journal, head_of(entry), str(exports / "never.csv")) == 1
+    said = capsys.readouterr().out
+    assert "no entry has this file's SHA-256" in said and "converted back" not in said
 
 
 def test_a_file_stays_when_its_entry_was_written_even_though_the_append_failed_after(synthetic_case, monkeypatch):

@@ -122,7 +122,9 @@ export const S = {
   journal: null,   // the journal's chain as /api/case_state last gave it: broken, why it's read-only, the head
   caseChanged: null,   // why the page sends nothing more: another case is open on the server
   viewStatus: '',   // the view's notes for the status line, after the last action: links, Sources, the View, the strays
-  lastAction: null,   // what the status line reports first: { text, ms }, an action's or "Window moved" (reportAction)
+  // What the status line reports first: { text, ms }, an action's or "Window moved" (reportAction), with `onLoad`, the
+  // same for when the window's data next loads, on a write whose reload failed (reportWrite)
+  lastAction: null,
   shownWindow: null, windowPending: false,   // the window the drawn data is for, and whether a new window's data is still due
   // The find boxes' text by list name, for the Details page on screen (pages.listFind): setPage starts it
   // again when the page's key changes, so a redraw keeps a find and a new page starts empty
@@ -438,6 +440,8 @@ export function listWords(names, { cap = Infinity } = {}) {
 // A table's entry for a key read from the evidence or the server, which may name a property every object has, such as
 // constructor; undefined when the table doesn't hold the key itself, or there is no table.
 export const lookup = (table, key) => (table && Object.hasOwn(table, key) ? table[key] : undefined);
+// A tool's name, as the registry gives it in /api/meta, or its ID.
+export const toolName = (id) => lookup(S.meta?.tool_names, id) || id;
 // A list row's event code, before its message. An event log message starts with its event ID, so the code isn't
 // written twice, as "4624 4624 Successful logon".
 export const codePrefix = (e) => (e.code && !String(e.msg ?? '').startsWith(`${e.code} `) ? `${e.code}  ` : '');

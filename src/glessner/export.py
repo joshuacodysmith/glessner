@@ -28,7 +28,7 @@ from .clock import in_segment, state_words
 from .events import from_us, id_table, well_formed
 from .hashes import ALGORITHMS
 from .identity import Identity
-from .intake import Check, check_files, manifest_missing, manifest_text, unverified_text
+from .intake import Check, check_files, lists_none, manifest_missing, manifest_text, unverified_text
 from .journal import Journal, State, analyst, head_of
 from .parsers.common import file_key, normalize_ip
 from .pivot_names import extra_of, service_names, task_names
@@ -686,11 +686,12 @@ def _files_check(found: Check) -> str:
     """What the report's re-hash found of the evidence files. "Every evidence file" only when it checked every one: a
     file intake couldn't read has no hash, so it can't count as matching. A manifest that lists no file says so, since
     nothing was there to match. A folder walk couldn't list counts as no file, since how many files it holds is unknown,
-    and has a sentence of its own (unverified_text)."""
-    n, problems, unread = found.checked, found.problems, found.unverified
+    and has a sentence of its own (unverified_text). Each sentence names what the evidence was compared with
+    (Check.against)."""
+    n, problems, unread, against = found.checked, found.problems, found.unverified, found.against
     total = n + len(unread) - found.folders
     if not n and not unread:
-        return "No evidence file was re-hashed when this report was written: the intake manifest lists none."
+        return f"No evidence file was re-hashed when this report was written: {lists_none(against)}"
     if not unread:
         text = f"Every evidence file ({n:,}) was re-hashed when this report was written"
     elif not n:
@@ -701,11 +702,11 @@ def _files_check(found: Check) -> str:
         text = (f"{n:,} of the {total:,} evidence files {'was' if n == 1 else 'were'} re-hashed when this "
                 f"report was written")
     if problems:
-        text += f". {len(problems)} do not match the intake manifest: {_md('; '.join(problems[:10]))}."
+        text += f". {len(problems)} do not match {against}: {_md('; '.join(problems[:10]))}."
     elif not unread:
-        text += ", and all match the intake manifest."
+        text += f", and all match {against}."
     else:
-        text += ", and none differs from the intake manifest." if n else "."
+        text += f", and none differs from {against}." if n else "."
     return " ".join(filter(None, (text, unverified_text(unread, _md))))
 
 

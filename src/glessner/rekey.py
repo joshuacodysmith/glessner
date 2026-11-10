@@ -73,6 +73,7 @@ from .runner import (
     _write_record,
     evidence_root_name,
     latest_runs,
+    names_found_output_as_format_4,
     parse_context,
     read_runs,
     reload_run,
@@ -1138,9 +1139,10 @@ def left_references(case: Case) -> LeftReferences | None:
     """The marks, tags, notes, and findings on events of the runs the 3 to 4 step left (_left_runs) whose rows still name
     a file by its extended-length path, as a load under a link named it. A rebuild names the file by its path under the
     evidence folder, so those events take new IDs that no reference follows, and nothing rekeys them now. None when no
-    reference is on such an event, or when the events database can't be read, as when another program holds it, which
-    a rebuild refuses."""
-    runs = _left_runs(case)
+    reference is on such an event, when the events database can't be read, as when another program holds it, which a
+    rebuild refuses, or in a case kept below format 4, whose rebuild loads found output under the names its rows carry,
+    so the IDs stay (runner.names_found_output_as_format_4)."""
+    runs = _left_runs(case) if names_found_output_as_format_4(case) else set()
     if not runs or not case.db_path.exists():
         return None
     try:
@@ -1165,7 +1167,8 @@ def left_references(case: Case) -> LeftReferences | None:
 def left_warning(left: LeftReferences) -> str:
     """What a rebuild says before it loads when the 3 to 4 step left events with an earlier build's IDs: the runs, and
     how many marks, tags, notes, and findings on those events will name no event after this rebuild, which gives the
-    events new IDs or leaves out a run whose output it can't load."""
+    events new IDs or leaves out a run whose output it can't load, and what brings such a run back, since every rebuild
+    leaves it out until its output matches its record."""
     counts = [f"{n:,} {word if n == 1 else word + 's'}"
               for n, word in ((left.marks, "mark"), (left.tags, "tag"), (left.notes, "note"), (left.findings, "finding"))
               if n]
@@ -1173,7 +1176,8 @@ def left_warning(left: LeftReferences) -> str:
     return (f"Warning: the upgrade to case format 4 left the events of {runs} with the IDs an earlier build gave them, as "
             "its journal entry says. This rebuild gives them new IDs, or leaves out a run whose output it can't load, so "
             f"{_listed(counts)} on those events will then refer to events that no longer exist. Mark those events again "
-            "once a rebuild has loaded them.")
+            "once a rebuild has loaded them. A run this rebuild leaves out stays out of every rebuild until you rerun its "
+            "tool or restore its output.")
 
 
 def upgraded(case: Case, client: str = "cli") -> Case:

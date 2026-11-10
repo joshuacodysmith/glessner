@@ -1,6 +1,6 @@
 """scripts/suricata_rules.py builds the rule file for Suricata runs from an unpacked ET Open rule set. It checks the set
 for everything it copies before it writes, and replaces the version file only after the rule file, so a set it can't use
-leaves the old rules in force with the version file naming them."""
+leaves the old rules in force with the version file naming them. A version file it can't replace is named as out of date."""
 
 import importlib.util
 from pathlib import Path
@@ -125,6 +125,39 @@ def test_a_failure_partway_leaves_the_old_rule_file_in_force_and_no_temporary_fi
     out = suricata / "rules"
     assert (out / "suricata.rules").read_text(encoding="utf-8") == "old"
     assert (out / "et-open-version.txt").read_text(encoding="utf-8") == "ET Open 11000\n"
+    assert sorted(p.name for p in out.glob("*.tmp")) == []
+
+
+def test_a_version_file_that_cant_be_replaced_is_named_as_out_of_date(tmp_path, monkeypatch, capsys):
+    et = et_open(tmp_path)
+    suricata = suricata_with_old_rules(tmp_path)
+    replace = Path.replace
+
+    def refuse_the_version_file(self, target):
+        if Path(target).name == "et-open-version.txt":
+            raise PermissionError(f"{target} is in use")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", refuse_the_version_file)
+    assert script().main(et, suricata) == 1
+    out = suricata / "rules"
+    told = capsys.readouterr()
+    assert told.out == ""
+    assert f"The rules are now ET Open 11310, but {out / 'et-open-version.txt'} is out of date" in told.err
+    assert (out / "suricata.rules").read_text(encoding="utf-8").startswith("# --- a.rules\n")
+    assert (out / "et-open-version.txt").read_text(encoding="utf-8") == "ET Open 11000\n"
+    assert sorted(p.name for p in out.glob("*.tmp")) == []
+
+
+def test_a_folder_in_the_version_files_place_stops_the_build_with_the_new_rules_in_force(tmp_path, capsys):
+    et = et_open(tmp_path)
+    suricata = suricata_with_old_rules(tmp_path)
+    out = suricata / "rules"
+    (out / "et-open-version.txt").unlink()
+    (out / "et-open-version.txt").mkdir()
+    assert script().main(et, suricata) == 1
+    assert f"{out / 'et-open-version.txt'} is out of date" in capsys.readouterr().err
+    assert (out / "suricata.rules").read_text(encoding="utf-8").startswith("# --- a.rules\n")
     assert sorted(p.name for p in out.glob("*.tmp")) == []
 
 

@@ -1,4 +1,4 @@
-import { $, api, el, HINTS, panelBand, plural, post, S, setStatus, showControls, syncPanelButtons } from './core.js';
+import { $, api, el, HINTS, panelBand, plural, post, S, setStatus, showControls, syncPanelButtons, toolName } from './core.js';
 import { fetchView, scheduleFetch } from './data.js';
 import { button } from './event_page.js';
 import { renderExportScope } from './exports.js';
@@ -15,8 +15,6 @@ import { viewPart } from './view.js';
 // Checkboxes come from the server's counts of what the filter shows, so they tell the truth whichever rule
 // did the hiding. Filters never change the case and are not kept across a reload.
 
-// A tool's name, as the registry gives it in /api/meta, or its ID.
-const toolName = (id) => (S.meta?.tool_names || {})[id] || id;
 export const predKey = (p) => JSON.stringify(Object.keys(p).sort().map((k) => [k, p[k]]));
 export const covers = (outer, inner) => Object.entries(outer).every(([k, v]) => inner[k] === v);   // outer is as broad or broader
 export const filterParam = () => (S.filterId ? `&filter=${S.filterId}` : '');

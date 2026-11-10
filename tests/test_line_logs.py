@@ -4,8 +4,10 @@ and imports."""
 import json
 import time
 
+import duckdb
 import pytest
 
+from glessner import imports
 from glessner.case import create_case
 from glessner.events import connect
 from glessner.identify import identify_bytes
@@ -13,6 +15,7 @@ from glessner.imports import (
     KV_PAIR,
     KV_PAIR_COMMA,
     PRESETS,
+    case_year,
     guess_time_format,
     importable,
     preview,
@@ -22,6 +25,7 @@ from glessner.imports import (
 from glessner.intake import intake
 from glessner.line_logs import LAYOUTS
 from glessner.runner import rebuild
+from glessner.server import App, api_import_preview
 from glessner.timezones import DATE_TIME
 
 US = 1_000_000
@@ -254,8 +258,9 @@ def test_each_layout_imports_as_a_run_that_rebuild_repeats(case):
     assert listed["FW/asa.log"] == "Cisco ASA" and listed["DB01/mysql_error.log"] == "Lines that start with a date and time"
     counts = {}
     for path in listed:
-        p = preview(case, path, year_hint=2023)
-        mapping = {**p["mapping"], "time": {**p["mapping"]["time"], "zone": p["mapping"]["time"]["zone"] or "UTC"}}
+        p = preview(case, path)
+        given = {**p["mapping"]["time"], "zone": p["mapping"]["time"].get("zone") or "UTC"}
+        mapping = {**p["mapping"], "time": {**given, "year": 2023} if p["needs_year"] else given}
         record = run_import(case, path, mapping, zones={})
         assert record.status == "ok" and record.evidence_check == "ok", (path, record.reason)
         counts[path] = record.loaded_rows
@@ -292,6 +297,47 @@ def test_a_missing_year_blocks_the_import_until_given(case):
     assert any("no year" in problem for problem in p["problems"])
     p = preview(case, "FW/asa.log", {**p["mapping"], "time": {**p["mapping"]["time"], "year": 2023, "zone": "UTC"}})
     assert not p["problems"] and any("first reads as 2023" in w for w in p["warnings"])
+
+
+def test_the_served_preview_asks_for_a_year_in_a_case_without_events(case):
+    """The server's connection holds the database open, and DuckDB refuses a second one in the same process."""
+    app = App(case)
+    try:
+        p = api_import_preview(app, {"path": "FW/asa.log"})
+        assert case_year(case) is None
+    finally:
+        app.con.close()
+    assert p["needs_year"] and "year" not in p["mapping"]["time"]
+    assert any("no year" in problem for problem in p["problems"])
+
+
+def test_the_served_preview_defaults_to_the_year_of_the_case_s_latest_events(case):
+    p = preview(case, "IDS/alert")
+    time_field = {**p["mapping"]["time"], "year": 2023, "zone": "UTC"}
+    assert run_import(case, "IDS/alert", {**p["mapping"], "time": time_field}).status == "ok"
+    app = App(case)
+    try:
+        served = api_import_preview(app, {"path": "FW/asa.log"})
+    finally:
+        app.con.close()
+    assert served["mapping"]["time"]["year"] == 2023
+    assert any("first reads as 2023, the year of the case's latest events" in w for w in served["warnings"])
+
+
+class StoppedCursor:
+    """A server cursor once the shutdown has interrupted its connection."""
+
+    def execute(self, *_):
+        raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+
+
+def test_a_failed_read_of_the_year_opens_no_connection_of_its_own(case, monkeypatch):
+    """After a server's stop, a second connection would run the same scan and hold the database file open."""
+    opened = []
+    monkeypatch.setattr(imports, "connect", lambda *args, **kwargs: opened.append(args))
+    p = preview(case, "FW/asa.log", reader=StoppedCursor())
+    assert opened == [] and "year" not in p["mapping"]["time"]
+    assert any("no year" in problem for problem in p["problems"])
 
 
 def test_text_logs_taken_in_as_key_value_lines_are_listed_by_layout(case):

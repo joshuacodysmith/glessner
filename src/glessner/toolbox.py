@@ -53,7 +53,7 @@ from .runner import (
     run,
 )
 from .tool_outputs import BY_KIND, CAPTURES
-from .tools import REGISTRY_DIR, DetectedTool, ToolSpec, _executables_under
+from .tools import REGISTRY_DIR, DetectedTool, ToolSpec, _executables_under, rules_label
 from .tools_manifest import PinCache, check_text, pin_states
 
 KNOWN_FILE = REGISTRY_DIR / "known" / "known_tools.yaml"
@@ -163,10 +163,21 @@ def _noun(key: str, n: int) -> str:
     return f"{n:,} {word if word.endswith('s') else word + 's'}"
 
 
+def _rule_set(tool: DetectedTool, pins: PinCache | None) -> str:
+    """The rule or map set the Tools page names for a found tool (tools.rules_label), "" without `pins`. A git label's
+    files part takes the hash of a whole folder, so it comes from the tool's files as last hashed for the page, whatever
+    number of times the page is drawn. Other labels read a name from the tool's folder."""
+    if pins is None:
+        return ""
+    label = tool.spec.rules_label
+    return pins.get(tool).rules if label and label["kind"] == "git" else rules_label(tool.spec, tool.executable)
+
+
 def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, DetectedTool],
              pins: PinCache | None = None) -> dict:
     """The Tools page's data. With `pins`, each found tool's files against its pin (tools_manifest.pin_states) are each
-    tool's `pin` and, for the page, the tools folder's `manifest`; without it, both are None and no tool is hashed."""
+    tool's `pin`, its rule set is named as its `rules`, and the tools folder's state is `manifest`; without it, `pin` and
+    `manifest` are None, `rules` is empty, and no tool is hashed."""
     entries = current_entries(case) if case.manifest_path.exists() else []
     runs = read_runs(case)
     tools = []
@@ -192,7 +203,8 @@ def overview(case: Case, specs: dict[str, ToolSpec], detected: dict[str, Detecte
             "download_url": spec.download_url, "notes": spec.notes, "work_on_copies": spec.work_on_copies,
             "found": tool is not None, "version": tool.version if tool else "", "path": str(tool.executable) if tool else "",
             "dotnet": spec.dotnet, "dotnet_root": tool.dotnet_root if tool else "", "builtin": spec.builtin,
-            "missing": tool.missing if tool else "", "rules": tool.rules if tool else "", "has_rules": bool(spec.rules),
+            "missing": tool.missing if tool else "", "rules": _rule_set(tool, pins) if tool else "",
+            "has_rules": bool(spec.rules),
             "reads": ", ".join(_noun(k, n) for k, n in by_kind.most_common()), "hosts": hosts, "status": status,
             "last_run": _last_run(latest, last, specs) if latest else None,
             "hits": spec.id == "hayabusa",   # its rows are hits, not events

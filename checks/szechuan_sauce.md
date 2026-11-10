@@ -17,7 +17,7 @@ The check scored 25 items from the published answers. Its score is 19, 5, 0 of 2
 
 [glossary.md](../glossary.md) defines terms such as lane, pivot, and mark.
 
-**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number. Each gap's state under Gaps found says where the gap stands in v0.2.0, and a fixed gap names the release that fixed it.
+**Date and build.** The check ran on 2026-10-14, on a build that predates v0.1.0, the first build with a version number. Each gap's state under Gaps found says where the gap stands in v0.4.0, and a fixed gap names the release that fixed it.
 
 **Evidence.** Glessner reads a folder of collected files, not a disk image (see Inputs in [known_limitations.md](../known_limitations.md#inputs)). Each host's E01 image was unpacked into a collection that holds every artifact type the app reads. The unpacking took the steps of the builder scripts `extract_e01.sh`, `extract_more.sh`, and `extract_app_dbs.sh` in [scripts/](../scripts/), with the host folders named DC01 and DESKTOP, and [disk_images.md](../disk_images.md) shows how to run them. Those runs skipped each file whose content matched one already exported, and today's scripts keep such files. The skipped files include 5 of DC01's 107 event logs and 42 of DESKTOP's 159, each with no records. Each host's Autoruns CSV (from `DC01-autorunsc.zip` and `DESKTOP-SDN1RPT-autorunsc.zip`) went into its folder, and the capture (from `case001-pcap.zip`) into a folder of its own. The two Autoruns zips and the capture zip matched the MD5 hashes that the case page publishes. The evidence folder held 536 files, 715.9 MB.
 
@@ -83,7 +83,7 @@ Item numbers are this page's own, in the order of the table. Gap numbers refer t
 | 24 | Time-stomped file: Beth_Secret.txt | MFT events for the file carry the flag `SI<FN, possible timestomping; SI times have zero microseconds`. Found by search. No suggestion pointed to it (gap 9). | Reached |
 | 25 | Recommendations: RDP behind a VPN, firewall, IPS, EDR, password policy | Nothing. The app leaves recommendations to the analyst by design, so the item is out of scope and isn't counted (gap 11). | Out of scope |
 
-For item 6, a development build made after v0.3.0 also loads DC01 Administrator's "URL last typed" event for `http://194.61.24.102/`. It lists at [03:23:41], 25 s before `$J` shows `coreupdater[1].exe` written at [03:24:06].
+For item 6, v0.4.0 also loads DC01 Administrator's "URL last typed" event for `http://194.61.24.102/`. It lists at [03:23:41], 25 s before `$J` shows `coreupdater[1].exe` written at [03:24:06].
 
 ### Totals
 

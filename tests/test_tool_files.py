@@ -3,6 +3,7 @@ rule or map set it runs with (tools.rules_label), read from the tool's folder wi
 
 import dataclasses
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -10,10 +11,13 @@ from pathlib import Path
 
 import pytest
 from conftest import junction
+from test_case_intake import held
 from test_evidence_paths import shut
 
 from glessner import tools
+from glessner.toolbox import overview
 from glessner.tools import DetectedTool, detect, folder_sha256, load_registry, pin_files, rules_label, tool_files
+from glessner.tools_manifest import PinCache, take_pin
 
 COMMIT = "fffbdd179c8c8c7554368c443f9ba2917877f108"
 OTHER_COMMIT = "0123456789abcdef0123456789abcdef01234567"
@@ -317,9 +321,105 @@ def test_a_rules_folder_that_cannot_be_read_is_named_unreadable_never_by_its_com
     tool, unpacked = checkout(tmp_path), hayabusa(tmp_path / "zip")
     shut(monkeypatch, "sigma")
     assert rules_label(tool.spec, tool.executable) == "Hayabusa rules fffbdd1, files unreadable"
-    assert detect([tool.spec], tmp_path / "tools")["hayabusa"].rules == "Hayabusa rules fffbdd1, files unreadable"
+    assert PinCache().get(tool).rules == "Hayabusa rules fffbdd1, files unreadable"
     assert rules_label(unpacked.spec, unpacked.executable) == "Hayabusa rules unreadable"
     assert rules_label(tool.spec, tool.executable, {"rules/": "ab" * 32}) == "Hayabusa rules fffbdd1, files abababab"
+
+
+def folder_reads(monkeypatch) -> list[Path]:
+    """The folders whose files are hashed from here on, each time it happens."""
+    listed = []
+    real = tools.folder_listing
+
+    def counted(folder, links=None):
+        listed.append(folder)
+        return real(folder, links)
+
+    monkeypatch.setattr(tools, "folder_listing", counted)
+    return listed
+
+
+def with_tools_folder(case, tool: DetectedTool):
+    """`case` with its tools folder set to the one `tool` was unpacked in."""
+    settings = dataclasses.replace(case.settings, tools_folder=str(tool.executable.parent.parent))
+    return dataclasses.replace(case, settings=settings)
+
+
+def test_detection_finds_a_tool_without_hashing_its_rules_folder(tmp_path, monkeypatch):
+    """The CLI detects for each command, and a rules folder holds thousands of files."""
+    tool = checkout(tmp_path)
+    listed = folder_reads(monkeypatch)
+    assert detect([tool.spec], tmp_path / "tools")["hayabusa"].executable == tool.executable
+    assert listed == []
+
+
+def test_the_tools_page_names_a_rules_checkout_from_the_hash_its_pin_state_took(synthetic_case, tmp_path, monkeypatch):
+    """The page's pin state hashes the tool's files once. The rule set's name comes from that hash on each draw, so its
+    commit and digits stay together until the files are hashed again."""
+    tool = checkout(tmp_path)
+    rules = tool.executable.parent / "rules"
+    case = with_tools_folder(synthetic_case, tool)
+    label = f"Hayabusa rules fffbdd1, files {folder_sha256(rules)[:8]}"
+    listed = folder_reads(monkeypatch)
+    pins, specs = PinCache(), {"hayabusa": tool.spec}
+    named = lambda: overview(case, specs, {"hayabusa": tool}, pins)["tools"][0]["rules"]
+    assert named() == label
+    assert listed.count(rules) == 1
+    write(rules, {".git/refs/heads/main": OTHER_COMMIT.encode() + b"\n"})   # an update since that hash
+    assert named() == label
+    assert listed.count(rules) == 1
+    pins.clear()
+    assert named() == label.replace("fffbdd1", OTHER_COMMIT[:7])
+
+
+def test_a_pin_just_made_gives_the_tools_page_its_rule_set(tmp_path):
+    tool = checkout(tmp_path)
+    pins = PinCache()
+    pins.put(tool, take_pin(tool))
+    assert pins.get(tool).rules == f"Hayabusa rules fffbdd1, files {folder_sha256(tool.executable.parent / 'rules')[:8]}"
+
+
+def test_the_tools_page_hashes_a_tool_outside_the_tools_folder_only_for_a_git_label(synthetic_case, tmp_path, monkeypatch):
+    """A tool on PATH has no pin state, so it is hashed only when its label needs a folder's digits."""
+    tool = checkout(tmp_path)
+    evtx_folder = tmp_path / "EvtxECmd"
+    write(evtx_folder, {"EvtxECmd.exe": b"MZ", "Maps/a.map": b"a"})
+    evtx = DetectedTool(spec("evtxecmd"), evtx_folder / "EvtxECmd.exe", "1.0")
+    listed = folder_reads(monkeypatch)
+    view = overview(synthetic_case, {"hayabusa": tool.spec, "evtxecmd": evtx.spec}, {"hayabusa": tool, "evtxecmd": evtx},
+                    PinCache())
+    assert {row["id"]: row["rules"].partition(", files")[0] for row in view["tools"]} == {
+        "hayabusa": "Hayabusa rules fffbdd1", "evtxecmd": "Maps, 1 maps"}
+    assert tool.executable.parent / "rules" in listed and evtx_folder / "Maps" not in listed
+
+
+def test_the_tools_page_keeps_a_failed_hash_s_label_rather_than_walking_the_folder_on_each_draw(synthetic_case, tmp_path,
+                                                                                                monkeypatch):
+    """The label of a folder that can't be read says so, on each draw, from the one hash that failed."""
+    tool = checkout(tmp_path)
+    rules = tool.executable.parent / "rules"
+    case = with_tools_folder(synthetic_case, tool)
+    shut(monkeypatch, "sigma")
+    pins = PinCache()
+    row = lambda: overview(case, {"hayabusa": tool.spec}, {"hayabusa": tool}, pins)["tools"][0]
+    assert (row()["rules"], row()["pin"]["state"]) == ("Hayabusa rules fffbdd1, files unreadable", "cant_check")
+    listed = folder_reads(monkeypatch)
+    assert row()["rules"] == "Hayabusa rules fffbdd1, files unreadable"
+    assert rules not in listed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="share modes are Windows'")
+def test_the_tools_page_draws_while_a_program_holds_a_rule_set_s_version_file(synthetic_case, tmp_path):
+    """The file's directory entry still reads, so the open is what fails. The page names the rule set as unreadable for as
+    long as the hold lasts."""
+    folder = tmp_path / "tools" / "suricata"
+    write(folder, {"suricata.exe": b"MZ", "rules/suricata.rules": b"alert", "rules/et-open-version.txt": b"ET Open 11310\n"})
+    found = DetectedTool(spec("suricata"), folder / "suricata.exe", "1.0")
+    case = with_tools_folder(synthetic_case, found)
+    row = lambda: overview(case, {"suricata": found.spec}, {"suricata": found}, PinCache())["tools"][0]
+    with held(folder / "rules" / "et-open-version.txt"):
+        assert (row()["rules"], row()["pin"]["state"]) == ("unreadable", "cant_check")
+    assert row()["rules"] == "ET Open 11310"
 
 
 def test_the_eric_zimmerman_tools_are_named_by_their_maps_count_and_their_batch_file_s_version(tmp_path):
@@ -346,14 +446,6 @@ def test_suricata_is_named_by_its_rule_set_s_version_file(tmp_path):
     assert rules_label(spec("suricata"), folder / "suricata.exe") == "ET Open 11310"
     (folder / "rules" / "suricata.rules").unlink()
     assert rules_label(spec("suricata"), folder / "suricata.exe") == ""
-
-
-def test_detection_names_each_tool_s_set(tmp_path):
-    tool = hayabusa(tmp_path)
-    write(tool.executable.parent / "rules" / ".git", {"HEAD": b"ref: refs/heads/main\n",
-                                                      "refs/heads/main": COMMIT.encode() + b"\n"})
-    files = folder_sha256(tool.executable.parent / "rules")[:8]
-    assert detect([tool.spec], tmp_path / "tools")["hayabusa"].rules == f"Hayabusa rules fffbdd1, files {files}"
 
 
 def test_a_tool_s_files_include_every_dll_beside_its_executable_and_its_runtimeconfig_and_deps_files(tmp_path):

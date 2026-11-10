@@ -963,10 +963,10 @@ def check(case: Case, sample: Sample, mapping: dict, zones: dict[str, dict]) -> 
 
 
 def preview(case: Case, rel_path: str, mapping: dict | None = None, zones: dict[str, dict] | None = None,
-            rows: int = PREVIEW_ROWS, year_hint: int | None = None) -> dict:
+            rows: int = PREVIEW_ROWS, reader: duckdb.DuckDBPyConnection | None = None) -> dict:
     """What the import page shows: the file's records, the mapping (guessed when none is given), the events the
-    first records become, and anything that blocks the import. year_hint is the year of the case's latest events,
-    which the server passes from its own connection; times without a year default to it."""
+    first records become, and anything that blocks the import. Times without a year default to the year of the case's
+    latest events (case_year), read through `reader`, the server's cursor, when it is given."""
     zones = host_zones(case) if zones is None else zones
     if mapping is not None:
         mapping = resolve_named(case, rel_path, mapping)
@@ -985,7 +985,7 @@ def preview(case: Case, rel_path: str, mapping: dict | None = None, zones: dict[
     if needs_year(t.get("format") or ""):
         year, source = t.get("year"), ""
         if not year:
-            year = year_hint if year_hint is not None else case_year(case)
+            year = case_year(case, reader)
             source = ", the year of the case's latest events"
             if year:
                 mapping = {**mapping, "time": {**t, "year": year}}
@@ -1025,20 +1025,22 @@ def _layout_of(sample: Sample) -> dict:
 
 
 def case_year(case: Case, con: duckdb.DuckDBPyConnection | None = None) -> int | None:
-    """The year of the case's latest events, leaving out the latest 1% as strays; None for a case without events.
-    The server passes a cursor on its own connection, which holds the database open."""
-    if con is None:
+    """The year of the case's latest events, leaving out the latest 1% as strays; None for a case without events, or
+    when they can't be read. The server passes a cursor on its own connection, which holds the database open: DuckDB
+    refuses a second connection in that process, and another process's while the server runs."""
+    try:
+        if con is not None:
+            return _latest_year(con)
         if not case.db_path.exists():
             return None
-        con = connect(case.db_path, read_only=True)
-        try:
-            return case_year(case, con)
-        finally:
-            con.close()
-    try:
-        row = con.execute("SELECT quantile_disc(ts_us, 0.99) FROM events WHERE ts_us IS NOT NULL").fetchone()
+        with connect(case.db_path, read_only=True) as own:
+            return _latest_year(own)
     except duckdb.Error:
         return None
+
+
+def _latest_year(con: duckdb.DuckDBPyConnection) -> int | None:
+    row = con.execute("SELECT quantile_disc(ts_us, 0.99) FROM events WHERE ts_us IS NOT NULL").fetchone()
     return from_us(row[0]).year if row and row[0] is not None else None
 
 

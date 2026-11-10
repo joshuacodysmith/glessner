@@ -9,6 +9,7 @@
 // reaches the page through el() and textContent only.
 
 import { $, api, el, plural, post, reportAction, S, setStatus, showControls, windowText } from './core.js';
+import { windowUs } from './data.js';
 import { button, headAfter } from './event_page.js';
 import { filterCount } from './filters.js';
 import { refreshCaseState } from './frame.js';
@@ -159,7 +160,7 @@ function exportsSection(count, filtered, run) {
     (r) => `Wrote ${plural(r.rows, 'event')} to ${r.path}. Whole case.${filtered(r)}`);
   const window = (fmt) => () => {
     const view = { ...S.view };
-    return run('/api/export', { start: Math.floor(view.start * 1000), end: Math.ceil(view.end * 1000), format: fmt, marks: 'all', ...(S.filterId ? { filter: S.filterId } : {}) },
+    return run('/api/export', { ...windowUs(view), format: fmt, marks: 'all', ...(S.filterId ? { filter: S.filterId } : {}) },
                (r) => `Wrote ${plural(r.rows, 'event')} to ${r.path}. Window: ${windowText(view)}.${filtered(r)}`);
   };
   const card = (name, scope, what, ...buttons) => el('div', { class: 'export-card' },

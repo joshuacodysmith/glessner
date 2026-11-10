@@ -9,7 +9,7 @@ import { fetchView } from './data.js';
 import { button, focusedPageAction, pageAction, reportWrite } from './event_page.js';
 import { reloadLanes } from './lanes.js';
 import { closeQuickMenu, menuItem, placeMenu } from './quick_menu.js';
-import { renderViewPanel } from './view.js';
+import { refreshViewCounts } from './view.js';
 
 export const UNTAGGED = 'Untagged';
 
@@ -68,21 +68,19 @@ export async function decideTagSuggestions(uids, keys, decision) {
 // `listed` settles the list the change came from (applyTags). It runs before done(), whose redraw of the focused Event
 // page claims the panel: a pivot's list on that page, whose rows can include the event in focus, still has its rows read
 // again. The change is written once the server has answered, so lanes that fail to reload don't keep the rest from
-// following. Returns the lanes error's message, or '' when the lanes reloaded or had no need to (reloadTimeline).
+// following. Returns the message of the lanes' failure, else of the window's data's, or '' when neither failed
+// (reloadTimeline).
 async function afterTagChange(done, listed = null) {
   // Tactic lanes and a View on tags depend on tags, so the lanes reload; the counts in the View panel follow.
   let failed = '';
   if (S.groupby.includes('tactic') || S.filterId) {
     try { await reloadLanes(); } catch (err) { failed = err.message; }
   }
-  await fetchView();
+  const viewFailed = await fetchView();
   if (listed) listed();
   done();
-  if (!$('viewPanel').hidden) {
-    try { S.tagCounts = await api('/api/tags'); } catch (_) { /* the panel keeps its old counts */ }
-    renderViewPanel();
-  }
-  return failed;
+  await refreshViewCounts();
+  return failed || viewFailed;
 }
 
 // The tag picker, in the shared popup menu: the 15 tactics, a technique picked from the ATT&CK list, or the analyst's own

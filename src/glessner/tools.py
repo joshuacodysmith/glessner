@@ -130,7 +130,6 @@ class DetectedTool:
     version: str          # "unknown" when the version check fails
     dotnet_root: str = ""   # the private .NET runtime this tool runs on, if it needs one and one was found
     missing: str = ""       # why it can't run here, such as Npcap not being installed
-    rules: str = ""         # the rule or map set it runs with (rules_label), such as "ET Open 11310"; "" for none
 
 
 @dataclass(frozen=True)
@@ -158,9 +157,8 @@ def detect(specs: Iterable[ToolSpec], tools_folder: Path | None) -> dict[str, De
         exe = _match(spec, candidates) or _on_path(spec)
         if exe is None:
             continue
-        rules = rules_label(spec, exe)
         if spec.npcap and not npcap_folder():   # its version check would stop on a missing-DLL dialog
-            found[spec.id] = DetectedTool(spec, exe, "unknown", missing=NPCAP_MISSING, rules=rules)
+            found[spec.id] = DetectedTool(spec, exe, "unknown", missing=NPCAP_MISSING)
             continue
         root = find_dotnet(tools_folder, spec.dotnet) if spec.dotnet else None
         tool = DetectedTool(spec, exe, "", str(root) if root else "")
@@ -169,7 +167,7 @@ def detect(specs: Iterable[ToolSpec], tools_folder: Path | None) -> dict[str, De
         # exit code and a message of the host's own. A check that ended otherwise, such as by timing out or being blocked,
         # shows the tool lacks nothing, and a build that prints its version has started, on a runtime of the machine.
         absent = dotnet_missing(spec.dotnet) if spec.dotnet and not root and check.host_stopped else ""
-        found[spec.id] = DetectedTool(spec, exe, check.version, tool.dotnet_root, missing=absent, rules=rules)
+        found[spec.id] = DetectedTool(spec, exe, check.version, tool.dotnet_root, missing=absent)
     return found
 
 
@@ -195,20 +193,24 @@ def rules_file(spec: ToolSpec, exe: Path) -> Path | None:
 
 
 def rules_version(spec: ToolSpec, exe: Path) -> str:
-    """The rule set a tool runs with, from the version file beside its rules; "" when it has none."""
+    """The rule set a tool runs with, from the version file beside its rules; "" when it has none, and UNREADABLE when
+    that file can't be read, as while another program holds it."""
     if rules_file(spec, exe) is None:
         return ""
     version = exe.parent / spec.rules.get("version_file", "")
-    if version.is_file():
+    if not version.is_file():
+        return "rules"
+    try:
         return version.read_text(encoding="utf-8", errors="replace").strip()[:80] or "rules"
-    return "rules"
+    except OSError:
+        return UNREADABLE
 
 
 LABEL_KINDS = ("git", "count", "version_line")   # the kinds of ToolSpec.rules_label
 GIT = ".git"   # a git checkout's own folder
 COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")   # a commit's ID, by SHA-1 or SHA-256
 VERSION_LINE = re.compile(r"^Version:\s*(\S+)", re.MULTILINE)
-UNREADABLE = "unreadable"   # a git label's files part when the rules folder can't be read
+UNREADABLE = "unreadable"   # a git label's files part when the rules folder can't be read, or a version file's text
 
 
 def rules_label(spec: ToolSpec, exe: Path, hashes: dict[str, str] | None = None) -> str:

@@ -12,6 +12,10 @@ classtypes), and et-open-version.txt. It writes nothing when the set has no rule
 writes all three to temporary files first, then replaces classification.config, suricata.rules, and et-open-version.txt
 in that order, so a build that fails before the rule file is replaced leaves the earlier rules in force with the
 version file still naming them. A build that fails also removes the temporary files it wrote.
+
+When only the last replace fails, such as while a reader holds et-open-version.txt open, the new rules are in force and
+the version file is out of date. Runs record that file's text as their rules version, so they name the wrong set until a
+later build replaces it. The script says so, names the file, and exits 1.
 """
 
 import shutil
@@ -37,6 +41,7 @@ def main(et: Path, suricata: Path) -> int:
     active = 0
     rules_tmp = out_dir / "suricata.rules.tmp"
     classification_tmp = out_dir / "classification.config.tmp"
+    version_file = out_dir / "et-open-version.txt"
     version_tmp = out_dir / "et-open-version.txt.tmp"
     try:
         with rules_tmp.open("w", encoding="utf-8", newline="\n") as out:
@@ -51,7 +56,12 @@ def main(et: Path, suricata: Path) -> int:
         classification_tmp.replace(out_dir / "classification.config")
         rules_tmp.replace(out_dir / "suricata.rules")
         # Each run records the version file's text as its rules version, so it changes only after the rules it names
-        version_tmp.replace(out_dir / "et-open-version.txt")
+        try:
+            version_tmp.replace(version_file)
+        except OSError as e:
+            print(f"The rules are now ET Open {version}, but {version_file} is out of date and doesn't name them: {e}\n"
+                  "Runs record that file as their rules version. Build the rules again to replace it.", file=sys.stderr)
+            return 1
     finally:
         # A finished build has renamed every temporary file away, so only a build that failed has anything to remove
         for tmp in (rules_tmp, classification_tmp, version_tmp):

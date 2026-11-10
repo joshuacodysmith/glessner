@@ -1680,6 +1680,11 @@ def analyst(entry: dict) -> str:
     return who if isinstance(who, str) else json.dumps(who)
 
 
+def named_who(record: dict) -> dict:
+    """A copy of a state record for a page, whose `who` reads as `analyst` names it. The state keeps it as written."""
+    return {**record, "who": analyst(record)}
+
+
 def last_action(path: Path) -> dict | None:
     """The journal's newest entry by someone, as entries() gives it, read from the file's end rather than by parsing every
     line. The app's own entries, such as the build each new build journals when it opens the case, are left to the audit

@@ -19,7 +19,7 @@ from .accounts import build_account_domains
 from .clock import check_clocks
 from .events import id_table, insert_columns, live_hive_first, sql_literal
 from .identity import HostIdentity, Identity, lookup_key
-from .journal import State
+from .journal import State, analyst
 from .parsers.common import is_digits, normalize_ip
 from .relations import build_logon_links
 from .rules import RuleError, parse
@@ -97,7 +97,7 @@ def build_identity(con: duckdb.DuckDBPyConnection, state: State) -> Identity:
         h.ips = [i for i in h.ips if i not in edits.remove_ips] + sorted(edits.add_ips - set(h.ips))
         if edits.role:
             h.role, h.role_source = edits.role, "analyst"
-            h.role_by, h.role_at = edits.role_who, edits.role_at
+            h.role_by, h.role_at = analyst({"who": edits.role_who}), edits.role_at
         h.offset_seconds = edits.offset_seconds
         h.offset_aligned = edits.offset_align == "capture" and bool(edits.offset_seconds)
     for h in hosts.values():

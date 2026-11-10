@@ -19,7 +19,6 @@ from . import heads
 from .case import CASE_FORMAT, FIRST_CHAINED, JOURNAL_FILE, Case, CaseError, copy_case, create_case, open_case
 from .events import connect, from_us
 from .intake import (
-    UNRECORDED_MANIFEST,
     ManifestCheck,
     add_new,
     check_files,
@@ -27,6 +26,7 @@ from .intake import (
     first_unvouched,
     intake,
     line_ending_sha256,
+    lists_none,
     manifest_missing,
     manifest_state,
     manifest_text,
@@ -73,7 +73,7 @@ class _Version(argparse.Action):
     """--version: the build, worked out only when asked for, since it runs git."""
 
     def __init__(self, option_strings, dest, **kwargs):
-        super().__init__(option_strings, dest, nargs=0, help="show the build, such as 0.3.0+abc1234, and exit")
+        super().__init__(option_strings, dest, nargs=0, help="show the build, such as 0.4.0+abc1234, and exit")
 
     def __call__(self, parser, namespace, values, option_string=None):
         print(f"glessner {build_id()}")
@@ -316,12 +316,12 @@ def cmd_verify(case: Case, args) -> int:
             print(unread)
         code = 1
     elif unread:
-        print(f"{matched_text(found.checked)} {unread}")
+        print(f"{matched_text(found.checked, found.against)} {unread}")
         code = int(not found.checked)   # intake hashed none of the files, and no later check can give one a hash
     elif found.checked:
-        print("All evidence files match the manifest.")
+        print(f"All evidence files match {found.against}.")
     else:
-        print("No evidence file to check: the intake manifest lists none.")
+        print(f"No evidence file to check: {lists_none(found.against)}")
         code = 1
     if manifest is not None:
         print(manifest_text(manifest))
@@ -474,7 +474,7 @@ def cmd_tools(case: Case, args) -> int:
     if args.pin is not None:
         return _pin(case, specs, detected, args.pin)
     print(f"Tools folder: {case.settings.tools_folder or '(not set; PATH only)'}")
-    width = max([10, *(len(tool.version) for tool in detected.values())])   # a build such as 0.3.0+abc1234.dirty
+    width = max([10, *(len(tool.version) for tool in detected.values())])   # a build such as 0.4.0+abc1234.dirty
     states, manifest = pin_states(_tools_folder(case), detected, PinCache())
     for spec in specs.values():
         tool = detected.get(spec.id)
@@ -829,7 +829,7 @@ def cmd_load_output(case: Case, args) -> int:
 
 def cmd_runs(case: Case, args) -> int:
     runs = read_runs(case)
-    width = max([10, *(len(r.tool_version) for r in runs)])   # an import's is the build, such as 0.3.0+abc1234.dirty
+    width = max([10, *(len(r.tool_version) for r in runs)])   # an import's is the build, such as 0.4.0+abc1234.dirty
     for r in runs:
         rows = plural(r.loaded_rows, "row") if r.loaded_rows is not None else "not loaded"
         check = str((r.tool_check or {}).get("result", "-"))   # the tool's files against its pin, as the run recorded it
@@ -1149,7 +1149,7 @@ def cmd_close(case: Case, args) -> int:
     unread_text = unverified_text(unread, shown=len(unread))
     head = (f"Journal head after this close: {head_of(entry)} (entry #{entry['seq']}). Record it outside the case "
             "folder, such as in your case notes or ticket.")
-    against = UNRECORDED_MANIFEST if manifest and manifest.failed else "the intake manifest"
+    against = found.against
     if problems:
         print(f"Case closed with {plural(len(problems), 'evidence problem')}, recorded in the journal:")
         for problem in problems:

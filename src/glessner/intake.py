@@ -710,6 +710,11 @@ class Check:
         record, as verification.jsonl and the close's entry record it."""
         return "ok" if not self.problems and not (self.manifest and self.manifest.failed) else "mismatch"
 
+    @property
+    def against(self) -> str:
+        """What the re-hash compared the evidence with, in the words of its outputs."""
+        return UNRECORDED_MANIFEST if self.manifest and self.manifest.failed else INTAKE_MANIFEST
+
 
 def verify(case: Case, paths: Iterable[str] | None = None, reason: str = "") -> list[str]:
     """Re-hash manifest files (all of them, or the given relative paths) and record the result.
@@ -782,12 +787,13 @@ def check_files(case: Case, paths: Iterable[str] | None = None, reason: str = ""
     return found
 
 
-# What close and the audit trail say the evidence matched when manifest.jsonl grew past or differs from its record, in
-# place of "the intake manifest": the file the re-hash read, which its record doesn't vouch for
+INTAKE_MANIFEST = "the intake manifest"
+# What a full check's outputs say the evidence matched when manifest.jsonl grew past or differs from its record, in
+# place of INTAKE_MANIFEST: the file the re-hash read, which its record doesn't vouch for
 UNRECORDED_MANIFEST = "manifest.jsonl, which doesn't match its record in the journal"
 
 
-def matched_text(checked: int, against: str = "the intake manifest") -> str:
+def matched_text(checked: int, against: str = INTAKE_MANIFEST) -> str:
     """What a full check that found no problem says of the files it checked, when intake couldn't read others: never
     "all". `against` names what they match, UNRECORDED_MANIFEST for a manifest its record doesn't vouch for."""
     if not checked:
@@ -796,11 +802,16 @@ def matched_text(checked: int, against: str = "the intake manifest") -> str:
             else f"The {checked:,} evidence files intake hashed match {against}.")
 
 
-def none_listed_text(against: str) -> str:
-    """What close and the audit trail say when the manifest the close read lists no evidence file. `against` names that
-    manifest, as in matched_text; UNRECORDED_MANIFEST ends in a clause, which a comma closes before "lists"."""
+def lists_none(against: str) -> str:
+    """The sentence's end that says a manifest lists no evidence file. `against` names that manifest, as in matched_text;
+    UNRECORDED_MANIFEST ends in a clause, which a comma closes before "lists"."""
     subject = f"{against}," if against == UNRECORDED_MANIFEST else against
-    return f"No evidence file was checked: {subject} lists none."
+    return f"{subject} lists none."
+
+
+def none_listed_text(against: str) -> str:
+    """What close and the audit trail say when the manifest the close read lists no evidence file (lists_none)."""
+    return f"No evidence file was checked: {lists_none(against)}"
 
 
 def unverified_text(paths: list[str], escape: Callable[[str], str] = str, shown: int = 10) -> str:

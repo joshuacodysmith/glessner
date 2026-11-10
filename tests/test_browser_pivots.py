@@ -545,6 +545,13 @@ def test_show_reasons_folds_and_remembers(browser, pcase, monkeypatch):  # noqa:
         assert not any(r.is_visible() for r in page.locator("#details .pv-reason").all())
 
 
+# The Record and source fold's Tool row: its value's text, and what its View toggle adds
+TOOL_ROW = """() => {
+    const value = [...document.querySelectorAll('#details dt')].find((dt) => dt.textContent === 'Tool').nextElementSibling;
+    return [value.firstChild.textContent, value.querySelector('.viewtoggle').dataset.pred];
+}"""
+
+
 def test_provenance_is_one_line_with_the_hash_against_intake_and_the_build(browser, pcase):  # noqa: F811
     (pcase.evidence / "DC01" / "Windows" / "System32" / "winevt" / "Logs").mkdir(parents=True, exist_ok=True)
     (pcase.evidence / SECURITY).write_bytes(b"security log")
@@ -555,7 +562,11 @@ def test_provenance_is_one_line_with_the_hash_against_intake_and_the_build(brows
         select(page, rdp)
         line = page.locator("#details .prov")
         text = line.inner_text()
-        assert text.startswith("Read by evtxecmd t, run r1") and f"from {SECURITY}, record 101" in text
+        assert text.startswith("Read by EvtxECmd t, run r1") and f"from {SECURITY}, record 101" in text
+        # A part that doesn't fit has its whole text in its hover, which also gives the registry's ID
+        assert line.locator(".tool").get_attribute("title") == "Read by EvtxECmd t, run r1. Tool ID: evtxecmd"
+        assert line.locator(".tool b").get_attribute("title") is None
+        assert page.evaluate(TOOL_ROW) == ["EvtxECmd t", '{"tool":"evtxecmd"}']   # the View value stays the ID
         assert "the intake hash; nothing has re-checked the file since" in text
         assert f"shown by build {page.evaluate('window.__app.S.meta.build')}" in text
         assert line.locator("b").nth(3).get_attribute("title") == hashlib.sha256(b"security log").hexdigest()
@@ -569,6 +580,11 @@ def test_provenance_is_one_line_with_the_hash_against_intake_and_the_build(brows
         select(page, other)
         select(page, rdp)
         assert check.inner_text() == "differs from intake (SHA-256 changed)"
+        # A tool the page has no name for reads as its ID, as on the other pages
+        page.evaluate("delete window.__app.S.meta.tool_names.evtxecmd")
+        select(page, other)
+        select(page, rdp)
+        assert line.inner_text().startswith("Read by evtxecmd t, run r1")
     # A file intake never saw has no hash to show
     for page in served_page(browser, pcase):
         select(page, registry)
